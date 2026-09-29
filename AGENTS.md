@@ -11,3 +11,7 @@ Use the default five canonical triage labels. See `docs/agents/triage-labels.md`
 ### Domain docs
 
 This is a single-context repository. See `docs/agents/domain.md`.
+
+## Context sources
+
+- [Agent skills configuration](docs/agents/)
