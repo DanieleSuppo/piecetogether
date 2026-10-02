@@ -1,0 +1,11 @@
+{
+  "database": "../var/core.sqlite3",
+  "channel": "development",
+  "model": "deterministic",
+  "contract_version": "development-v1",
+  "capabilities": ["receive", "reply"],
+  "identities": {
+    "development:sender-1": "actor-1"
+  },
+  "secret_references": {}
+}

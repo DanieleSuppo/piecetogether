@@ -1,1 +1,5 @@
 .agents/ctx.cache.md
+__pycache__/
+.mypy_cache/
+.ruff_cache/
+var/

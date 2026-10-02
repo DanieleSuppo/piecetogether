@@ -730,4 +730,39 @@ Extension points exist to support real applications. Connector frameworks and pl
 
 ## Status
 
-PieceTogether is currently in product-definition and specification. The product thesis and MVP boundaries are captured in [docs/PRD.md](docs/PRD.md); implementation has not started yet.
+The first development slice ([#13](https://github.com/DanieleSuppo/piecetogether/issues/13)) implements durable text ingress and observable candidate-only interpretation. Domain Contract validation, trusted commits, Grounding, production channels and application APIs remain subsequent tickets. Product boundaries are captured in [docs/PRD.md](docs/PRD.md); technical authority is [SPEC #12](https://github.com/DanieleSuppo/piecetogether/issues/12).
+
+## Run the development Core
+
+Requires Python 3.10+; no runtime dependencies or external services.
+
+```bash
+python3 -m piecetogether --config config/development.json
+```
+
+This standalone local development process accepts one normalized JSON Communication per stdin line and emits one response per stdout line:
+
+```json
+{"channel":"development","sender":"sender-1","idempotency_key":"message-1","text":"Keep the original option.","sent_at":"2026-01-01T12:00:00Z"}
+```
+
+Replies contain only `communication_id`, `status` and `reply`. Repeated delivery returns the same outcome, including after restarting the process. Reusing a key with different content is rejected. A `retryable` outcome has no exposed reply; redeliver the original Communication to retry.
+
+`config/development.json` selects the static development ChannelPlugin, deterministic ModelProvider, Contract version reference, enabled capabilities and identity mappings. Database paths are relative to the config file. Optional `secret_references` map names to environment variable names; values stay outside configuration. The development adapters need no credentials. Unknown adapters and unmapped senders are rejected; runtime input cannot change configuration.
+
+SQLite stores normalized inbound/outbound Communications, candidate proposals, processing outcomes and a minimal Evaluation Trace. The development ChannelPlugin accepts handoff into a durable local mailbox; it does not send Email or Telegram. Model and channel work run outside database transactions. There is no trusted-state writer, State API or event publisher in this slice.
+
+Run one sequential development worker per database. This transport is operator-local, not a public network ingress or production connector. Candidates and traces are not returned to senders. A local operator with deployment filesystem access can inspect an outcome separately:
+
+```bash
+python3 -m piecetogether --config config/development.json --inspect <communication_id>
+```
+
+## Verify
+
+```bash
+python3 -m unittest discover -s tests -v
+uvx mypy --strict piecetogether
+```
+
+The tests use the Core service boundary and deterministic adapters with temporary persistent databases, not live models or storage-internal assertions. `uvx` is needed only for the optional development typechecker.
