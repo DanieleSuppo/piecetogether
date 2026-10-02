@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "version": "development-v1",
+  "entity_types": {},
+  "relationship_types": {},
+  "claim_concepts": {},
+  "artifact_types": {},
+  "grounding_policies": {},
+  "emergent_concepts": {"allowed": false}
+}

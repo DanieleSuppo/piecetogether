@@ -11,6 +11,26 @@ from piecetogether.core import Bootstrap
 
 
 class ServiceTests(unittest.TestCase):
+    def test_deeply_nested_contract_fails_bootstrap_without_a_traceback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "deployment.json"
+            config.write_text(json.dumps({
+                "database": "state.sqlite3",
+                "identities": {"development:s1": "a1"},
+                "contract": "contract.json",
+            }))
+            (Path(directory) / "contract.json").write_text("[" * 2000 + "]" * 2000)
+            process = subprocess.run(
+                [sys.executable, "-m", "piecetogether", "--config", str(config)],
+                text=True, capture_output=True,
+            )
+            self.assertEqual(process.returncode, 1)
+            self.assertEqual(process.stdout, "")
+            self.assertEqual(
+                process.stderr.strip(),
+                "Invalid or unavailable deployment configuration/state.",
+            )
+
     def test_deeply_nested_json_does_not_stop_later_communications(self):
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / "deployment.json"

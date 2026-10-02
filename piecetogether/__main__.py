@@ -20,7 +20,7 @@ def main() -> int:
     args = parser.parse_args()
     try:
         core = Core(Bootstrap.from_file(args.config))
-    except (ValueError, TypeError, OSError, sqlite3.Error):
+    except (ValueError, TypeError, RecursionError, OSError, sqlite3.Error):
         print("Invalid or unavailable deployment configuration/state.", file=sys.stderr)
         return 1
     if args.inspect:

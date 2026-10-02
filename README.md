@@ -730,7 +730,7 @@ Extension points exist to support real applications. Connector frameworks and pl
 
 ## Status
 
-The first development slice ([#13](https://github.com/DanieleSuppo/piecetogether/issues/13)) implements durable text ingress and observable candidate-only interpretation. Domain Contract validation, trusted commits, Grounding, production channels and application APIs remain subsequent tickets. Product boundaries are captured in [docs/PRD.md](docs/PRD.md); technical authority is [SPEC #12](https://github.com/DanieleSuppo/piecetogether/issues/12).
+The development Core implements durable text ingress and observable candidate-only interpretation ([#13](https://github.com/DanieleSuppo/piecetogether/issues/13)), plus deterministic Domain Contract and typed Semantic Proposal validation ([#14](https://github.com/DanieleSuppo/piecetogether/issues/14)). Trusted commits, Grounding lifecycle, production channels and application APIs remain subsequent tickets. Product boundaries are captured in [docs/PRD.md](docs/PRD.md); technical authority is [SPEC #12](https://github.com/DanieleSuppo/piecetogether/issues/12).
 
 ## Run the development Core
 
@@ -746,9 +746,9 @@ This standalone local development process accepts one normalized JSON Communicat
 {"channel":"development","sender":"sender-1","idempotency_key":"message-1","text":"Keep the original option.","sent_at":"2026-01-01T12:00:00Z"}
 ```
 
-Replies contain only `communication_id`, `status` and `reply`. Repeated delivery returns the same outcome, including after restarting the process. Reusing a key with different content is rejected. A `retryable` outcome has no exposed reply; redeliver the original Communication to retry.
+Replies contain only `communication_id`, `status` and `reply`. Repeated delivery returns the same completed or rejected outcome, including after restarting the process. Reusing a key with different content is rejected. `retryable` denotes an operational failure; `reprocess_required` denotes a stale Contract reference. Both have no exposed reply; redeliver the original Communication for a fresh attempt. `rejected` denotes a deterministic, terminal policy or invariant failure and has no reply.
 
-`config/development.json` selects the static development ChannelPlugin, deterministic ModelProvider, Contract version reference, enabled capabilities and identity mappings. Database paths are relative to the config file. Optional `secret_references` map names to environment variable names; values stay outside configuration. The development adapters need no credentials. Unknown adapters and unmapped senders are rejected; runtime input cannot change configuration.
+`config/development.json` selects the static development ChannelPlugin, deterministic ModelProvider, declarative Contract file and version, enabled capabilities and identity mappings. Relative database and Contract paths resolve from the config file's directory; absolute paths are also supported. Optional `secret_references` map names to environment variable names; values stay outside configuration. The development adapters need no credentials. Unknown adapters and unmapped senders are rejected; runtime input cannot change configuration.
 
 SQLite stores normalized inbound/outbound Communications, candidate proposals, processing outcomes and a minimal Evaluation Trace. The development ChannelPlugin accepts handoff into a durable local mailbox; it does not send Email or Telegram. Model and channel work run outside database transactions. There is no trusted-state writer, State API or event publisher in this slice.
 
@@ -757,6 +757,37 @@ Run one sequential development worker per database. This transport is operator-l
 ```bash
 python3 -m piecetogether --config config/development.json --inspect <communication_id>
 ```
+
+## Declarative Domain Contracts and Proposals
+
+The `contract` bootstrap field names a JSON file in the format of [config/development-contract.json](config/development-contract.json). Its `version` must match `contract_version`; `schema_version` is integer `1`. The Core loads and validates a Contract snapshot at startup. Domain rules are data, never executable plugins. Unknown fields, duplicate JSON keys, unsupported schema versions, contradictory constraints and dangling policy/type references fail bootstrap.
+
+The development Contract deliberately declares no domain Entity Types. The deterministic model produces only a free-text candidate interpretation, not structured domain assertions. Omitting `contract` uses the same closed, empty domain with the configured version, preserving existing development configurations. Deployments declare their own vocabulary through these catalogues:
+
+| Catalogue | Declaration |
+| --- | --- |
+| `entity_types` | Type name → `creation` boolean and `attributes` map of value constraints. No required conversational attributes. |
+| `relationship_types` | Relationship name → nonempty `source_types` and `target_types` arrays. Entity Type names and `$context` are allowed; `$claim` also supports claim relationships such as `corrects`, `supersedes` and `contradicts`. |
+| `claim_concepts` | Canonical concept → `target_types`, `value` constraint and declared `grounding_policy` name. Targets are Entity Types or `$context`. |
+| `grounding_policies` | Policy name → nonempty `acceptance` array containing `explicit`, `implicit`, or both. Silence is not an acceptance mode. |
+| `artifact_types` | Artifact Type → permitted `roles`, `persistence` (`forbidden`, `allowed`, `required`), `retention` and `supersession` boolean. Roles are `ephemeral-evidence`, `source-evidence`, `persistent-domain-artifact`. Retention independently declares `metadata`, `bytes`, `provenance` as `retain` or `delete`. Required persistence needs the persistent role and retained bytes. |
+| `emergent_concepts` | `{"allowed": false}`, or `allowed: true` with `target_types`, `value` and `grounding_policy`. These constraints govern every non-canonical concept; proposals cannot override them. |
+
+Value constraints support `type` (`string`, `boolean`, `integer`, `number`, `object`, `array`), `enum`, numeric `minimum`/`maximum`, string/array `min_length`/`max_length`, object `properties`, and array `items`. Unknown object properties are forbidden; absent properties are allowed. Arrays require an item constraint. Numbers must be finite; booleans are distinct from integers. Constraint nesting is limited to 16. Names/references are bounded to 256 characters. The `$context`, `$claim` and `$artifact` type names are reserved by the Core.
+
+Model adapters return `SemanticProposal` records from `piecetogether.proposals`. Envelope schema `1` versions both the envelope and its operation union. Operations are frozen typed records with durable `kind` discriminators:
+
+- `EntityOperation`, `ContextOperation`: propose candidate creation or resolution.
+- `ClaimOperation`: propose a constrained candidate assertion; provenance defaults to the envelope's inbound Communication and may never refer to another sender's input.
+- `RelationshipOperation`: propose a Contract-permitted relationship with permitted endpoints.
+- `GroundingPlanOperation`, `GroundingResolutionOperation`: describe a policy-governed plan or resolution.
+- `ArtifactOperation`: describe role classification or lifecycle intent, with Contract-controlled retention.
+- `EmergentConceptOperation`: introduce reusable vocabulary with `non_authoritative` status; no canonical-name collisions, Entity Type creation or ontology promotion.
+- `ContextRequestOperation`: describe a scoped, purpose-labelled request with a positive retrieval budget. Retrieval execution and disclosure eligibility belong to #16; until then requests reject with `context_retrieval_unavailable`.
+
+Proposal-local identifiers and targets within a Grounding plan must be unique. References resolve independently of operation order, and every operation must validate before any reply is handed off. An envelope contains at most 256 operations and 256 free-text candidates. Free-text `candidate_claims` remain unstructured Working State and cannot stand in for a structured Claim operation or trusted assertion. Concept names and type names are separate namespaces; a Concept name can never be used to introduce an Entity Type. The active Contract version, Proposal version/intent, validation outcome (`accepted`, `rejected`, `stale`) and deterministic reason codes are recorded through operator inspection. Unserializable rejected model output is omitted with an explicit trace marker; the rejection itself remains durable.
+
+Acceptance authorizes candidate processing, not a trusted commit. This ticket has no trusted writer: semantic-commit requests, unresolved existing-object references, Grounding resolutions without Core-owned exposed items, and Artifact lifecycle requests without Core-owned records/staged bytes reject explicitly. Their stateful implementations belong to #15, #17 and #19. A permitted Grounding plan or Artifact classification remains candidate-only; it cannot manufacture Grounding evidence or persistent content. Reusable Emergent Concepts and their source Communication remain durable in candidate proposals for #15's history-preserving persistence and later reconciliation.
 
 ## Verify
 

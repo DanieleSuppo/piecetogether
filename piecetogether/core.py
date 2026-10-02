@@ -12,6 +12,9 @@ from time import monotonic
 from typing import Any, Protocol
 from uuid import uuid4
 
+from .contracts import DeclarativeContractProvider, DomainContractProvider
+from .proposals import CandidateClaim, SemanticProposal, validate
+
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -26,8 +29,11 @@ class Bootstrap:
     contract_version: str = "development-v1"
     capabilities: tuple[str, ...] = ("receive", "reply")
     secret_references: dict[str, str] = field(default_factory=dict)
+    contract: Path | None = None
 
     def __post_init__(self) -> None:
+        if self.contract is not None and not isinstance(self.contract, Path):
+            raise ValueError("contract must name a declarative file")
         if self.channel != "development" or self.model != "deterministic":
             raise ValueError("only static development adapters are available")
         if set(self.capabilities) != {"receive", "reply"}:
@@ -78,6 +84,7 @@ class Bootstrap:
             "contract_version",
             "capabilities",
             "secret_references",
+            "contract",
         }
         if not isinstance(data, dict) or set(data) - allowed:
             raise ValueError("invalid bootstrap configuration")
@@ -88,6 +95,10 @@ class Bootstrap:
         ):
             raise ValueError("capabilities must be a string array")
         database = Path(data.pop("database"))
+        if "contract" in data:
+            if not isinstance(data["contract"], str) or not data["contract"].strip():
+                raise ValueError("contract must name a declarative file")
+            data["contract"] = path.parent / data["contract"]
         data["capabilities"] = tuple(data.get("capabilities", ["receive", "reply"]))
         config = cls(database=path.parent / database, **data)
         if any(
@@ -111,22 +122,6 @@ class Communication:
     received_at: str
     thread_id: str | None = None
     reply_to: str | None = None
-
-
-@dataclass(frozen=True)
-class CandidateClaim:
-    source_communication_id: str
-    interpretation: str
-    status: str = "candidate"
-
-
-@dataclass(frozen=True)
-class SemanticProposal:
-    schema_version: int
-    contract_version: str
-    communication_id: str
-    candidate_claims: tuple[CandidateClaim, ...]
-    draft_response: str
 
 
 class ModelProvider(Protocol):
@@ -184,8 +179,13 @@ class Core:
         config: Bootstrap,
         model: ModelProvider | None = None,
         channel: ChannelPlugin | None = None,
+        contract_provider: DomainContractProvider | None = None,
     ):
         self.config = config
+        provider = contract_provider or DeclarativeContractProvider(config.contract)
+        self.contract = provider.get(config.contract_version)
+        if self.contract.version != config.contract_version:
+            raise ValueError("provider returned a different Contract version")
         self.model = model or DeterministicModel()
         self.channel = channel or DevelopmentChannel(config.database)
         config.database.parent.mkdir(parents=True, exist_ok=True)
@@ -290,12 +290,18 @@ class Core:
                 "reply": json.loads(row["outbound"])["text"],
                 "status": "completed",
             }
+        if row["status"] == "rejected":
+            return {"communication_id": inbound.id, "reply": None, "status": "rejected"}
         started = monotonic()
         previous_trace = json.loads(row["trace"]) if row["trace"] else {}
+        outbound = (
+            Communication(**json.loads(row["outbound"])) if row["outbound"] else None
+        )
         trace: dict[str, Any] = {
             "input_communication_id": inbound.id,
-            "contract_version": previous_trace.get(
-                "contract_version", self.config.contract_version
+            "contract_version": (
+                previous_trace.get("contract_version", self.config.contract_version)
+                if outbound else self.config.contract_version
             ),
             "model_provider": self.config.model,
             "attempt": previous_trace.get("attempt", 0) + 1,
@@ -303,63 +309,70 @@ class Core:
             "commit_result": "not_requested",
             "delivery_result": "pending",
             "model_usage": None,
+            "validation_result": (
+                previous_trace.get("validation_result") if outbound else None
+            ),
+            "validation_reasons": (
+                previous_trace.get("validation_reasons", []) if outbound else []
+            ),
         }
         accepted = False
-        outbound = (
-            Communication(**json.loads(row["outbound"])) if row["outbound"] else None
-        )
+        status = "retryable"
         stage = "model"
         try:
             if outbound is None:
                 proposal = self.model.propose(inbound, self.config.contract_version)
-                # Envelope/provenance only; Domain Contract validation belongs to #14.
-                if (
-                    not isinstance(proposal, SemanticProposal)
-                    or proposal.schema_version != 1
-                    or proposal.communication_id != inbound.id
-                    or proposal.contract_version != self.config.contract_version
-                    or not isinstance(proposal.draft_response, str)
-                    or not proposal.draft_response.strip()
-                    or len(proposal.draft_response) > 65536
-                    or not isinstance(proposal.candidate_claims, tuple)
-                    or any(
-                        not isinstance(claim, CandidateClaim)
-                        or claim.source_communication_id != inbound.id
-                        or claim.status != "candidate"
-                        for claim in proposal.candidate_claims
+                validation = validate(proposal, inbound.id, self.contract)
+                trace["validation_result"] = validation.outcome
+                trace["validation_reasons"] = list(validation.reasons)
+                trace["proposal_contract_version"] = proposal.contract_version
+                trace["proposal_intent"] = proposal.intent
+                if proposal.intent == "semantic_commit":
+                    trace["commit_result"] = "rejected"
+                status = {
+                    "accepted": "retryable",
+                    "rejected": "rejected",
+                    "stale": "reprocess_required",
+                }[validation.outcome]
+                try:
+                    captured = json.dumps(asdict(proposal), allow_nan=False)
+                except (TypeError, ValueError, RecursionError):
+                    captured = None
+                    trace["proposal_capture"] = "unserializable"
+                    if validation.outcome == "accepted":
+                        raise ValueError("accepted proposal must be JSON serializable") from None
+                if validation.outcome == "accepted":
+                    outbound = Communication(
+                        id=str(uuid4()),
+                        channel=inbound.channel,
+                        sender=inbound.sender,
+                        actor_id=inbound.actor_id,
+                        direction="outbound",
+                        idempotency_key=inbound.id,
+                        text=proposal.draft_response,
+                        sent_at=now(),
+                        received_at=now(),
+                        thread_id=inbound.thread_id,
+                        reply_to=inbound.id,
                     )
-                ):
-                    raise ValueError("invalid candidate-only proposal envelope")
-                trace["validation_result"] = "candidate_only"
-                outbound = Communication(
-                    id=str(uuid4()),
-                    channel=inbound.channel,
-                    sender=inbound.sender,
-                    actor_id=inbound.actor_id,
-                    direction="outbound",
-                    idempotency_key=inbound.id,
-                    text=proposal.draft_response,
-                    sent_at=now(),
-                    received_at=now(),
-                    thread_id=inbound.thread_id,
-                    reply_to=inbound.id,
-                )
+                else:
+                    trace["delivery_result"] = "not_attempted"
                 stage = "storage"
                 with connect(self.config.database) as db:
                     db.execute(
                         "UPDATE turns SET proposal=?, outbound=?, trace=? WHERE id=?",
                         (
-                            json.dumps(asdict(proposal)),
-                            json.dumps(asdict(outbound)),
+                            captured,
+                            json.dumps(asdict(outbound)) if outbound else None,
                             json.dumps(trace),
                             inbound.id,
                         ),
                     )
-            trace["validation_result"] = "candidate_only"
-            stage = "channel"
-            accepted = self.channel.deliver(outbound)
-            trace["delivery_result"] = "accepted" if accepted else "retryable"
-        except (OSError, ValueError, TypeError, sqlite3.Error) as error:
+            if outbound is not None:
+                stage = "channel"
+                accepted = self.channel.deliver(outbound)
+                trace["delivery_result"] = "accepted" if accepted else "retryable"
+        except (OSError, ValueError, TypeError, RecursionError, sqlite3.Error) as error:
             trace["failure_stage"] = stage
             trace["error_type"] = type(error).__name__
             trace["delivery_result"] = (
@@ -367,7 +380,7 @@ class Core:
             )
         trace["finished_at"] = now()
         trace["duration_ms"] = round((monotonic() - started) * 1000, 3)
-        status = "completed" if accepted else "retryable"
+        status = "completed" if accepted else status
         with connect(self.config.database) as db:
             db.execute(
                 "UPDATE turns SET status=?, trace=? WHERE id=?",

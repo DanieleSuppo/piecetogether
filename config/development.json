@@ -3,6 +3,7 @@
   "channel": "development",
   "model": "deterministic",
   "contract_version": "development-v1",
+  "contract": "development-contract.json",
   "capabilities": ["receive", "reply"],
   "identities": {
     "development:sender-1": "actor-1"
