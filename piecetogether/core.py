@@ -173,6 +173,19 @@ def connect(database: Path) -> Iterator[sqlite3.Connection]:
         db.close()
 
 
+def _record_attempt(
+    db: sqlite3.Connection, communication_id: str, proposal: str | None,
+    outbound: str | None, trace: dict[str, Any], status: str,
+) -> None:
+    db.execute(
+        "INSERT INTO processing_attempts VALUES (?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(communication_id, attempt) DO UPDATE SET "
+        "proposal=excluded.proposal, outbound=excluded.outbound, "
+        "trace=excluded.trace, status=excluded.status",
+        (communication_id, trace.get("attempt", 0), proposal, outbound, json.dumps(trace), status),
+    )
+
+
 class Core:
     def __init__(
         self,
@@ -206,7 +219,26 @@ class Core:
                 CREATE TABLE IF NOT EXISTS deliveries (
                     id TEXT PRIMARY KEY, outbound TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS processing_attempts (
+                    communication_id TEXT NOT NULL REFERENCES turns(id),
+                    attempt INTEGER NOT NULL,
+                    proposal TEXT,
+                    outbound TEXT,
+                    trace TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    PRIMARY KEY(communication_id, attempt)
+                );
             """)
+            # Import the last available checkpoint from pre-history deployments once.
+            legacy_rows = db.execute(
+                "SELECT * FROM turns WHERE trace IS NOT NULL AND NOT EXISTS "
+                "(SELECT 1 FROM processing_attempts WHERE communication_id=turns.id)"
+            ).fetchall()
+            for row in legacy_rows:
+                _record_attempt(
+                    db, row["id"], row["proposal"], row["outbound"],
+                    json.loads(row["trace"]), row["status"],
+                )
 
     def accept(self, payload: Any) -> dict[str, Any]:
         required = {"channel", "sender", "idempotency_key", "text", "sent_at"}
@@ -290,58 +322,70 @@ class Core:
                 "reply": json.loads(row["outbound"])["text"],
                 "status": "completed",
             }
+        previous_trace = json.loads(row["trace"]) if row["trace"] else {}
+        if (
+            row["status"] != "rejected"
+            and (row["proposal"] or previous_trace.get("proposal_capture") == "unserializable")
+            and previous_trace.get("validation_result") == "rejected"
+            and not previous_trace.get("failure_stage")
+        ):
+            # Recover the pre-atomic #14 checkpoint without replacing its decision.
+            with connect(self.config.database) as db:
+                db.execute("UPDATE turns SET status='rejected' WHERE id=?", (inbound.id,))
+                _record_attempt(
+                    db, inbound.id, row["proposal"], row["outbound"], previous_trace, "rejected",
+                )
+            return {"communication_id": inbound.id, "reply": None, "status": "rejected"}
         if row["status"] == "rejected":
             return {"communication_id": inbound.id, "reply": None, "status": "rejected"}
         started = monotonic()
-        previous_trace = json.loads(row["trace"]) if row["trace"] else {}
         outbound = (
             Communication(**json.loads(row["outbound"])) if row["outbound"] else None
         )
         trace: dict[str, Any] = {
             "input_communication_id": inbound.id,
-            "contract_version": (
-                previous_trace.get("contract_version", self.config.contract_version)
-                if outbound else self.config.contract_version
-            ),
+            "contract_version": self.config.contract_version,
             "model_provider": self.config.model,
             "attempt": previous_trace.get("attempt", 0) + 1,
             "started_at": now(),
             "commit_result": "not_requested",
             "delivery_result": "pending",
             "model_usage": None,
-            "validation_result": (
-                previous_trace.get("validation_result") if outbound else None
-            ),
-            "validation_reasons": (
-                previous_trace.get("validation_reasons", []) if outbound else []
-            ),
+            "validation_result": None,
+            "validation_reasons": [],
         }
         accepted = False
         status = "retryable"
+        saved_outbound = row["outbound"]
+        captured = row["proposal"] if outbound else None
         stage = "model"
         try:
             if outbound is None:
                 proposal = self.model.propose(inbound, self.config.contract_version)
-                validation = validate(proposal, inbound.id, self.contract)
-                trace["validation_result"] = validation.outcome
-                trace["validation_reasons"] = list(validation.reasons)
-                trace["proposal_contract_version"] = proposal.contract_version
-                trace["proposal_intent"] = proposal.intent
-                if proposal.intent == "semantic_commit":
-                    trace["commit_result"] = "rejected"
-                status = {
-                    "accepted": "retryable",
-                    "rejected": "rejected",
-                    "stale": "reprocess_required",
-                }[validation.outcome]
-                try:
-                    captured = json.dumps(asdict(proposal), allow_nan=False)
-                except (TypeError, ValueError, RecursionError):
-                    captured = None
-                    trace["proposal_capture"] = "unserializable"
-                    if validation.outcome == "accepted":
-                        raise ValueError("accepted proposal must be JSON serializable") from None
+            else:
+                stage = "validation"
+                proposal = SemanticProposal.from_dict(json.loads(row["proposal"]))
+            validation = validate(proposal, inbound.id, self.contract)
+            trace["validation_result"] = validation.outcome
+            trace["validation_reasons"] = list(validation.reasons)
+            trace["proposal_contract_version"] = proposal.contract_version
+            trace["proposal_intent"] = proposal.intent
+            if proposal.intent == "semantic_commit":
+                trace["commit_result"] = "rejected"
+            status = {
+                "accepted": "retryable",
+                "rejected": "rejected",
+                "stale": "reprocess_required",
+            }[validation.outcome]
+            try:
+                captured = json.dumps(asdict(proposal), allow_nan=False)
+            except (TypeError, ValueError, RecursionError):
+                captured = None
+                trace["proposal_capture"] = "unserializable"
                 if validation.outcome == "accepted":
+                    raise ValueError("accepted proposal must be JSON serializable") from None
+            if validation.outcome == "accepted":
+                if outbound is None:
                     outbound = Communication(
                         id=str(uuid4()),
                         channel=inbound.channel,
@@ -355,24 +399,30 @@ class Core:
                         thread_id=inbound.thread_id,
                         reply_to=inbound.id,
                     )
-                else:
-                    trace["delivery_result"] = "not_attempted"
-                stage = "storage"
-                with connect(self.config.database) as db:
-                    db.execute(
-                        "UPDATE turns SET proposal=?, outbound=?, trace=? WHERE id=?",
-                        (
-                            captured,
-                            json.dumps(asdict(outbound)) if outbound else None,
-                            json.dumps(trace),
-                            inbound.id,
-                        ),
-                    )
+            else:
+                outbound = None
+                trace["delivery_result"] = "not_attempted"
+                trace["finished_at"] = now()
+                trace["duration_ms"] = round((monotonic() - started) * 1000, 3)
+            stage = "storage"
+            encoded_outbound = json.dumps(asdict(outbound)) if outbound else None
+            with connect(self.config.database) as db:
+                db.execute(
+                    "UPDATE turns SET proposal=?, outbound=?, trace=?, status=? WHERE id=?",
+                    (captured, encoded_outbound, json.dumps(trace), status, inbound.id),
+                )
+                _record_attempt(db, inbound.id, captured, encoded_outbound, trace, status)
+            saved_outbound = encoded_outbound
+            if outbound is None:
+                return {"communication_id": inbound.id, "reply": None, "status": status}
             if outbound is not None:
                 stage = "channel"
                 accepted = self.channel.deliver(outbound)
                 trace["delivery_result"] = "accepted" if accepted else "retryable"
         except (OSError, ValueError, TypeError, RecursionError, sqlite3.Error) as error:
+            status = "retryable"
+            if stage == "validation":
+                saved_outbound = None
             trace["failure_stage"] = stage
             trace["error_type"] = type(error).__name__
             trace["delivery_result"] = (
@@ -383,9 +433,10 @@ class Core:
         status = "completed" if accepted else status
         with connect(self.config.database) as db:
             db.execute(
-                "UPDATE turns SET status=?, trace=? WHERE id=?",
-                (status, json.dumps(trace), inbound.id),
+                "UPDATE turns SET status=?, trace=?, outbound=? WHERE id=?",
+                (status, json.dumps(trace), saved_outbound, inbound.id),
             )
+            _record_attempt(db, inbound.id, captured, saved_outbound, trace, status)
         return {
             "communication_id": inbound.id,
             "reply": outbound.text if accepted and outbound else None,
@@ -398,10 +449,24 @@ class Core:
             row = db.execute(
                 "SELECT * FROM turns WHERE id=?", (communication_id,)
             ).fetchone()
+            attempts = db.execute(
+                "SELECT * FROM processing_attempts WHERE communication_id=? ORDER BY attempt",
+                (communication_id,),
+            ).fetchall()
         if row is None:
             raise KeyError(communication_id)
         return {
             "status": row["status"],
+            "attempts": [
+                {
+                    "attempt": item["attempt"], "status": item["status"],
+                    **{
+                        name: json.loads(item[name]) if item[name] else None
+                        for name in ("proposal", "outbound", "trace")
+                    },
+                }
+                for item in attempts
+            ],
             **{
                 name: json.loads(row[name]) if row[name] else None
                 for name in ("inbound", "proposal", "outbound", "trace")

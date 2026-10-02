@@ -750,13 +750,15 @@ Replies contain only `communication_id`, `status` and `reply`. Repeated delivery
 
 `config/development.json` selects the static development ChannelPlugin, deterministic ModelProvider, declarative Contract file and version, enabled capabilities and identity mappings. Relative database and Contract paths resolve from the config file's directory; absolute paths are also supported. Optional `secret_references` map names to environment variable names; values stay outside configuration. The development adapters need no credentials. Unknown adapters and unmapped senders are rejected; runtime input cannot change configuration.
 
-SQLite stores normalized inbound/outbound Communications, candidate proposals, processing outcomes and a minimal Evaluation Trace. The development ChannelPlugin accepts handoff into a durable local mailbox; it does not send Email or Telegram. Model and channel work run outside database transactions. There is no trusted-state writer, State API or event publisher in this slice.
+SQLite stores normalized inbound/outbound Communications, candidate proposals, processing outcomes and per-attempt Evaluation Traces. Validation checkpoints atomically persist the proposal, outbound, outcome and attempt evidence. The development ChannelPlugin accepts handoff into a durable local mailbox; it does not send Email or Telegram. Model and channel work run outside database transactions. There is no trusted-state writer, State API or event publisher in this slice.
 
 Run one sequential development worker per database. This transport is operator-local, not a public network ingress or production connector. Candidates and traces are not returned to senders. A local operator with deployment filesystem access can inspect an outcome separately:
 
 ```bash
 python3 -m piecetogether --config config/development.json --inspect <communication_id>
 ```
+
+Inspection returns the latest turn fields and an ordered `attempts` collection containing each attempt's number, status, proposal, outbound and trace. Reprocessing preserves earlier stale decisions and captured proposals. Startup imports the last available checkpoint from older deployments once; earlier attempts that those deployments already overwrote cannot be reconstructed.
 
 ## Declarative Domain Contracts and Proposals
 
@@ -786,6 +788,8 @@ Model adapters return `SemanticProposal` records from `piecetogether.proposals`.
 - `ContextRequestOperation`: describe a scoped, purpose-labelled request with a positive retrieval budget. Retrieval execution and disclosure eligibility belong to #16; until then requests reject with `context_retrieval_unavailable`.
 
 Proposal-local identifiers and targets within a Grounding plan must be unique. References resolve independently of operation order, and every operation must validate before any reply is handed off. An envelope contains at most 256 operations and 256 free-text candidates. Free-text `candidate_claims` remain unstructured Working State and cannot stand in for a structured Claim operation or trusted assertion. Concept names and type names are separate namespaces; a Concept name can never be used to introduce an Entity Type. The active Contract version, Proposal version/intent, validation outcome (`accepted`, `rejected`, `stale`) and deterministic reason codes are recorded through operator inspection. Unserializable rejected model output is omitted with an explicit trace marker; the rejection itself remains durable.
+
+Delivery retries restore typed operations from the captured JSON and validate against the active Contract before handoff. Valid retries reuse the same outbound identifier and draft without another model invocation. A changed Contract reference produces `reprocess_required` and clears the current reply; redelivery then obtains a fresh proposal. Legacy envelopes receive the same version and policy checks, including rejection of boolean schema versions. A completed historical outcome remains idempotent. Storage failures remain operational retries, and an interrupted legacy rejection with already-recorded validation evidence is recovered without replacing its decision.
 
 Acceptance authorizes candidate processing, not a trusted commit. This ticket has no trusted writer: semantic-commit requests, unresolved existing-object references, Grounding resolutions without Core-owned exposed items, and Artifact lifecycle requests without Core-owned records/staged bytes reject explicitly. Their stateful implementations belong to #15, #17 and #19. A permitted Grounding plan or Artifact classification remains candidate-only; it cannot manufacture Grounding evidence or persistent content. Reusable Emergent Concepts and their source Communication remain durable in candidate proposals for #15's history-preserving persistence and later reconciliation.
 

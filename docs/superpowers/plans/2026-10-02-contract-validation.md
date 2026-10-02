@@ -87,3 +87,15 @@ Issue #14's allowed domain and policies are covered by slices 2–3. Typed/versi
 - The suggested Concept/type-sentinel collision is not a type-policy bypass: these namespaces are independent and Entity operations always check the closed Entity Type catalogue. A Core-boundary test verifies that a Concept with a sentinel-like name cannot create that Entity Type.
 - The full suite passed 28 tests before review. Final focused runs pass 21 validation, 9 Core and 4 service tests (34 total); strict mypy passes all five production modules. Premium Spec review was unavailable due provider quota; a separate independent reviewer completed that axis and verified the fixes without unresolved Spec blockers.
 - Final malformed-metadata checks verify that non-JSON Contract references, Communication references and intent values produce durable operational failure traces before entering semantic validation or trace serialization.
+
+## Independent Peer Review Follow-up
+
+Requested separately against `cbf9ce0..3df8168` using `requesting-code-review`; evaluated using `receiving-code-review` and reproduced the reported failure windows before editing.
+
+1. **Cached validation:** pending deliveries previously bypassed the active Contract and legacy version checks. Captured JSON now restores typed operations and passes through the same validator as fresh proposals. Valid retries preserve their original outbound identifier; stale replies require reprocessing before handoff.
+2. **Atomic rejection:** proposal capture and terminal status previously used separate writes. The validation checkpoint now commits proposal, outbound, trace, semantic status and attempt evidence together. Failed storage remains operationally retryable. An interrupted older rejection is recovered from its recorded evidence without another model invocation.
+3. **Attempt evidence:** reprocessing previously overwrote stale proposals and outcomes. A small SQLite attempt record preserves each processing attempt and is exposed through operator-only `Core.inspect`. The current attempt updates its handoff outcome atomically; subsequent attempts preserve completed earlier records. Existing last checkpoints migrate once at bootstrap.
+
+Regression seam: `tests/test_processing.py`, through `Core.accept`, `Core.inspect`, deterministic providers/channels, legacy persistence fixtures and real SQLite trigger faults. These checks also cover final-write failure after handoff, transactional rollback when attempt storage fails, and typed candidate-graph restoration.
+
+The independent follow-up identified and verified one additional legacy recovery edge: an intentionally omitted, unserializable rejected proposal still has valid rejection evidence in its explicit trace marker. Recovery now recognizes that marker while excluding operational storage failures. Both the positive recovery and negative storage-failure cases have regressions. The reviewer confirmed all three Important findings resolved, with no remaining Important or Critical blockers within #14's scope.

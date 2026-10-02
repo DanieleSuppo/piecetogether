@@ -115,6 +115,44 @@ class SemanticProposal:
     operations: tuple[Operation, ...] = ()
     intent: Literal["candidate", "semantic_commit"] = "candidate"
 
+    @classmethod
+    def from_dict(cls, data: Any) -> "SemanticProposal":
+        """Restore captured JSON without coercing versions or semantic values."""
+        operation_types: dict[str, type[Operation]] = {
+            "entity": EntityOperation, "context": ContextOperation,
+            "claim": ClaimOperation, "relationship": RelationshipOperation,
+            "grounding_plan": GroundingPlanOperation,
+            "grounding_resolution": GroundingResolutionOperation,
+            "artifact": ArtifactOperation, "emergent_concept": EmergentConceptOperation,
+            "context_request": ContextRequestOperation,
+        }
+        try:
+            if not isinstance(data, dict):
+                raise ValueError("invalid captured proposal")
+            envelope = dict(data)
+            claims = envelope.pop("candidate_claims")
+            operations = envelope.pop("operations", [])
+            if not isinstance(claims, list) or not isinstance(operations, list):
+                raise ValueError("captured proposal collections must be arrays")
+            restored: list[Operation] = []
+            for raw in operations:
+                if not isinstance(raw, dict):
+                    raise ValueError("invalid captured operation")
+                fields = dict(raw)
+                operation_type = operation_types[fields.pop("kind")]
+                for key in ("entity_ids", "claim_ids", "roles", "scope_ids"):
+                    if key in fields:
+                        if not isinstance(fields[key], list):
+                            raise ValueError("captured operation references must be arrays")
+                        fields[key] = tuple(fields[key])
+                restored.append(operation_type(**fields))
+            return cls(
+                candidate_claims=tuple(CandidateClaim(**claim) for claim in claims),
+                operations=tuple(restored), **envelope,
+            )
+        except (KeyError, TypeError) as error:
+            raise ValueError("invalid captured proposal") from error
+
 
 @dataclass(frozen=True)
 class ValidationResult:
