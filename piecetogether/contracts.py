@@ -147,12 +147,20 @@ class DomainContract:
         if {"$context", "$claim", "$artifact"} & self.entity_types.keys():
             raise ValueError("reserved Entity Type name")
         for policy in self.grounding_policies.values():
-            rule = require_record(policy, {"acceptance"}, {"acceptance"})
+            rule = require_record(policy, {"acceptance", "confirmation_forms"}, {"acceptance"})
             modes = rule["acceptance"]
             if not isinstance(modes, list) or not modes or any(
                 mode not in ("explicit", "implicit") for mode in modes
             ):
                 raise ValueError("invalid Grounding acceptance policy")
+            if "confirmation_forms" in rule and (
+                "explicit" not in modes or not isinstance(rule["confirmation_forms"], list)
+                or not rule["confirmation_forms"] or any(
+                    not isinstance(form, str) or not form.strip() or len(form) > 32768
+                    for form in rule["confirmation_forms"]
+                )
+            ):
+                raise ValueError("invalid explicit confirmation forms")
         for policy in self.relationship_types.values():
             rule = require_record(
                 policy, {"source_types", "target_types"}, {"source_types", "target_types"}

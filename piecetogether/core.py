@@ -1,4 +1,4 @@
-"""Development Core: durable acquisition and candidate-only interpretation."""
+"""Development Core: durable acquisition and authorized semantic history."""
 
 import json
 import os
@@ -13,7 +13,8 @@ from typing import Any, Protocol
 from uuid import uuid4
 
 from .contracts import DeclarativeContractProvider, DomainContractProvider
-from .proposals import CandidateClaim, SemanticProposal, validate
+from . import history
+from .proposals import CandidateClaim, SemanticProposal, ValidationResult
 
 
 def now() -> str:
@@ -239,6 +240,7 @@ class Core:
                     db, row["id"], row["proposal"], row["outbound"],
                     json.loads(row["trace"]), row["status"],
                 )
+            history.initialize(db, self.contract)
 
     def accept(self, payload: Any) -> dict[str, Any]:
         required = {"channel", "sender", "idempotency_key", "text", "sent_at"}
@@ -304,6 +306,9 @@ class Core:
                 "SELECT * FROM turns WHERE channel=? AND sender=? AND idempotency_key=?",
                 (inbound.channel, inbound.sender, inbound.idempotency_key),
             ).fetchone()
+            assert row is not None
+            # The turn checkpoint and its commit must come from the same transaction.
+            prior_commit = history.committed(db, row['id'])
         assert row is not None
         stored = json.loads(row["inbound"])
         incoming = asdict(inbound)
@@ -354,6 +359,10 @@ class Core:
             "validation_result": None,
             "validation_reasons": [],
         }
+        if prior_commit:
+            trace.update(commit_result="committed", semantic_commit_id=prior_commit['id'],
+                         semantic_revision=prior_commit['semantic_revision'],
+                         contract_version=prior_commit['contract_version'])
         accepted = False
         status = "retryable"
         saved_outbound = row["outbound"]
@@ -365,13 +374,18 @@ class Core:
             else:
                 stage = "validation"
                 proposal = SemanticProposal.from_dict(json.loads(row["proposal"]))
-            validation = validate(proposal, inbound.id, self.contract)
+            with connect(self.config.database) as db:
+                validation = (ValidationResult("accepted") if prior_commit else
+                              history.check(db, proposal, asdict(inbound), self.contract))
+            if (validation.outcome == "accepted" and not prior_commit and outbound is not None
+                    and outbound.text != history.grounding_response(proposal)):
+                validation = ValidationResult("stale", ("grounding_exposure_changed",))
             trace["validation_result"] = validation.outcome
             trace["validation_reasons"] = list(validation.reasons)
             trace["proposal_contract_version"] = proposal.contract_version
             trace["proposal_intent"] = proposal.intent
             if proposal.intent == "semantic_commit":
-                trace["commit_result"] = "rejected"
+                trace["commit_result"] = "committed" if prior_commit else validation.outcome
             status = {
                 "accepted": "retryable",
                 "rejected": "rejected",
@@ -385,6 +399,9 @@ class Core:
                 if validation.outcome == "accepted":
                     raise ValueError("accepted proposal must be JSON serializable") from None
             if validation.outcome == "accepted":
+                # Detach mutable provider values; exposure and commit use this captured snapshot.
+                assert captured is not None
+                proposal = SemanticProposal.from_dict(json.loads(captured))
                 if outbound is None:
                     outbound = Communication(
                         id=str(uuid4()),
@@ -393,7 +410,7 @@ class Core:
                         actor_id=inbound.actor_id,
                         direction="outbound",
                         idempotency_key=inbound.id,
-                        text=proposal.draft_response,
+                        text=history.grounding_response(proposal),
                         sent_at=now(),
                         received_at=now(),
                         thread_id=inbound.thread_id,
@@ -405,8 +422,52 @@ class Core:
                 trace["finished_at"] = now()
                 trace["duration_ms"] = round((monotonic() - started) * 1000, 3)
             stage = "storage"
-            encoded_outbound = json.dumps(asdict(outbound)) if outbound else None
             with connect(self.config.database) as db:
+                db.execute("BEGIN IMMEDIATE")
+                raced_commit = history.committed(db, inbound.id)
+                if raced_commit and not prior_commit:
+                    checkpoint = db.execute("SELECT * FROM turns WHERE id=?", (inbound.id,)).fetchone()
+                    checkpoint_trace = json.loads(checkpoint['trace'])
+                    trace.update(commit_result="committed", semantic_commit_id=raced_commit['id'],
+                                 semantic_revision=raced_commit['semantic_revision'],
+                                 contract_version=raced_commit['contract_version'],
+                                 recovery="already_committed",
+                                 discarded_proposal=json.loads(captured) if captured else None,
+                                 validation_result="accepted", validation_reasons=[],
+                                 attempt=checkpoint_trace['attempt'] + 1)
+                    captured = checkpoint['proposal']
+                    proposal = SemanticProposal.from_dict(json.loads(captured))
+                    outbound = Communication(**json.loads(checkpoint['outbound']))
+                    status = "retryable"
+                    prior_commit = raced_commit
+                    validation = ValidationResult("accepted")
+                    if checkpoint['status'] == "completed":
+                        trace['delivery_result'] = 'accepted'
+                        trace['finished_at'] = now()
+                        trace['duration_ms'] = round((monotonic() - started) * 1000, 3)
+                        db.execute("UPDATE turns SET trace=? WHERE id=?", (json.dumps(trace), inbound.id))
+                        _record_attempt(db, inbound.id, captured, checkpoint['outbound'], trace, 'completed')
+                        return {"communication_id": inbound.id, "reply": outbound.text, "status": "completed"}
+                if not prior_commit and validation.outcome == "accepted":
+                    validation, semantic_commit = history.commit(
+                        db, proposal, asdict(inbound), self.contract, now(),
+                    )
+                    trace["validation_result"] = validation.outcome
+                    trace["validation_reasons"] = list(validation.reasons)
+                    if semantic_commit:
+                        trace.update(commit_result="committed", semantic_commit_id=semantic_commit['id'],
+                                     semantic_revision=semantic_commit['semantic_revision'])
+                    elif proposal.intent == "semantic_commit":
+                        trace["commit_result"] = validation.outcome
+                    if validation.outcome != "accepted":
+                        status = "rejected" if validation.outcome == "rejected" else "reprocess_required"
+                        outbound = None
+                        trace["delivery_result"] = "not_attempted"
+                        trace["finished_at"] = now()
+                        trace["duration_ms"] = round((monotonic() - started) * 1000, 3)
+                if validation.outcome == "accepted" and not prior_commit:
+                    history.remember_concepts(db, proposal, inbound.actor_id)
+                encoded_outbound = json.dumps(asdict(outbound)) if outbound else None
                 db.execute(
                     "UPDATE turns SET proposal=?, outbound=?, trace=?, status=? WHERE id=?",
                     (captured, encoded_outbound, json.dumps(trace), status, inbound.id),
@@ -425,6 +486,10 @@ class Core:
                 saved_outbound = None
             trace["failure_stage"] = stage
             trace["error_type"] = type(error).__name__
+            if trace.get("proposal_intent") == "semantic_commit" and stage == "storage" and not prior_commit:
+                trace["commit_result"] = "retryable"
+                trace.pop("semantic_commit_id", None)
+                trace.pop("semantic_revision", None)
             trace["delivery_result"] = (
                 "indeterminate" if stage == "channel" else "not_attempted"
             )
@@ -432,11 +497,26 @@ class Core:
         trace["duration_ms"] = round((monotonic() - started) * 1000, 3)
         status = "completed" if accepted else status
         with connect(self.config.database) as db:
+            db.execute("BEGIN IMMEDIATE")
+            durable_commit = history.committed(db, inbound.id)
+            if durable_commit and trace.get('semantic_commit_id') != durable_commit['id']:
+                checkpoint = db.execute("SELECT * FROM turns WHERE id=?", (inbound.id,)).fetchone()
+                checkpoint_trace = json.loads(checkpoint['trace'])
+                trace.update(commit_result="committed", semantic_commit_id=durable_commit['id'],
+                             semantic_revision=durable_commit['semantic_revision'],
+                             recovery="already_committed", attempt=checkpoint_trace['attempt'] + 1)
+                # Retain the losing attempt's evidence without replacing the committed checkpoint.
+                _record_attempt(db, inbound.id, captured, saved_outbound, trace, checkpoint['status'])
+                return {"communication_id": inbound.id, "status": checkpoint['status'],
+                        "reply": json.loads(checkpoint['outbound'])['text']
+                        if checkpoint['status'] == 'completed' else None}
             db.execute(
                 "UPDATE turns SET status=?, trace=?, outbound=? WHERE id=?",
                 (status, json.dumps(trace), saved_outbound, inbound.id),
             )
             _record_attempt(db, inbound.id, captured, saved_outbound, trace, status)
+            if accepted and outbound is not None:
+                history.expose(db, proposal, outbound.id, inbound.actor_id, trace['finished_at'])
         return {
             "communication_id": inbound.id,
             "reply": outbound.text if accepted and outbound else None,
@@ -453,10 +533,12 @@ class Core:
                 "SELECT * FROM processing_attempts WHERE communication_id=? ORDER BY attempt",
                 (communication_id,),
             ).fetchall()
+            grounding_items = history.exposed_items(db, communication_id)
         if row is None:
             raise KeyError(communication_id)
         return {
             "status": row["status"],
+            "grounding_items": grounding_items,
             "attempts": [
                 {
                     "attempt": item["attempt"], "status": item["status"],
@@ -472,3 +554,15 @@ class Core:
                 for name in ("inbound", "proposal", "outbound", "trace")
             },
         }
+
+    def inspect_history(self) -> dict[str, Any]:
+        """Operator-only ledger inspection, separate from sender acquisition."""
+        with connect(self.config.database) as db:
+            db.execute("BEGIN")
+            return history.inspect_history(db)
+
+    def inspect_concepts(self) -> list[dict[str, Any]]:
+        """Non-authoritative vocabulary for later Core-owned reconciliation."""
+        with connect(self.config.database) as db:
+            return [json.loads(row['record']) for row in db.execute(
+                "SELECT record FROM emergent_concepts ORDER BY rowid")]

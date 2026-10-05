@@ -47,6 +47,7 @@ class GroundingPlanOperation:
     policy: str
     claim_ids: tuple[str, ...]
     acceptance_mode: Literal["explicit", "implicit"]
+    resolution_ids: tuple[str, ...] = ()
     kind: Literal["grounding_plan"] = field(default="grounding_plan", init=False)
 
 
@@ -57,6 +58,7 @@ class GroundingResolutionOperation:
     evidence_communication_id: str
     acceptance_mode: Literal["explicit", "implicit"]
     outcome: Literal["accepted", "rejected", "corrected"]
+    rationale: str | None = None
     kind: Literal["grounding_resolution"] = field(default="grounding_resolution", init=False)
 
 
@@ -114,6 +116,7 @@ class SemanticProposal:
     draft_response: str
     operations: tuple[Operation, ...] = ()
     intent: Literal["candidate", "semantic_commit"] = "candidate"
+    semantic_revision: int | None = None
 
     @classmethod
     def from_dict(cls, data: Any) -> "SemanticProposal":
@@ -140,7 +143,7 @@ class SemanticProposal:
                     raise ValueError("invalid captured operation")
                 fields = dict(raw)
                 operation_type = operation_types[fields.pop("kind")]
-                for key in ("entity_ids", "claim_ids", "roles", "scope_ids"):
+                for key in ("entity_ids", "claim_ids", "resolution_ids", "roles", "scope_ids"):
                     if key in fields:
                         if not isinstance(fields[key], list):
                             raise ValueError("captured operation references must be arrays")
@@ -161,7 +164,9 @@ class ValidationResult:
 
 
 def validate(
-    proposal: SemanticProposal, communication_id: str, contract: DomainContract
+    proposal: SemanticProposal, communication_id: str, contract: DomainContract,
+    existing_targets: dict[str, str] | None = None,
+    existing_concepts: set[str] | None = None,
 ) -> ValidationResult:
     # Malformed provider output is an operational parsing failure.
     if (
@@ -193,12 +198,18 @@ def validate(
         return ValidationResult("rejected", ("invalid_provenance_or_candidate_status",))
     if proposal.contract_version != contract.version:
         return ValidationResult("stale", ("contract_version_changed",))
-    if proposal.intent != "candidate":
-        return ValidationResult("rejected", ("trusted_commit_unavailable",))
+    if proposal.intent not in ("candidate", "semantic_commit"):
+        return ValidationResult("rejected", ("invalid_proposal_intent",))
+    if proposal.intent == "semantic_commit" and (
+        type(proposal.semantic_revision) is not int or proposal.semantic_revision < 0
+    ):
+        return ValidationResult("rejected", ("semantic_revision_required",))
     if not isinstance(proposal.operations, tuple) or len(proposal.operations) > 256:
         return ValidationResult("rejected", ("invalid_operations",))
-    targets: dict[str, str] = {}
-    emergent: set[str] = set()
+    targets: dict[str, str] = dict(existing_targets or {})
+    emergent: set[str] = set(existing_concepts or ())
+    local_ids: set[str] = set()
+    declared_concepts: set[str] = set()
     for operation in proposal.operations:
         if type(operation) not in (
             EntityOperation, ContextOperation, ClaimOperation, RelationshipOperation,
@@ -217,21 +228,31 @@ def validate(
                 return ValidationResult("rejected", ("emergent_canonical_collision",))
             if operation.status != "non_authoritative":
                 return ValidationResult("rejected", ("emergent_authority_not_allowed",))
-            if operation.name in emergent:
+            if operation.name in declared_concepts:
                 return ValidationResult("rejected", ("duplicate_emergent_concept",))
             if not isinstance(operation.description, str) or not operation.description.strip() or len(operation.description) > 32768:
                 return ValidationResult("rejected", ("invalid_emergent_description",))
             emergent.add(operation.name)
+            declared_concepts.add(operation.name)
         if isinstance(operation, (EntityOperation, ContextOperation, ClaimOperation, ArtifactOperation)):
-            if not valid_name(operation.id) or operation.id in targets:
+            if not valid_name(operation.id) or operation.id in local_ids or (
+                operation.id in targets and not (
+                    isinstance(operation, (EntityOperation, ContextOperation))
+                    and operation.action == "resolve"
+                )
+            ):
                 return ValidationResult("rejected", ("invalid_or_duplicate_id",))
+            local_ids.add(operation.id)
+            if isinstance(operation, (EntityOperation, ContextOperation)) and operation.action == "resolve":
+                continue
             targets[operation.id] = (
                 operation.entity_type if isinstance(operation, EntityOperation)
                 else "$context" if isinstance(operation, ContextOperation)
                 else "$claim" if isinstance(operation, ClaimOperation) else "$artifact"
             )
     for operation in proposal.operations:
-        reason = operation_reason(operation, targets, communication_id, contract, emergent)
+        reason = operation_reason(operation, targets, communication_id, contract, emergent,
+                                  proposal.intent == "semantic_commit")
         if reason:
             return ValidationResult("rejected", (reason,))
         if isinstance(operation, GroundingPlanOperation) and any(
@@ -245,14 +266,16 @@ def validate(
 
 def operation_reason(
     operation: Operation, targets: dict[str, str], communication_id: str,
-    contract: DomainContract, emergent: set[str],
+    contract: DomainContract, emergent: set[str], semantic_commit: bool = False,
 ) -> str | None:
     if isinstance(operation, EntityOperation):
         if not valid_name(operation.entity_type) or operation.entity_type not in contract.entity_types:
             return "entity_type_not_allowed"
         policy = contract.entity_types[operation.entity_type]
         if operation.action == "resolve":
-            return "entity_resolution_unavailable"
+            if targets.get(operation.id) != operation.entity_type or operation.attributes:
+                return "entity_resolution_unavailable"
+            return None
         if operation.action != "create" or not policy["creation"]:
             return "entity_creation_not_allowed"
         if not value_matches(
@@ -260,6 +283,8 @@ def operation_reason(
         ):
             return "invalid_entity_attributes"
     elif isinstance(operation, ContextOperation):
+        if operation.action == "resolve" and targets.get(operation.id) == "$context" and not operation.entity_ids:
+            return None
         if operation.action != "create":
             return "context_resolution_unavailable"
         if not isinstance(operation.entity_ids, tuple) or any(
@@ -276,6 +301,8 @@ def operation_reason(
         ):
             return "claim_concept_not_allowed"
         policy = contract.claim_concepts.get(operation.concept, contract.emergent_concepts)
+        if operation.concept not in contract.claim_concepts and not policy["allowed"]:
+            return "emergent_concepts_not_allowed"
         if not valid_name(operation.target_id) or targets.get(operation.target_id) not in policy["target_types"]:
             return "claim_target_not_allowed"
         if not valid_name(operation.grounding_policy) or operation.grounding_policy != policy["grounding_policy"]:
@@ -298,16 +325,31 @@ def operation_reason(
         if operation.acceptance_mode not in contract.grounding_policies[operation.policy]["acceptance"]:
             return "grounding_mode_not_allowed"
         if isinstance(operation, GroundingPlanOperation):
-            if not isinstance(operation.claim_ids, tuple) or not operation.claim_ids or any(
+            if not isinstance(operation.claim_ids, tuple) or not isinstance(operation.resolution_ids, tuple) or not (operation.claim_ids or operation.resolution_ids) or any(
                 not valid_name(claim_id) or targets.get(claim_id) != "$claim"
                 for claim_id in operation.claim_ids
+            ) or any(
+                not valid_name(target_id) or targets.get(target_id) not in set(contract.entity_types) | {"$context"}
+                for target_id in operation.resolution_ids
             ):
                 return "grounding_target_not_allowed"
-            if len(set(operation.claim_ids)) != len(operation.claim_ids):
+            target_ids = operation.claim_ids + operation.resolution_ids
+            if len(set(target_ids)) != len(target_ids):
                 return "duplicate_grounding_target"
         else:
-            # No persisted/exposed items exist until #17. Model assertions are not evidence.
-            return "grounding_item_unavailable"
+            if not semantic_commit:
+                return "grounding_item_unavailable"
+            if (
+                not valid_name(operation.item_id)
+                or operation.evidence_communication_id != communication_id
+                or operation.outcome != "accepted"
+                or operation.rationale is not None and (
+                    not isinstance(operation.rationale, str)
+                    or not operation.rationale.strip() or len(operation.rationale) > 32768
+                )
+                or operation.acceptance_mode == "implicit" and not operation.rationale
+            ):
+                return "invalid_grounding_evidence"
     elif isinstance(operation, ArtifactOperation):
         if operation.source_communication_id not in (None, communication_id):
             return "invalid_artifact_provenance"

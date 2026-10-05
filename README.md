@@ -730,7 +730,7 @@ Extension points exist to support real applications. Connector frameworks and pl
 
 ## Status
 
-The development Core implements durable text ingress and observable candidate-only interpretation ([#13](https://github.com/DanieleSuppo/piecetogether/issues/13)), plus deterministic Domain Contract and typed Semantic Proposal validation ([#14](https://github.com/DanieleSuppo/piecetogether/issues/14)). Trusted commits, Grounding lifecycle, production channels and application APIs remain subsequent tickets. Product boundaries are captured in [docs/PRD.md](docs/PRD.md); technical authority is [SPEC #12](https://github.com/DanieleSuppo/piecetogether/issues/12).
+The development Core implements durable text ingress and observable interpretation ([#13](https://github.com/DanieleSuppo/piecetogether/issues/13)), deterministic Domain Contract and typed Semantic Proposal validation ([#14](https://github.com/DanieleSuppo/piecetogether/issues/14)), and atomic trusted semantic history ([#15](https://github.com/DanieleSuppo/piecetogether/issues/15)). Bounded context assembly, the complete conversational Grounding lifecycle, Current Trusted View, production channels and application APIs remain subsequent tickets. Product boundaries are captured in [docs/PRD.md](docs/PRD.md); technical authority is [SPEC #12](https://github.com/DanieleSuppo/piecetogether/issues/12).
 
 ## Run the development Core
 
@@ -746,11 +746,11 @@ This standalone local development process accepts one normalized JSON Communicat
 {"channel":"development","sender":"sender-1","idempotency_key":"message-1","text":"Keep the original option.","sent_at":"2026-01-01T12:00:00Z"}
 ```
 
-Replies contain only `communication_id`, `status` and `reply`. Repeated delivery returns the same completed or rejected outcome, including after restarting the process. Reusing a key with different content is rejected. `retryable` denotes an operational failure; `reprocess_required` denotes a stale Contract reference. Both have no exposed reply; redeliver the original Communication for a fresh attempt. `rejected` denotes a deterministic, terminal policy or invariant failure and has no reply.
+Replies contain only `communication_id`, `status` and `reply`. Repeated delivery returns the same completed or rejected outcome, including after restarting the process. Reusing a key with different content is rejected. `retryable` denotes an operational failure; `reprocess_required` denotes a stale Contract, semantic revision or exposure binding. Both have no exposed reply; redeliver the original Communication for a fresh attempt. `rejected` denotes a deterministic, terminal policy or invariant failure and has no reply.
 
 `config/development.json` selects the static development ChannelPlugin, deterministic ModelProvider, declarative Contract file and version, enabled capabilities and identity mappings. Relative database and Contract paths resolve from the config file's directory; absolute paths are also supported. Optional `secret_references` map names to environment variable names; values stay outside configuration. The development adapters need no credentials. Unknown adapters and unmapped senders are rejected; runtime input cannot change configuration.
 
-SQLite stores normalized inbound/outbound Communications, candidate proposals, processing outcomes and per-attempt Evaluation Traces. Validation checkpoints atomically persist the proposal, outbound, outcome and attempt evidence. The development ChannelPlugin accepts handoff into a durable local mailbox; it does not send Email or Telegram. Model and channel work run outside database transactions. There is no trusted-state writer, State API or event publisher in this slice.
+SQLite stores normalized inbound/outbound Communications, candidate proposals, processing outcomes and per-attempt Evaluation Traces separately from trusted semantic history and non-authoritative vocabulary. Validation checkpoints atomically persist the proposal, outbound, outcome and attempt evidence; accepted semantic commits also append trusted history, Grounding outcomes, revision and an outbox event in that transaction. The development ChannelPlugin accepts handoff into a durable local mailbox; it does not send Email or Telegram. Model and channel work run outside database transactions. State API, Current Trusted View and event dispatch are subsequent tickets.
 
 Run one sequential development worker per database. This transport is operator-local, not a public network ingress or production connector. Candidates and traces are not returned to senders. A local operator with deployment filesystem access can inspect an outcome separately:
 
@@ -771,7 +771,7 @@ The development Contract deliberately declares no domain Entity Types. The deter
 | `entity_types` | Type name → `creation` boolean and `attributes` map of value constraints. No required conversational attributes. |
 | `relationship_types` | Relationship name → nonempty `source_types` and `target_types` arrays. Entity Type names and `$context` are allowed; `$claim` also supports claim relationships such as `corrects`, `supersedes` and `contradicts`. |
 | `claim_concepts` | Canonical concept → `target_types`, `value` constraint and declared `grounding_policy` name. Targets are Entity Types or `$context`. |
-| `grounding_policies` | Policy name → nonempty `acceptance` array containing `explicit`, `implicit`, or both. Silence is not an acceptance mode. |
+| `grounding_policies` | Policy name → nonempty `acceptance` array containing `explicit`, `implicit`, or both. Optional nonempty `confirmation_forms` string array declares exact explicit confirmation forms, compared after trimming and case-folding; it requires `explicit` acceptance. The foundational default explicit form is `yes`. Silence is not an acceptance mode. |
 | `artifact_types` | Artifact Type → permitted `roles`, `persistence` (`forbidden`, `allowed`, `required`), `retention` and `supersession` boolean. Roles are `ephemeral-evidence`, `source-evidence`, `persistent-domain-artifact`. Retention independently declares `metadata`, `bytes`, `provenance` as `retain` or `delete`. Required persistence needs the persistent role and retained bytes. |
 | `emergent_concepts` | `{"allowed": false}`, or `allowed: true` with `target_types`, `value` and `grounding_policy`. These constraints govern every non-canonical concept; proposals cannot override them. |
 
@@ -782,7 +782,7 @@ Model adapters return `SemanticProposal` records from `piecetogether.proposals`.
 - `EntityOperation`, `ContextOperation`: propose candidate creation or resolution.
 - `ClaimOperation`: propose a constrained candidate assertion; provenance defaults to the envelope's inbound Communication and may never refer to another sender's input.
 - `RelationshipOperation`: propose a Contract-permitted relationship with permitted endpoints.
-- `GroundingPlanOperation`, `GroundingResolutionOperation`: describe a policy-governed plan or resolution.
+- `GroundingPlanOperation`, `GroundingResolutionOperation`: describe a policy-governed plan or resolution. A plan's `claim_ids` expose Claims; optional `resolution_ids` expose Entity/Context resolutions as independent items. A resolution names a Core-generated item ID and later sender evidence; optional `rationale` supports the later conversational-policy extension.
 - `ArtifactOperation`: describe role classification or lifecycle intent, with Contract-controlled retention.
 - `EmergentConceptOperation`: introduce reusable vocabulary with `non_authoritative` status; no canonical-name collisions, Entity Type creation or ontology promotion.
 - `ContextRequestOperation`: describe a scoped, purpose-labelled request with a positive retrieval budget. Retrieval execution and disclosure eligibility belong to #16; until then requests reject with `context_retrieval_unavailable`.
@@ -791,7 +791,31 @@ Proposal-local identifiers and targets within a Grounding plan must be unique. R
 
 Delivery retries restore typed operations from the captured JSON and validate against the active Contract before handoff. Valid retries reuse the same outbound identifier and draft without another model invocation. A changed Contract reference produces `reprocess_required` and clears the current reply; redelivery then obtains a fresh proposal. Legacy envelopes receive the same version and policy checks, including rejection of boolean schema versions. A completed historical outcome remains idempotent. Storage failures remain operational retries, and an interrupted legacy rejection with already-recorded validation evidence is recovered without replacing its decision.
 
-Acceptance authorizes candidate processing, not a trusted commit. This ticket has no trusted writer: semantic-commit requests, unresolved existing-object references, Grounding resolutions without Core-owned exposed items, and Artifact lifecycle requests without Core-owned records/staged bytes reject explicitly. Their stateful implementations belong to #15, #17 and #19. A permitted Grounding plan or Artifact classification remains candidate-only; it cannot manufacture Grounding evidence or persistent content. Reusable Emergent Concepts and their source Communication remain durable in candidate proposals for #15's history-preserving persistence and later reconciliation.
+Candidate acceptance authorizes Working State, not trusted mutation. For planned items the Core appends an observable rendering of every proposed interpretation and its relationships to the draft, binding the values to what the sender actually sees; model prose alone cannot expose hidden assertions. The complete response remains bounded to 65,536 characters. A Grounding plan becomes exposed/pending only after durable outbound recording and accepted channel handoff, recorded atomically with completion. Failed or indeterminate delivery leaves no groundable items; an idempotent delivery retry produces one set of stable Core-generated item IDs. A legacy cached draft missing this binding requires fresh processing. Artifact classification remains candidate-only; persistent content and lifecycle require the later Artifact tickets.
+
+## Atomic trusted semantic history
+
+A `semantic_commit` Proposal must carry a nonnegative integer `semantic_revision` and only `GroundingResolutionOperation` operations for accepted, Core-owned pending items. The foundational writer checks the active Contract, original exposed proposal, item policy, resolved Actor, later receipt after accepted exposure, `reply_to` addressing that outbound Communication, and the Contract's explicit confirmation form. Model assertions and arbitrary implicit rationales are not acceptance evidence. Rich implicit acceptance, rejection/correction outcomes, successor-candidate orchestration and later Context Pack selection belong to #17/#16.
+
+Each Entity or Context creation needs its own accepted resolution item. Accepting a Claim cannot implicitly authorize its unaccepted target or Context members. Partial accepted batches may commit dependencies first and remaining items later. Resolve operations use existing trusted IDs and cannot replace Entity attributes or Context membership; acceptance preserves their identity.
+
+The short SQLite transaction rechecks the semantic revision and appends immutable Entities, Contexts, Grounded Claims, Grounding snapshots/items, provenance links, relationships, an opaque semantic commit ID and Contract version. It advances the revision and inserts a trusted change in the outbox together with the processing checkpoint. A storage failure rolls all these writes back. A rejected or stale proposal leaves trusted history unchanged. The initial deployment-wide revision conservatively fences all trusted changes; #22 can refine the relevant scope without relaxing atomicity.
+
+Corrections, supersessions and contradictions must be Contract-permitted relationships in the exposed candidate graph. They connect a newly accepted Claim to assertions on the same target/concept; correction and supersession predecessors must already be committed. A differing assertion on the same semantic key needs an explicit history relationship to conflicting current heads. Previous assertions are never overwritten. Current Trusted View projection and its conflict representation belong to #18.
+
+A committed turn's delivery failure cannot undo trusted history. Redelivery restores the durable commit and outbound without another model call or semantic effect, even after a Contract change or restart. Completed historical outcomes remain idempotent. A losing processing attempt, including a model/parsing failure, cannot replace an already committed checkpoint; its trace is retained separately. The outbox is recorded atomically now; at-least-once event dispatch and consumer authentication belong to #23/#24.
+
+Accepted Emergent Concept declarations persist in a separate `non_authoritative` catalogue with source Communication, Actor and Contract provenance. Later declarations preserve earlier source descriptions. Previously declared names are available to validation and later Core-owned reconciliation without redeclaration, but every use still satisfies the active emergent policy or canonical constraints. Vocabulary never creates Entity Types or modifies the Contract.
+
+Operator-only in-process inspection seams are:
+
+```python
+core.inspect(communication_id)  # proposal/trace plus exposed Grounding Items
+core.inspect_history()         # revision, immutable objects, Groundings, relations, commits, outbox
+core.inspect_concepts()        # separate non-authoritative vocabulary and provenance
+```
+
+These are local Core/verification interfaces, not sender retrieval or an application State API. Sender replies still contain only `communication_id`, `status` and `reply`. Deterministic adapter scenarios in `tests/test_history.py` exercise authorized commits and failure/recovery invariants without a live model.
 
 ## Verify
 
