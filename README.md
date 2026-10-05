@@ -817,6 +817,14 @@ core.inspect_concepts()        # separate non-authoritative vocabulary and prove
 
 These are local Core/verification interfaces, not sender retrieval or an application State API. Sender replies still contain only `communication_id`, `status` and `reply`. Deterministic adapter scenarios in `tests/test_history.py` exercise authorized commits and failure/recovery invariants without a live model.
 
+## Planned semantic decision adapters
+
+The development direction is to evaluate TypeSafe/Jev for bounded selection and classification, starting with the replaceable semantic selector in Context Assembly ([#16](https://github.com/DanieleSuppo/piecetogether/issues/16)). A deterministic reference adapter remains the default; the optional Jev adapter ranks permitted candidates while the Core owns scope, budgets, revisions and disclosure. Production adoption depends on domain-specific recall, fallback, latency and cost measurements.
+
+Later tickets can reuse the approach for known Entity/Context references, concept reconciliation, per-item Grounding proposals and Artifact text classifications. Generative ModelProviders still handle open interpretations and conversational responses; all model decisions remain proposals subject to deterministic validation and Grounding. Confidence never authorizes trusted state.
+
+Read the [development design and ticket responsibilities](docs/superpowers/specs/2026-10-05-semantic-decision-routing-design.md) before implementing #16, #17, #27, #29 or #31. The [research note](docs/research/2026-10-05-typesafe.md) records primary sources and provider limitations. This direction requires no change to the implemented #13–#15 foundation.
+
 ## Verify
 
 ```bash
