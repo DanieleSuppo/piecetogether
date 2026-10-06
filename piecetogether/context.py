@@ -9,7 +9,7 @@ from time import monotonic
 from typing import Any, Protocol
 
 from .contracts import DomainContract, finite_number
-from .history import grounding_response, phrase_boundary
+from .history import _candidate_supported, grounding_response, phrase_boundary, source_candidate
 from .proposals import (
     ClaimOperation,
     ContextOperation,
@@ -197,9 +197,21 @@ def check_disclosure(proposal: SemanticProposal, pack: ContextPack | None,
         accepted_items = {operation.item_id for operation in proposal.operations
                           if isinstance(operation, GroundingResolutionOperation)
                           and operation.outcome == 'accepted'}
+        pending = {record.id: json.loads(record.payload_json)['candidate'] for record in pack.records
+                   if record.kind == 'pending_grounding'}
         for record in pack.records:
             if record.kind == 'pending_grounding' and record.id in accepted_items:
-                local.add(json.loads(record.payload_json)['candidate']['id'])
+                local.add(pending[record.id]['id'])
+        for resolution in proposal.operations:
+            if not isinstance(resolution, GroundingResolutionOperation) or resolution.outcome != 'corrected':
+                continue
+            candidate = pending.get(resolution.item_id)
+            if candidate and candidate['kind'] == 'claim':
+                for successor_id in resolution.successor_ids:
+                    successor = next((operation for operation in proposal.operations
+                                      if isinstance(operation, ClaimOperation) and operation.id == successor_id), None)
+                    if successor and successor.target_id == candidate['target_id']:
+                        local.add(successor.target_id)
         for operation in proposal.operations:
             references: tuple[str, ...] = ()
             if isinstance(operation, (EntityOperation, ContextOperation)) and operation.action == 'resolve':
@@ -301,28 +313,23 @@ def assemble(db: sqlite3.Connection, inbound: dict[str, Any], contract_version: 
     ).fetchall()
     targets = []
     for row in pending:
-        source = json.loads(row['proposal'])
-        targets.append(next(op for op in source['operations'] if op.get('id') == row['candidate_id']))
+        source = SemanticProposal.from_dict(json.loads(row['proposal']))
+        targets.append(source_candidate(source, row['candidate_id']))
 
-    def matches(target: dict[str, Any]) -> bool:
-        values = [target['id']]
-        if target['kind'] == 'claim' and isinstance(target['value'], (str, int, float)):
-            values.append(str(target['value']))
-        text = inbound['text'].casefold()
-        return any(phrase_boundary(text, value) for value in values)
-
-    target_matches = {index for index, target in enumerate(targets) if matches(target)}
+    target_matches = {index for index, target in enumerate(targets)
+                      if _candidate_supported(target, inbound['text'])}
 
     for index, (row, target) in enumerate(zip(pending, targets)):
+        payload = asdict(target)
         add(row['id'], 'pending_grounding', {'id': row['id'], 'grounding_id': row['grounding_id'],
-            'policy': row['policy'], 'candidate': target, 'source_communication_id': row['communication_id']},
-            encoded(target), True, ('grounding',) if inbound.get('reply_to') == row['grounding_id']
+            'policy': row['policy'], 'candidate': payload, 'source_communication_id': row['communication_id']},
+            encoded(payload), mandatory=True, purposes=('grounding',) if inbound.get('reply_to') == row['grounding_id']
             or target_matches == {index} else ())
 
     for name, policy in contract.claim_concepts.items():
         explicit = phrase_boundary(inbound['text'], name)
         add('canonical:' + name, 'canonical_concept', {'name': name, 'policy': policy}, name,
-            False, ('disambiguation', 'grounding') if explicit else ())
+            mandatory=False, purposes=('disambiguation', 'grounding') if explicit else ())
 
     trusted = [json.loads(row['record']) for row in db.execute(
         "SELECT record FROM trusted_records WHERE json_extract(record, '$.provenance.actor_id')=? "
@@ -334,8 +341,8 @@ def assemble(db: sqlite3.Connection, inbound: dict[str, Any], contract_version: 
             summary += ' ' + ' '.join(encoded(by_id.get(member, {}).get('attributes', {}))
                                       for member in record['entity_ids'])
         explicit = record['id'] in inbound['text']
-        add(record['id'], record['kind'], record, summary, explicit,
-            ('continuity', 'disambiguation') if explicit else ())
+        add(record['id'], record['kind'], record, summary, mandatory=explicit,
+            purposes=('continuity', 'disambiguation') if explicit else ())
     for row in db.execute(
         "SELECT record FROM emergent_concepts WHERE json_extract(record, '$.provenance.actor_id')=? "
         "ORDER BY rowid DESC LIMIT ?", (actor_id, limit),
@@ -343,8 +350,8 @@ def assemble(db: sqlite3.Connection, inbound: dict[str, Any], contract_version: 
         record = json.loads(row['record'])
         explicit = phrase_boundary(inbound['text'], record['name'])
         add('concept:' + digest(encoded([record['name'], record['provenance']['source_communication_id']])),
-            'emergent_concept', record, record['name'] + ' ' + record['description'], explicit,
-            ('disambiguation', 'grounding') if explicit else ())
+            'emergent_concept', record, record['name'] + ' ' + record['description'], mandatory=explicit,
+            purposes=('disambiguation', 'grounding') if explicit else ())
     for row in db.execute(
         "SELECT id, inbound, proposal FROM turns WHERE json_extract(inbound, '$.actor_id')=? "
         "AND status='completed' ORDER BY rowid DESC LIMIT ?", (actor_id, limit),

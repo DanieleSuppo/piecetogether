@@ -491,6 +491,223 @@ class GroundingTests(unittest.TestCase):
         self.assertEqual(history['events'], [])
         self.assertEqual(self.core().inspect(exposed['inbound']['id'])['grounding_items'][0]['outcome'], 'pending')
 
+    def test_corrected_claim_can_retain_a_pending_entity_target_until_later_acceptance(self):
+        exposed = self.expose()
+        subject = next(item for item in exposed['grounding_items'] if item['candidate_id'] == 'subject')
+        note = next(item for item in exposed['grounding_items'] if item['candidate_id'] == 'note')
+
+        correction = self.core(
+            lambda inbound: (
+                GroundingResolutionOperation(note['id'], 'p', inbound.id, 'explicit', 'corrected',
+                                            evidence_span='blue no green', successor_ids=('green_note',)),
+                ClaimOperation('green_note', 'subject', 'note', 'green', 'p'),
+                GroundingPlanOperation('p', ('green_note',), 'explicit'),
+            ), intent='semantic_commit', semantic_revision=0,
+        ).accept(self.message(text='blue no green', reply_to=exposed['outbound']['id']))
+        self.assertEqual(correction['status'], 'completed')
+        successor_turn = self.core().inspect(correction['communication_id'])
+        successor = successor_turn['grounding_items'][0]
+
+        restarted = Core(
+            self.config,
+            CapturedModel(
+                lambda inbound: (GroundingResolutionOperation(
+                    subject['id'], 'p', inbound.id, 'explicit', 'accepted',
+                ),),
+                intent='semantic_commit', semantic_revision=1,
+            ),
+            contract_provider=ContractProvider(self.contract),
+        )
+        self.assertEqual(restarted.accept(
+            self.message(reply_to=exposed['outbound']['id'])
+        )['status'], 'completed')
+        accepted = Core(
+            self.config,
+            CapturedModel(
+                lambda inbound: (GroundingResolutionOperation(
+                    successor['id'], 'p', inbound.id, 'explicit', 'accepted',
+                ),),
+                intent='semantic_commit', semantic_revision=2,
+            ),
+            contract_provider=ContractProvider(self.contract),
+        ).accept(self.message(reply_to=successor_turn['outbound']['id']))
+        self.assertEqual(accepted['status'], 'completed')
+        history = self.core().inspect_history()
+        self.assertEqual(history['claims'][0]['target_id'], history['entities'][0]['id'])
+
+    def test_pending_target_binding_cannot_use_another_groundings_local_id(self):
+        first = self.expose()
+        second_core = self.core((
+            EntityOperation('subject', 'Subject'),
+            GroundingPlanOperation('p', (), 'explicit', ('subject',)),
+        ))
+        second_result = second_core.accept(self.message(text='another subject'))
+        second = second_core.inspect(second_result['communication_id'])
+        first_note = next(item for item in first['grounding_items'] if item['candidate_id'] == 'note')
+        second_subject = next(item for item in second['grounding_items'] if item['candidate_id'] == 'subject')
+        correction = self.core(
+            lambda inbound: (
+                GroundingResolutionOperation(first_note['id'], 'p', inbound.id, 'explicit', 'corrected',
+                                            evidence_span='blue no green', successor_ids=('green_note',)),
+                ClaimOperation('green_note', 'subject', 'note', 'green', 'p'),
+                GroundingPlanOperation('p', ('green_note',), 'explicit'),
+            ), intent='semantic_commit', semantic_revision=0,
+        ).accept(self.message(text='blue no green', reply_to=first['outbound']['id']))
+        self.assertEqual(correction['status'], 'completed')
+        successor_turn = self.core().inspect(correction['communication_id'])
+        successor = successor_turn['grounding_items'][0]
+
+        wrong_root = self.core(
+            lambda inbound: (
+                GroundingResolutionOperation(second_subject['id'], 'p', inbound.id, 'explicit', 'accepted',
+                                            evidence_span='subject yes'),
+                GroundingResolutionOperation(successor['id'], 'p', inbound.id, 'explicit', 'accepted',
+                                            evidence_span='green yes'),
+            ), intent='semantic_commit', semantic_revision=1,
+        ).accept(self.message(text='subject yes; green yes', reply_to=successor_turn['outbound']['id']))
+        self.assertEqual(wrong_root['status'], 'rejected')
+        self.assertEqual(self.core().inspect_history()['entities'], [])
+
+    def test_corrected_claim_and_pending_entity_can_be_accepted_together(self):
+        exposed = self.expose()
+        subject = next(item for item in exposed['grounding_items'] if item['candidate_id'] == 'subject')
+        note = next(item for item in exposed['grounding_items'] if item['candidate_id'] == 'note')
+        correction = self.core(
+            lambda inbound: (
+                GroundingResolutionOperation(note['id'], 'p', inbound.id, 'explicit', 'corrected',
+                                            evidence_span='blue no green', successor_ids=('green_note',)),
+                ClaimOperation('green_note', 'subject', 'note', 'green', 'p'),
+                GroundingPlanOperation('p', ('green_note',), 'explicit'),
+            ), intent='semantic_commit', semantic_revision=0,
+        ).accept(self.message(text='blue no green', reply_to=exposed['outbound']['id']))
+        self.assertEqual(correction['status'], 'completed')
+        successor_turn = self.core().inspect(correction['communication_id'])
+        successor = successor_turn['grounding_items'][0]
+        accepted = self.core(
+            lambda inbound: (
+                GroundingResolutionOperation(subject['id'], 'p', inbound.id, 'explicit', 'accepted',
+                                            evidence_span='subject yes'),
+                GroundingResolutionOperation(successor['id'], 'p', inbound.id, 'explicit', 'accepted',
+                                            evidence_span='green yes'),
+            ), intent='semantic_commit', semantic_revision=1,
+        ).accept(self.message(text='subject yes; green yes', reply_to=successor_turn['outbound']['id']))
+        self.assertEqual(accepted['status'], 'completed')
+        history = self.core().inspect_history()
+        self.assertEqual(history['claims'][0]['target_id'], history['entities'][0]['id'])
+
+    def test_correction_chain_retains_the_original_pending_target_binding(self):
+        exposed = self.expose()
+        subject = next(item for item in exposed['grounding_items'] if item['candidate_id'] == 'subject')
+        note = next(item for item in exposed['grounding_items'] if item['candidate_id'] == 'note')
+        green = self.core(
+            lambda inbound: (
+                GroundingResolutionOperation(note['id'], 'p', inbound.id, 'explicit', 'corrected',
+                                            evidence_span='blue no green', successor_ids=('green_note',)),
+                ClaimOperation('green_note', 'subject', 'note', 'green', 'p'),
+                GroundingPlanOperation('p', ('green_note',), 'explicit'),
+            ), intent='semantic_commit', semantic_revision=0,
+        ).accept(self.message(text='blue no green', reply_to=exposed['outbound']['id']))
+        green_turn = self.core().inspect(green['communication_id'])
+        green_item = green_turn['grounding_items'][0]
+        red = self.core(
+            lambda inbound: (
+                GroundingResolutionOperation(green_item['id'], 'p', inbound.id, 'explicit', 'corrected',
+                                            evidence_span='green no red', successor_ids=('red_note',)),
+                ClaimOperation('red_note', 'subject', 'note', 'red', 'p'),
+                GroundingPlanOperation('p', ('red_note',), 'explicit'),
+            ), intent='semantic_commit', semantic_revision=1,
+        ).accept(self.message(text='green no red', reply_to=green_turn['outbound']['id']))
+        self.assertEqual(red['status'], 'completed')
+        red_turn = self.core().inspect(red['communication_id'])
+        red_item = red_turn['grounding_items'][0]
+        self.assertEqual(self.core(
+            lambda inbound: (GroundingResolutionOperation(
+                subject['id'], 'p', inbound.id, 'explicit', 'accepted',
+            ),), intent='semantic_commit', semantic_revision=2,
+        ).accept(self.message(reply_to=exposed['outbound']['id']))['status'], 'completed')
+        self.assertEqual(self.core(
+            lambda inbound: (GroundingResolutionOperation(
+                red_item['id'], 'p', inbound.id, 'explicit', 'accepted',
+            ),), intent='semantic_commit', semantic_revision=3,
+        ).accept(self.message(reply_to=red_turn['outbound']['id']))['status'], 'completed')
+        self.assertEqual(self.core().inspect_history()['claims'][0]['value'], 'red')
+
+    def test_multi_successor_source_revalidation_keeps_each_pending_target_bound(self):
+        for mode in ('subset', 'joint', 'corrected'):
+            with self.subTest(mode=mode):
+                self.config = replace(self.config, database=Path(self.directory.name) / f'multi-{mode}.sqlite3')
+                exposed = self.core((
+                    EntityOperation('first_subject', 'Subject'),
+                    EntityOperation('second_subject', 'Subject'),
+                    ClaimOperation('first_note', 'first_subject', 'note', 'blue', 'p'),
+                    ClaimOperation('second_note', 'second_subject', 'note', 'yellow', 'p'),
+                    GroundingPlanOperation('p', ('first_note', 'second_note'), 'explicit',
+                                           ('first_subject', 'second_subject')),
+                )).accept(self.message(text='two subjects'))
+                first_turn = self.core().inspect(exposed['communication_id'])
+                first_items = {item['candidate_id']: item for item in first_turn['grounding_items']}
+                corrected = self.core(
+                    lambda inbound: (
+                        GroundingResolutionOperation(first_items['first_note']['id'], 'p', inbound.id,
+                                                    'explicit', 'corrected', evidence_span='blue no green',
+                                                    successor_ids=('green_note',)),
+                        GroundingResolutionOperation(first_items['second_note']['id'], 'p', inbound.id,
+                                                    'explicit', 'corrected', evidence_span='yellow no red',
+                                                    successor_ids=('red_note',)),
+                        ClaimOperation('green_note', 'first_subject', 'note', 'green', 'p'),
+                        ClaimOperation('red_note', 'second_subject', 'note', 'red', 'p'),
+                        GroundingPlanOperation('p', ('green_note', 'red_note'), 'explicit'),
+                    ), intent='semantic_commit', semantic_revision=0,
+                ).accept(self.message(text='blue no green; yellow no red', reply_to=first_turn['outbound']['id']))
+                self.assertEqual(corrected['status'], 'completed')
+                successor_turn = self.core().inspect(corrected['communication_id'])
+                successors = {item['candidate_id']: item for item in successor_turn['grounding_items']}
+                accepted_entities = self.core(
+                    lambda inbound: (
+                        GroundingResolutionOperation(first_items['first_subject']['id'], 'p', inbound.id,
+                                                    'explicit', 'accepted'),
+                        GroundingResolutionOperation(first_items['second_subject']['id'], 'p', inbound.id,
+                                                    'explicit', 'accepted'),
+                    ), intent='semantic_commit', semantic_revision=1,
+                ).accept(self.message(text='Yes', reply_to=first_turn['outbound']['id']))
+                self.assertEqual(accepted_entities['status'], 'completed')
+                entity_ids = [entity['id'] for entity in self.core().inspect_history()['entities']]
+
+                if mode == 'corrected':
+                    result = self.core(
+                        lambda inbound: (
+                            GroundingResolutionOperation(successors['green_note']['id'], 'p', inbound.id,
+                                                        'explicit', 'corrected', evidence_span='green no teal',
+                                                        successor_ids=('teal_note',)),
+                            ClaimOperation('teal_note', 'first_subject', 'note', 'teal', 'p'),
+                            GroundingPlanOperation('p', ('teal_note',), 'explicit'),
+                        ), intent='semantic_commit', semantic_revision=2,
+                    ).accept(self.message(text='green no teal', reply_to=successor_turn['outbound']['id']))
+                    self.assertEqual(result['status'], 'completed')
+                    follow_up = self.core().inspect(result['communication_id'])['grounding_items']
+                    self.assertEqual(follow_up[0]['candidate_id'], 'teal_note')
+                    self.assertEqual(self.core().inspect_history()['claims'], [])
+                    continue
+
+                resolved = ('green_note',) if mode == 'subset' else ('green_note', 'red_note')
+                result = self.core(
+                    lambda inbound: tuple(GroundingResolutionOperation(
+                        successors[candidate_id]['id'], 'p', inbound.id, 'explicit', 'accepted',
+                        evidence_span=f'{"green" if candidate_id == "green_note" else "red"} yes',
+                    ) for candidate_id in resolved),
+                    intent='semantic_commit', semantic_revision=2,
+                ).accept(self.message(
+                    text='green yes' if mode == 'subset' else 'green yes; red yes',
+                    reply_to=successor_turn['outbound']['id'],
+                ))
+                self.assertEqual(result['status'], 'completed')
+                claims = self.core().inspect_history()['claims']
+                self.assertEqual(
+                    {(claim['value'], claim['target_id']) for claim in claims},
+                    {('green', entity_ids[0])} if mode == 'subset'
+                    else {('green', entity_ids[0]), ('red', entity_ids[1])},
+                )
+
     def test_correction_creates_an_exposed_successor_with_immutable_lineage(self):
         exposed = self.expose()
         subject = next(item for item in exposed['grounding_items'] if item['candidate_id'] == 'subject')

@@ -57,6 +57,11 @@ def initialize(db: sqlite3.Connection, contract: DomainContract) -> None:
             candidate_id TEXT NOT NULL, policy TEXT NOT NULL,
             UNIQUE(grounding_id, candidate_id)
         );
+        CREATE TABLE IF NOT EXISTS candidate_target_bindings (
+            grounding_id TEXT NOT NULL, candidate_id TEXT NOT NULL,
+            target_grounding_id TEXT NOT NULL, target_candidate_id TEXT NOT NULL,
+            PRIMARY KEY(grounding_id, candidate_id)
+        );
         CREATE TABLE IF NOT EXISTS semantic_outbox (
             id TEXT PRIMARY KEY, record TEXT NOT NULL
         );
@@ -150,6 +155,21 @@ def expose(
         for candidate_id in plan.claim_ids + plan.resolution_ids:
             db.execute("INSERT OR IGNORE INTO pending_items VALUES (?, ?, ?, ?)",
                        (str(uuid4()), outbound_id, candidate_id, plan.policy))
+    for resolution in proposal.operations:
+        if not isinstance(resolution, GroundingResolutionOperation) or resolution.outcome != 'corrected':
+            continue
+        pending = pending_candidate(db, resolution.item_id)
+        if pending is None:
+            continue
+        row, _, candidate = pending
+        if not isinstance(candidate, ClaimOperation):
+            continue
+        binding = claim_target_binding(db, row['grounding_id'], candidate)
+        if binding is None:
+            continue
+        for successor_id in resolution.successor_ids:
+            db.execute("INSERT OR IGNORE INTO candidate_target_bindings VALUES (?, ?, ?, ?)",
+                       (outbound_id, successor_id, *binding))
 
 
 def phrase_boundary(text: str, phrase: str) -> bool:
@@ -157,25 +177,77 @@ def phrase_boundary(text: str, phrase: str) -> bool:
     return bool(re.search(r'(?<!\w)' + re.escape(phrase.casefold()) + r'(?!\w)', text.casefold()))
 
 
-def _candidate_terms(candidate: EntityOperation | ContextOperation | ClaimOperation) -> tuple[str, ...]:
+CandidateOperation = EntityOperation | ContextOperation | ClaimOperation
+
+
+def source_candidate(source: SemanticProposal, candidate_id: str) -> CandidateOperation:
+    return next(operation for operation in source.operations
+                if isinstance(operation, (EntityOperation, ContextOperation, ClaimOperation))
+                and operation.id == candidate_id)
+
+
+def pending_candidate(
+    db: sqlite3.Connection, item_id: str,
+) -> tuple[sqlite3.Row, SemanticProposal, CandidateOperation] | None:
+    row = db.execute(
+        "SELECT i.*, g.communication_id, g.actor_id, g.contract_version, g.exposed_at, g.proposal "
+        "FROM pending_items i JOIN exposed_groundings g ON g.id=i.grounding_id WHERE i.id=?", (item_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    source = SemanticProposal.from_dict(json.loads(row['proposal']))
+    return row, source, source_candidate(source, row['candidate_id'])
+
+
+def claim_target_binding(
+    db: sqlite3.Connection, grounding_id: str, candidate: ClaimOperation,
+) -> tuple[str, str] | None:
+    binding = db.execute(
+        "SELECT target_grounding_id, target_candidate_id FROM candidate_target_bindings "
+        "WHERE grounding_id=? AND candidate_id=?", (grounding_id, candidate.id),
+    ).fetchone()
+    if binding:
+        return binding['target_grounding_id'], binding['target_candidate_id']
+    if db.execute("SELECT 1 FROM trusted_records WHERE id=?", (candidate.target_id,)).fetchone():
+        return None
+    return grounding_id, candidate.target_id
+
+
+def bound_target(
+    db: sqlite3.Connection, grounding_id: str, candidate: ClaimOperation,
+) -> tuple[tuple[str, str], str] | None:
+    binding = claim_target_binding(db, grounding_id, candidate)
+    if binding is None:
+        return None
+    row = db.execute("SELECT proposal FROM exposed_groundings WHERE id=?", (binding[0],)).fetchone()
+    if row is None:
+        return None
+    target = source_candidate(SemanticProposal.from_dict(json.loads(row['proposal'])), binding[1])
+    if isinstance(target, EntityOperation):
+        return binding, target.entity_type
+    if isinstance(target, ContextOperation):
+        return binding, '$context'
+    return None
+
+
+def _candidate_terms(candidate: CandidateOperation) -> tuple[str, ...]:
     if isinstance(candidate, ClaimOperation) and isinstance(candidate.value, (str, int, float)):
         return (candidate.id, str(candidate.value))
     return (candidate.id,)
 
 
-def _candidate_supported(candidate: EntityOperation | ContextOperation | ClaimOperation,
-                         text: str) -> bool:
+def _candidate_supported(candidate: CandidateOperation, text: str) -> bool:
     return any(phrase_boundary(text, term) for term in _candidate_terms(candidate))
 
 
-def _relevant_clauses(text: str, candidate: EntityOperation | ContextOperation | ClaimOperation) -> tuple[str, ...]:
+def _relevant_clauses(text: str, candidate: CandidateOperation) -> tuple[str, ...]:
     return tuple(clause.strip() for clause in re.split(r'[;.!?]', text)
                  if clause.strip() and _candidate_supported(candidate, clause))
 
 
 # ponytail: finite evidence grammar; extend supported composition when domain fixtures require it.
-def _clause_supported(outcome: str, candidate: EntityOperation | ContextOperation | ClaimOperation,
-                      clause: str, successors: tuple[EntityOperation | ContextOperation | ClaimOperation, ...]) -> bool:
+def _clause_supported(outcome: str, candidate: CandidateOperation,
+                      clause: str, successors: tuple[CandidateOperation, ...]) -> bool:
     if any(character in clause for character in ('"', "'", '?')):
         return False
     terms = _candidate_terms(candidate)
@@ -202,7 +274,7 @@ def _clause_supported(outcome: str, candidate: EntityOperation | ContextOperatio
     return False
 
 
-def _unsafe_relevant_span(span: str, inbound_text: str) -> bool:
+def _whole_text_evidence_ambiguous(span: str, inbound_text: str) -> bool:
     # Unlabelled negation has an ambiguous antecedent; never discard it as unrelated.
     return (f'"{span}"' in inbound_text or f"'{span}'" in inbound_text
             or bool(re.search(re.escape(span.strip()) + r'\s*\?', inbound_text, re.IGNORECASE))
@@ -210,18 +282,18 @@ def _unsafe_relevant_span(span: str, inbound_text: str) -> bool:
                    for clause in re.split(r'[;.!?]', inbound_text)))
 
 
-def _outcome_supported(outcome: str, candidate: EntityOperation | ContextOperation | ClaimOperation,
+def _outcome_supported(outcome: str, candidate: CandidateOperation,
                        span: str, inbound_text: str,
-                       successors: tuple[EntityOperation | ContextOperation | ClaimOperation, ...]) -> bool:
+                       successors: tuple[CandidateOperation, ...]) -> bool:
     clauses = _relevant_clauses(inbound_text, candidate)
-    return (not _unsafe_relevant_span(span, inbound_text) and len(clauses) == 1
+    return (not _whole_text_evidence_ambiguous(span, inbound_text) and len(clauses) == 1
             and span.strip().casefold() == clauses[0].casefold()
             and _clause_supported(outcome, candidate, clauses[0], successors))
 
 
-def _explicit_acceptance_supported(candidate: EntityOperation | ContextOperation | ClaimOperation,
+def _explicit_acceptance_supported(candidate: CandidateOperation,
                                   span: str, inbound_text: str, forms: list[str]) -> bool:
-    if _unsafe_relevant_span(span, inbound_text):
+    if _whole_text_evidence_ambiguous(span, inbound_text):
         return False
     clauses = _relevant_clauses(inbound_text, candidate)
     if len(clauses) != 1 or span.strip().casefold() != clauses[0].casefold():
@@ -245,10 +317,7 @@ def _target_unique(db: sqlite3.Connection, actor_id: str, contract_version: str,
     )
     for row in rows:
         source = SemanticProposal.from_dict(json.loads(row['proposal']))
-        candidate = next(op for op in source.operations
-                         if isinstance(op, (EntityOperation, ContextOperation, ClaimOperation))
-                         and op.id == row['candidate_id'])
-        if _candidate_supported(candidate, span):
+        if _candidate_supported(source_candidate(source, row['candidate_id']), span):
             matches += 1
     return matches == 1
 
@@ -265,23 +334,34 @@ def check(
 ) -> ValidationResult:
     available = targets(db)
     if isinstance(proposal, SemanticProposal) and proposal.intent == 'semantic_commit':
-        for operation in proposal.operations:
-            if not isinstance(operation, GroundingResolutionOperation) or operation.outcome != 'accepted':
+        pending_resolutions = [
+            (operation, *pending)
+            for operation in proposal.operations if isinstance(operation, GroundingResolutionOperation)
+            if (pending := pending_candidate(db, operation.item_id)) is not None
+        ]
+        accepted_targets = {
+            (row['grounding_id'], candidate.id)
+            for operation, row, _, candidate in pending_resolutions
+            if operation.outcome == 'accepted' and isinstance(candidate, (EntityOperation, ContextOperation))
+        }
+        for operation, row, _, candidate in pending_resolutions:
+            if operation.outcome == 'accepted' and isinstance(candidate, EntityOperation):
+                available[candidate.id] = candidate.entity_type
                 continue
-            row = db.execute(
-                "SELECT i.candidate_id, g.proposal FROM pending_items i "
-                "JOIN exposed_groundings g ON g.id=i.grounding_id WHERE i.id=?", (operation.item_id,),
-            ).fetchone()
-            if row is None:
+            if operation.outcome == 'accepted' and isinstance(candidate, ContextOperation):
+                available[candidate.id] = '$context'
                 continue
-            source = SemanticProposal.from_dict(json.loads(row['proposal']))
-            pending_candidate = next((op for op in source.operations
-                                      if isinstance(op, (EntityOperation, ContextOperation))
-                                      and op.id == row['candidate_id']), None)
-            if isinstance(pending_candidate, EntityOperation):
-                available[pending_candidate.id] = pending_candidate.entity_type
-            elif isinstance(pending_candidate, ContextOperation):
-                available[pending_candidate.id] = '$context'
+            if operation.outcome not in ('accepted', 'corrected') or not isinstance(candidate, ClaimOperation):
+                continue
+            target = bound_target(db, row['grounding_id'], candidate)
+            if target is None:
+                continue
+            binding, target_type = target
+            target_is_trusted = db.execute(
+                "SELECT 1 FROM trusted_records WHERE grounding_id=? AND candidate_id=?", binding,
+            ).fetchone() is not None
+            if operation.outcome == 'corrected' or target_is_trusted or binding in accepted_targets:
+                available[candidate.target_id] = target_type
     result = validate(proposal, inbound['id'], contract, available, concept_names(db))
     if result.outcome != 'accepted':
         return result
@@ -325,12 +405,10 @@ def check(
     if len(resolution_ids) != len(set(resolution_ids)):
         return ValidationResult('rejected', ('duplicate_grounding_resolution',))
     for operation in resolutions:
-        row = db.execute(
-            "SELECT i.*, g.actor_id, g.contract_version, g.exposed_at, g.proposal "
-            "FROM pending_items i JOIN exposed_groundings g ON g.id=i.grounding_id "
-            "WHERE i.id=?", (operation.item_id,)).fetchone()
-        if row is None:
+        pending = pending_candidate(db, operation.item_id)
+        if pending is None:
             return ValidationResult('rejected', ('grounding_item_unavailable',))
+        row, source, candidate = pending
         if db.execute("SELECT 1 FROM trusted_grounding_items WHERE id=?",
                       (operation.item_id,)).fetchone():
             return ValidationResult('stale', ('grounding_item_already_resolved',))
@@ -339,10 +417,6 @@ def check(
         if (row['actor_id'] != inbound['actor_id'] or row['policy'] != operation.policy
                 or datetime.fromisoformat(inbound['received_at']) <= datetime.fromisoformat(row['exposed_at'])):
             return ValidationResult('rejected', ('invalid_grounding_evidence',))
-        source = SemanticProposal.from_dict(json.loads(row['proposal']))
-        candidate = next(op for op in source.operations
-                         if isinstance(op, (EntityOperation, ContextOperation, ClaimOperation))
-                         and op.id == row['candidate_id'])
         successors = tuple(op for op in proposal.operations
                            if isinstance(op, (EntityOperation, ContextOperation, ClaimOperation))
                            and op.id in operation.successor_ids)
@@ -417,6 +491,7 @@ def commit(
     records: dict[tuple[str, str], dict[str, Any]] = {}
     items: list[dict[str, Any]] = []
     sources: dict[str, SemanticProposal] = {}
+    successor_bindings: dict[str, tuple[str, str]] = {}
     commit_id = str(uuid4())
     revision = proposal.semantic_revision
     assert revision is not None
@@ -424,18 +499,25 @@ def commit(
                 'contract_version': contract.version, 'committed_at': timestamp}
     for operation in (op for op in proposal.operations if isinstance(op, GroundingResolutionOperation)
                       and op.outcome != 'pending'):
-        row = db.execute(
-            "SELECT i.*, g.communication_id, g.proposal, g.exposed_at "
-            "FROM pending_items i JOIN exposed_groundings g ON g.id=i.grounding_id WHERE i.id=?",
-            (operation.item_id,)).fetchone()
-        source = SemanticProposal.from_dict(json.loads(row['proposal']))
-        result = validate(source, row['communication_id'], contract, targets(db), concept_names(db))
+        pending = pending_candidate(db, operation.item_id)
+        assert pending is not None
+        row, source, candidate = pending
+        source_targets = targets(db)
+        for source_operation in source.operations:
+            if not isinstance(source_operation, ClaimOperation):
+                continue
+            binding_target = bound_target(db, row['grounding_id'], source_operation)
+            if binding_target is not None and binding_target[0][0] != row['grounding_id']:
+                source_targets[source_operation.target_id] = binding_target[1]
+        result = validate(source, row['communication_id'], contract, source_targets, concept_names(db))
         if result.outcome != 'accepted':
             return result, None
         sources[row['grounding_id']] = source
-        candidate = next(op for op in source.operations
-                         if isinstance(op, (EntityOperation, ContextOperation, ClaimOperation))
-                         and op.id == row['candidate_id'])
+        if operation.outcome == 'corrected' and isinstance(candidate, ClaimOperation):
+            binding = claim_target_binding(db, row['grounding_id'], candidate)
+            if binding is not None:
+                for successor_id in operation.successor_ids:
+                    successor_bindings[successor_id] = binding
         parent = next((resolution for resolution in source.operations
                        if isinstance(resolution, GroundingResolutionOperation)
                        and row['candidate_id'] in resolution.successor_ids), None)
@@ -468,12 +550,21 @@ def commit(
         return mapping.get((grounding_id, candidate_id),
                            candidate_id if candidate_id in existing else None)
 
+    def resolve_claim_target(grounding_id: str, candidate_id: str, target_id: str) -> str | None:
+        binding = db.execute(
+            "SELECT target_grounding_id, target_candidate_id FROM candidate_target_bindings "
+            "WHERE grounding_id=? AND candidate_id=?", (grounding_id, candidate_id),
+        ).fetchone()
+        if binding:
+            return resolve(binding['target_grounding_id'], binding['target_candidate_id'])
+        return resolve(grounding_id, target_id)
+
     for (grounding_id, candidate_id), record in records.items():
         if record['kind'] == 'claim':
-            target = resolve(grounding_id, record['target_id'])
-            if target is None:
+            resolved_target = resolve_claim_target(grounding_id, candidate_id, record['target_id'])
+            if resolved_target is None:
                 return ValidationResult('rejected', ('ungrounded_dependency',)), None
-            record['target_id'] = target
+            record['target_id'] = resolved_target
         elif record['kind'] == 'context':
             entity_ids = [resolve(grounding_id, entity_id) for entity_id in record['entity_ids']]
             if None in entity_ids:
@@ -534,18 +625,14 @@ def commit(
         db.execute("INSERT OR IGNORE INTO trusted_groundings VALUES (?, ?)",
                    (grounding_id, json.dumps({'id': grounding_id, **metadata,
                                              'source_communication_id': source.communication_id})))
-    committed_targets = {candidate_id: record['id'] for (_, candidate_id), record in records.items()
-                         if record['kind'] in ('entity', 'context')}
-    successor_ids = {successor_id for operation in proposal.operations
-                     if isinstance(operation, GroundingResolutionOperation)
-                     for successor_id in operation.successor_ids}
     summary = {'id': commit_id, **metadata, 'communication_id': inbound['id'],
                'record_ids': [record['id'] for record in records.values()],
                'grounding_item_ids': [item['id'] for item in items],
                'successor_target_ids': {
-                   operation.id: committed_targets[operation.target_id]
+                   operation.id: normalized_target
                    for operation in proposal.operations if isinstance(operation, ClaimOperation)
-                   and operation.id in successor_ids and operation.target_id in committed_targets
+                   and operation.id in successor_bindings
+                   if (normalized_target := resolve(*successor_bindings[operation.id])) is not None
                }}
     db.execute("INSERT INTO semantic_commits VALUES (?, ?, ?)",
                (commit_id, inbound['id'], json.dumps(summary)))
