@@ -3,7 +3,7 @@
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from .contracts import DomainContract, valid_name, value_matches
+from .contracts import DomainContract, finite_number, valid_name, value_matches
 
 
 @dataclass(frozen=True)
@@ -57,8 +57,11 @@ class GroundingResolutionOperation:
     policy: str
     evidence_communication_id: str
     acceptance_mode: Literal["explicit", "implicit"]
-    outcome: Literal["accepted", "rejected", "corrected"]
+    outcome: Literal["accepted", "rejected", "corrected", "pending"]
     rationale: str | None = None
+    evidence_span: str | None = None
+    successor_ids: tuple[str, ...] = ()
+    confidence: float | None = None
     kind: Literal["grounding_resolution"] = field(default="grounding_resolution", init=False)
 
 
@@ -98,6 +101,16 @@ class DisclosureOperation:
     kind: Literal['disclosure'] = field(default='disclosure', init=False)
 
 
+@dataclass(frozen=True)
+class ReferenceResolutionOperation:
+    reference_kind: Literal['entity', 'context', 'concept']
+    outcome: Literal['known', 'none', 'new', 'ambiguous']
+    selected_id: str | None = None
+    candidate_ids: tuple[str, ...] = ()
+    purpose: Literal['continuity', 'disambiguation', 'grounding'] = 'disambiguation'
+    kind: Literal['reference_resolution'] = field(default='reference_resolution', init=False)
+
+
 Operation = (
     EntityOperation | ContextOperation | ClaimOperation | RelationshipOperation
     | GroundingPlanOperation | GroundingResolutionOperation
@@ -105,6 +118,7 @@ Operation = (
     | EmergentConceptOperation
     | ContextRequestOperation
     | DisclosureOperation
+    | ReferenceResolutionOperation
 )
 
 
@@ -126,6 +140,11 @@ class SemanticProposal:
     intent: Literal["candidate", "semantic_commit"] = "candidate"
     semantic_revision: int | None = None
     response_intent: Literal['acquisition', 'retrieval'] = 'acquisition'
+    decision_provider: str | None = None
+    decision_model: str | None = None
+    decision_question_version: str | None = None
+    decision_raw: Any | None = None
+    decision_fallback: str | None = None
 
     @classmethod
     def from_dict(cls, data: Any) -> "SemanticProposal":
@@ -138,6 +157,7 @@ class SemanticProposal:
             "artifact": ArtifactOperation, "emergent_concept": EmergentConceptOperation,
             "context_request": ContextRequestOperation,
             'disclosure': DisclosureOperation,
+            'reference_resolution': ReferenceResolutionOperation,
         }
         try:
             if not isinstance(data, dict):
@@ -153,7 +173,7 @@ class SemanticProposal:
                     raise ValueError("invalid captured operation")
                 fields = dict(raw)
                 operation_type = operation_types[fields.pop("kind")]
-                for key in ("entity_ids", "claim_ids", "resolution_ids", "roles", "scope_ids"):
+                for key in ("entity_ids", "claim_ids", "resolution_ids", "successor_ids", "candidate_ids", "roles", "scope_ids"):
                     if key in fields:
                         if not isinstance(fields[key], list):
                             raise ValueError("captured operation references must be arrays")
@@ -212,6 +232,10 @@ def validate(
         return ValidationResult("rejected", ("invalid_proposal_intent",))
     if proposal.response_intent not in ('acquisition', 'retrieval'):
         return ValidationResult('rejected', ('invalid_response_intent',))
+    if any(value is not None and (not isinstance(value, str) or not value.strip() or len(value) > 256)
+           for value in (proposal.decision_provider, proposal.decision_model,
+                         proposal.decision_question_version, proposal.decision_fallback)):
+        return ValidationResult('rejected', ('invalid_decision_metadata',))
     if proposal.intent == "semantic_commit" and (
         type(proposal.semantic_revision) is not int or proposal.semantic_revision < 0
     ):
@@ -234,6 +258,7 @@ def validate(
             EmergentConceptOperation,
             ContextRequestOperation,
             DisclosureOperation,
+            ReferenceResolutionOperation,
         ):
             return ValidationResult("rejected", ("unsupported_operation",))
         if isinstance(operation, EntityOperation) and not valid_name(operation.entity_type):
@@ -278,6 +303,35 @@ def validate(
             for claim in proposal.operations
         ):
             return ValidationResult("rejected", ("grounding_policy_not_allowed",))
+    plans = {target_id for operation in proposal.operations if isinstance(operation, GroundingPlanOperation)
+             for target_id in operation.claim_ids + operation.resolution_ids}
+    candidates = {operation.id: operation for operation in proposal.operations
+                  if isinstance(operation, (EntityOperation, ContextOperation, ClaimOperation))}
+    declared = {operation.name for operation in proposal.operations
+                if isinstance(operation, EmergentConceptOperation)}
+    for operation in proposal.operations:
+        if not isinstance(operation, ReferenceResolutionOperation):
+            continue
+        if operation.outcome == 'new':
+            selected = tuple(candidates.get(candidate_id) for candidate_id in operation.candidate_ids)
+            expected = {'entity': EntityOperation, 'context': ContextOperation, 'concept': ClaimOperation}[operation.reference_kind]
+            if (not operation.candidate_ids or any(candidate is None or type(candidate) is not expected
+                                                   or isinstance(candidate, (EntityOperation, ContextOperation))
+                                                   and candidate.action != 'create'
+                                                   for candidate in selected)
+                    or not set(operation.candidate_ids) <= plans
+                    or operation.reference_kind == 'concept' and any(
+                        isinstance(candidate, ClaimOperation)
+                        and (candidate.concept in contract.claim_concepts or candidate.concept not in declared)
+                        for candidate in selected
+                    )):
+                return ValidationResult('rejected', ('new_reference_requires_grounding',))
+        elif operation.outcome in ('none', 'ambiguous') and any(
+            isinstance(candidate, EntityOperation) and candidate.action == 'resolve'
+            or isinstance(candidate, ContextOperation) and candidate.action == 'resolve'
+            for candidate in candidates.values()
+        ):
+            return ValidationResult('rejected', ('reference_outcome_conflict',))
     return ValidationResult("accepted")
 
 
@@ -359,12 +413,25 @@ def operation_reason(
             if (
                 not valid_name(operation.item_id)
                 or operation.evidence_communication_id != communication_id
-                or operation.outcome != "accepted"
+                or operation.outcome not in ("accepted", "rejected", "corrected", "pending")
                 or operation.rationale is not None and (
                     not isinstance(operation.rationale, str)
                     or not operation.rationale.strip() or len(operation.rationale) > 32768
                 )
-                or operation.acceptance_mode == "implicit" and not operation.rationale
+                or operation.evidence_span is not None and (
+                    not isinstance(operation.evidence_span, str)
+                    or not operation.evidence_span.strip() or len(operation.evidence_span) > 32768
+                )
+                or operation.acceptance_mode == 'implicit' and operation.outcome == 'accepted'
+                and not operation.rationale
+                or not isinstance(operation.successor_ids, tuple)
+                or any(not valid_name(successor_id) for successor_id in operation.successor_ids)
+                or len(set(operation.successor_ids)) != len(operation.successor_ids)
+                or operation.outcome == "corrected" and not operation.successor_ids
+                or operation.outcome != "corrected" and operation.successor_ids
+                or operation.confidence is not None and (
+                    not finite_number(operation.confidence) or not 0 <= operation.confidence <= 1
+                )
             ):
                 return "invalid_grounding_evidence"
     elif isinstance(operation, ArtifactOperation):
@@ -408,4 +475,22 @@ def operation_reason(
         if (not valid_name(operation.record_id)
                 or operation.purpose not in ('continuity', 'disambiguation', 'grounding')):
             return 'invalid_disclosure_request'
+    elif isinstance(operation, ReferenceResolutionOperation):
+        valid_kind = operation.reference_kind in ('entity', 'context', 'concept')
+        valid_outcome = operation.outcome in ('known', 'none', 'new', 'ambiguous')
+        valid_purpose = operation.purpose in ('continuity', 'disambiguation', 'grounding')
+        valid_candidates = (
+            isinstance(operation.candidate_ids, tuple)
+            and all(valid_name(candidate_id) for candidate_id in operation.candidate_ids)
+            and len(set(operation.candidate_ids)) == len(operation.candidate_ids)
+        )
+        if not (valid_kind and valid_outcome and valid_purpose and valid_candidates):
+            return 'invalid_reference_resolution'
+        if operation.outcome == 'known':
+            if not valid_name(operation.selected_id) or operation.candidate_ids:
+                return 'invalid_reference_resolution'
+        elif operation.selected_id is not None or (
+            operation.outcome != 'new' and operation.candidate_ids
+        ):
+            return 'invalid_reference_resolution'
     return None

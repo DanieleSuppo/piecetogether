@@ -12,10 +12,16 @@ from time import monotonic
 from typing import Any, Protocol
 from uuid import uuid4
 
+from . import context, history
 from .contracts import DeclarativeContractProvider, DomainContractProvider
-from . import history
-from . import context
-from .proposals import CandidateClaim, ContextRequestOperation, SemanticProposal, ValidationResult
+from .proposals import (
+    CandidateClaim,
+    ContextRequestOperation,
+    GroundingResolutionOperation,
+    ReferenceResolutionOperation,
+    SemanticProposal,
+    ValidationResult,
+)
 
 
 def now() -> str:
@@ -184,6 +190,32 @@ def connect(database: Path) -> Iterator[sqlite3.Connection]:
             yield db
     finally:
         db.close()
+
+
+def _snapshot(value: Any) -> tuple[Any, str | None]:
+    try:
+        return json.loads(json.dumps(value, allow_nan=False)), None
+    except (TypeError, ValueError, RecursionError):
+        return None, 'unserializable'
+
+
+def _decision_trace(proposal: SemanticProposal | None, fallback: str | None = None) -> dict[str, Any]:
+    value = {
+        'provider': proposal.decision_provider if proposal else None,
+        'model': proposal.decision_model if proposal else None,
+        'question_version': proposal.decision_question_version if proposal else None,
+        'raw': proposal.decision_raw if proposal else None,
+        'fallback': fallback if fallback is not None else proposal.decision_fallback if proposal else None,
+        'decisions': [asdict(operation) for operation in proposal.operations
+                      if isinstance(operation, (GroundingResolutionOperation,
+                                                ReferenceResolutionOperation))] if proposal else [],
+    }
+    snapshot, marker = _snapshot(value)
+    if marker:
+        return {'provider': None, 'model': None, 'question_version': None, 'raw': None,
+                'fallback': fallback, 'decisions': [], 'capture': marker}
+    assert isinstance(snapshot, dict)
+    return snapshot
 
 
 def _record_attempt(
@@ -397,7 +429,8 @@ class Core:
             if outbound is None:
                 with connect(self.config.database) as db:
                     db.execute('BEGIN')
-                    pack = context.assemble(db, asdict(inbound), self.config.contract_version, self.config.selection)
+                    pack = context.assemble(db, asdict(inbound), self.config.contract_version,
+                                            self.config.selection, self.contract)
                     pack = replace(pack, contract_json=context.encoded(asdict(self.contract)))
                 trace['selection'] = []
                 pack = context.select(pack, asdict(inbound), self.selector, trace['selection'])
@@ -447,6 +480,7 @@ class Core:
             trace["validation_reasons"] = list(validation.reasons)
             trace["proposal_contract_version"] = proposal.contract_version
             trace["proposal_intent"] = proposal.intent
+            trace["grounding_decision"] = _decision_trace(proposal)
             if proposal.intent == "semantic_commit":
                 trace["commit_result"] = "committed" if prior_commit else validation.outcome
             status = {
@@ -514,6 +548,9 @@ class Core:
                 if not prior_commit and validation.outcome == "accepted":
                     if pack is not None and not context.current(db, pack):
                         validation, semantic_commit = ValidationResult('stale', ('context_revision_changed',)), None
+                    elif proposal.intent == 'semantic_commit' and not history.has_effect(proposal):
+                        semantic_commit = None
+                        trace['commit_result'] = 'pending'
                     else:
                         validation, semantic_commit = history.commit(
                             db, proposal, asdict(inbound), self.contract, now(),
@@ -521,9 +558,13 @@ class Core:
                     trace["validation_result"] = validation.outcome
                     trace["validation_reasons"] = list(validation.reasons)
                     if semantic_commit:
+                        proposal = history.normalized_successors(proposal, semantic_commit)
+                        captured = json.dumps(asdict(proposal), allow_nan=False)
+                        if outbound is not None:
+                            outbound = replace(outbound, text=context.response(proposal, asdict(inbound), pack))
                         trace.update(commit_result="committed", semantic_commit_id=semantic_commit['id'],
                                      semantic_revision=semantic_commit['semantic_revision'])
-                    elif proposal.intent == "semantic_commit":
+                    elif proposal.intent == "semantic_commit" and trace['commit_result'] != 'pending':
                         trace["commit_result"] = validation.outcome
                     if validation.outcome != "accepted":
                         status = "rejected" if validation.outcome == "rejected" else "reprocess_required"
@@ -544,7 +585,7 @@ class Core:
                 return {"communication_id": inbound.id, "reply": None, "status": status}
             if outbound is not None:
                 stage = "channel"
-                accepted = self.channel.deliver(outbound)
+                accepted = self.channel.deliver(outbound) is True
                 trace["delivery_result"] = "accepted" if accepted else "retryable"
         except (OSError, ValueError, TypeError, RecursionError, sqlite3.Error) as error:
             status = 'budget_exhausted' if isinstance(error, context.BudgetExhausted) else "retryable"
@@ -552,6 +593,8 @@ class Core:
                 saved_outbound = None
             trace["failure_stage"] = stage
             trace["error_type"] = type(error).__name__
+            if stage == 'model' and 'grounding_decision' not in trace:
+                trace['grounding_decision'] = _decision_trace(None, 'model_error')
             if trace.get("proposal_intent") == "semantic_commit" and stage == "storage" and not prior_commit:
                 trace["commit_result"] = "retryable"
                 trace.pop("semantic_commit_id", None)

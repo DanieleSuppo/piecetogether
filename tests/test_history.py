@@ -81,7 +81,18 @@ class HistoryTests(unittest.TestCase):
                                   resolution_ids=('subject', 'context')),
         )
         core = self.core(operations, channel=channel)
-        result = core.accept(self.message(text='There are three'))
+        # Existing trusted UUIDs are explicit policy-permitted context references;
+        # same-batch symbolic IDs remain local dependencies.
+        references = []
+        for operation in operations:
+            if isinstance(operation, (EntityOperation, ContextOperation)) and operation.action == 'resolve':
+                references.append(operation.id)
+            elif isinstance(operation, ClaimOperation):
+                references.append(operation.target_id)
+            elif isinstance(operation, RelationshipOperation):
+                references.extend((operation.source_id, operation.target_id))
+        known_ids = [reference for reference in references if '-' in reference]
+        result = core.accept(self.message(text='There are three ' + ' '.join(known_ids)))
         return core.inspect(result['communication_id'])
 
     def accept_items(self, exposed, items=None, revision=0, evidence=None, **kwargs):
