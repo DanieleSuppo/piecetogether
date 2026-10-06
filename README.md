@@ -730,7 +730,7 @@ Extension points exist to support real applications. Connector frameworks and pl
 
 ## Status
 
-The development Core implements durable text ingress and observable interpretation ([#13](https://github.com/DanieleSuppo/piecetogether/issues/13)), deterministic Domain Contract and typed Semantic Proposal validation ([#14](https://github.com/DanieleSuppo/piecetogether/issues/14)), and atomic trusted semantic history ([#15](https://github.com/DanieleSuppo/piecetogether/issues/15)). Bounded context assembly, the complete conversational Grounding lifecycle, Current Trusted View, production channels and application APIs remain subsequent tickets. Product boundaries are captured in [docs/PRD.md](docs/PRD.md); technical authority is [SPEC #12](https://github.com/DanieleSuppo/piecetogether/issues/12).
+The development Core implements durable text ingress and observable interpretation ([#13](https://github.com/DanieleSuppo/piecetogether/issues/13)), deterministic Domain Contract and typed Semantic Proposal validation ([#14](https://github.com/DanieleSuppo/piecetogether/issues/14)), atomic trusted semantic history ([#15](https://github.com/DanieleSuppo/piecetogether/issues/15)), and bounded Context Packs with disclosure controls ([#16](https://github.com/DanieleSuppo/piecetogether/issues/16)). The complete conversational Grounding lifecycle, Current Trusted View, production channels and application APIs remain subsequent tickets. Product boundaries are captured in [docs/PRD.md](docs/PRD.md); technical authority is [SPEC #12](https://github.com/DanieleSuppo/piecetogether/issues/12).
 
 ## Run the development Core
 
@@ -746,7 +746,7 @@ This standalone local development process accepts one normalized JSON Communicat
 {"channel":"development","sender":"sender-1","idempotency_key":"message-1","text":"Keep the original option.","sent_at":"2026-01-01T12:00:00Z"}
 ```
 
-Replies contain only `communication_id`, `status` and `reply`. Repeated delivery returns the same completed or rejected outcome, including after restarting the process. Reusing a key with different content is rejected. `retryable` denotes an operational failure; `reprocess_required` denotes a stale Contract, semantic revision or exposure binding. Both have no exposed reply; redeliver the original Communication for a fresh attempt. `rejected` denotes a deterministic, terminal policy or invariant failure and has no reply.
+Replies contain only `communication_id`, `status` and `reply`. Repeated delivery returns the same completed or rejected outcome, including after restarting the process. Reusing a key with different content is rejected. `retryable` denotes an operational failure; `reprocess_required` denotes a stale Contract, semantic revision, Context Pack or exposure binding. Both have no exposed reply; redeliver the original Communication for a fresh attempt. `budget_exhausted` is an operational limit with no reply or semantic rejection; inspect its trace and reconcile the mandatory backlog or deployment budget before retrying. `rejected` denotes a deterministic, terminal policy or invariant failure and has no reply.
 
 `config/development.json` selects the static development ChannelPlugin, deterministic ModelProvider, declarative Contract file and version, enabled capabilities and identity mappings. Relative database and Contract paths resolve from the config file's directory; absolute paths are also supported. Optional `secret_references` map names to environment variable names; values stay outside configuration. The development adapters need no credentials. Unknown adapters and unmapped senders are rejected; runtime input cannot change configuration.
 
@@ -785,7 +785,8 @@ Model adapters return `SemanticProposal` records from `piecetogether.proposals`.
 - `GroundingPlanOperation`, `GroundingResolutionOperation`: describe a policy-governed plan or resolution. A plan's `claim_ids` expose Claims; optional `resolution_ids` expose Entity/Context resolutions as independent items. A resolution names a Core-generated item ID and later sender evidence; optional `rationale` supports the later conversational-policy extension.
 - `ArtifactOperation`: describe role classification or lifecycle intent, with Contract-controlled retention.
 - `EmergentConceptOperation`: introduce reusable vocabulary with `non_authoritative` status; no canonical-name collisions, Entity Type creation or ontology promotion.
-- `ContextRequestOperation`: describe a scoped, purpose-labelled request with a positive retrieval budget. Retrieval execution and disclosure eligibility belong to #16; until then requests reject with `context_retrieval_unavailable`.
+- `ContextRequestOperation`: request known catalogue IDs for `continuity`, `disambiguation` or `grounding`, with a positive bounded record budget. Core resolves requests before another model call; the final proposal must contain no unresolved request.
+- `DisclosureOperation`: request Core-rendered historical content by selected record ID and eligible purpose. Unknown, duplicate or ineligible references reject without a reply.
 
 Proposal-local identifiers and targets within a Grounding plan must be unique. References resolve independently of operation order, and every operation must validate before any reply is handed off. An envelope contains at most 256 operations and 256 free-text candidates. Free-text `candidate_claims` remain unstructured Working State and cannot stand in for a structured Claim operation or trusted assertion. Concept names and type names are separate namespaces; a Concept name can never be used to introduce an Entity Type. The active Contract version, Proposal version/intent, validation outcome (`accepted`, `rejected`, `stale`) and deterministic reason codes are recorded through operator inspection. Unserializable rejected model output is omitted with an explicit trace marker; the rejection itself remains durable.
 
@@ -817,9 +818,35 @@ core.inspect_concepts()        # separate non-authoritative vocabulary and prove
 
 These are local Core/verification interfaces, not sender retrieval or an application State API. Sender replies still contain only `communication_id`, `status` and `reply`. Deterministic adapter scenarios in `tests/test_history.py` exercise authorized commits and failure/recovery invariants without a live model.
 
-## Planned semantic decision adapters
+## Bounded Context Packs and semantic decision adapters
 
-The development direction is to evaluate TypeSafe/Jev for bounded selection and classification, starting with the replaceable semantic selector in Context Assembly ([#16](https://github.com/DanieleSuppo/piecetogether/issues/16)). A deterministic reference adapter remains the default; the optional Jev adapter ranks permitted candidates while the Core owns scope, budgets, revisions and disclosure. Production adoption depends on domain-specific recall, fallback, latency and cost measurements.
+`ModelProvider.propose(inbound, contract_version, context_pack)` receives a frozen Core-owned Pack. It includes resolved Actor identity, the active declarative Contract/policy JSON, selected record IDs/kinds, reasons, content revisions, deployment-wide semantic revision, scope fingerprint and explicit budgets. The bounded catalogue supports multiple Contexts, Entity/Claim history, normalized Communications, unresolved Grounding, persisted Emergent Concepts and validated candidate Artifact metadata. Artifact bytes and persistence are handled by the later Artifact tickets.
+
+The deterministic reference selector ranks compact summaries by lexical overlap and explicit IDs. It does not force ambiguous references into one identity or create a record when none matches. Actor-owned pending items and explicit trusted record references are mandatory. Mandatory overflow produces `budget_exhausted`; optional catalogue overflow is recorded as truncation. The initial policy conservatively treats every Actor-owned pending item as mandatory. Catalogue bounds prioritize pending items and recent records; older optional history outside the catalogue is unavailable to a model request.
+
+Internal selection is distinct from sender disclosure. Structural evidence marks pending items addressed by `reply_to` as eligible for Grounding, explicitly referenced trusted IDs as eligible for continuity/disambiguation, and same-thread Communication history as eligible for continuity. Ranking and additional-context requests never add eligibility. The generative model receives identities/revisions for internal-only records with their content and summaries withheld; unselected catalogue entries never include payloads. This conservative first policy prevents private historical content from leaking into model-generated prose or candidates. Eligible historic content uses `DisclosureOperation` and Core rendering. When a historical catalogue is present, arbitrary model draft prose is replaced by the current Communication's acquisition acknowledgement. `SemanticProposal.response_intent='retrieval'` produces a fixed refusal without ledger disclosure; retrieval intent cannot create candidates, Grounding plans, vocabulary or trusted state. External Entity/Context/Claim/relationship references must belong to the Actor-scoped catalogue, independently of global Contract validation.
+
+The Pack is checked after provider work and again in the checkpoint transaction. Trusted history, other turns' exposures/concepts and completed Communication membership are fenced; a turn's own durable vocabulary/exposure changes do not invalidate its delivery recovery. Cached delivery restores the Pack and selection/retrieval trace without repeating provider work. Completed and committed outcomes retain their existing idempotency guarantees.
+
+An optional `selection` bootstrap object controls the fixed adapter and budgets. Defaults:
+
+```json
+{"adapter":"deterministic","max_records":32,"max_bytes":65536,"catalogue_records":128,"catalogue_bytes":32768,"max_calls":3,"max_tokens":65536,"timeout_ms":2000,"max_model_calls":3,"rubric_version":"context-relevance-v1"}
+```
+
+`max_records`/`max_bytes` bound selected content; `max_bytes` also bounds the serialized generative input including Communication, Contract and catalogue. `catalogue_records`/`catalogue_bytes` bound compact selector candidates. `max_calls`, `max_tokens` and `timeout_ms` bound selection and fallback; UTF-8 byte counts provide a conservative text-token upper bound, and fallback is charged against remaining calls/input budget. `max_model_calls` bounds the cumulative proposal/retrieval loop. Request budgets count record IDs and cannot override these deployment limits. No automatic remote retry is performed.
+
+Optional Jev configuration requires an evaluated operating point, pinned model and resolved deployment secret:
+
+```json
+{"selection":{"adapter":"jev","model_id":"jev-1.13.0","rubric_version":"context-relevance-v1","secret_reference":"typesafe","minimum_relevance":0.7},"secret_references":{"typesafe":"TYPESAFE_API_KEY"}}
+```
+
+The example `0.7` is illustrative, not an endorsed threshold. Only the model whose limits have been verified (`jev-1.13.0`) is supported initially. Jev sends bounded text/JSON via stdlib HTTPS and independent per-candidate Noul questions. Core validates IDs, duplicate assessments, primitive shape/ranges, model/rubric metadata, usage and final budgets. Timeout, unavailable/abstained/malformed output uses deterministic fallback when budget remains. Scores never authorize disclosure, Grounding or trusted state. Missing configuration fails bootstrap; default deployments need no TypeSafe account.
+
+Operator traces capture the catalogue/mandatory revision references, Pack, decisions, primitive values, model/rubric versions, usage, elapsed latency, retrieval and fallback. Captured HTTP fixtures keep CI independent of live credentials. Follow the [focused Jev adoption procedure](docs/jev-adoption.md) before enabling it in a deployment.
+
+TypeSafe/Jev evaluation starts with the replaceable semantic selector in Context Assembly ([#16](https://github.com/DanieleSuppo/piecetogether/issues/16)). A deterministic reference adapter remains the default; the optional Jev adapter ranks permitted candidates while the Core owns scope, budgets, revisions and disclosure. Production adoption depends on domain-specific recall, fallback, latency and cost measurements.
 
 Later tickets can reuse the approach for known Entity/Context references, concept reconciliation, per-item Grounding proposals and Artifact text classifications. Generative ModelProviders still handle open interpretations and conversational responses; all model decisions remain proposals subject to deterministic validation and Grounding. Confidence never authorizes trusted state.
 

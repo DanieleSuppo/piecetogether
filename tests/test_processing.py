@@ -14,7 +14,7 @@ from piecetogether.proposals import (
 
 
 class ForbiddenModel:
-    def propose(self, inbound, contract_version):
+    def propose(self, inbound, contract_version, context_pack):
         return SemanticProposal(
             1, contract_version, inbound.id, (), "Unsafe draft",
             (EntityOperation("e1", "Forbidden"),),
@@ -22,7 +22,7 @@ class ForbiddenModel:
 
 
 class MustNotRunModel:
-    def propose(self, inbound, contract_version):
+    def propose(self, inbound, contract_version, context_pack):
         raise AssertionError("a durable outcome must not invoke the model again")
 
 
@@ -35,7 +35,7 @@ class StaticContractProvider:
 
 
 class SubjectModel:
-    def propose(self, inbound, contract_version):
+    def propose(self, inbound, contract_version, context_pack):
         return SemanticProposal(
             1, contract_version, inbound.id, (), "Subject interpretation",
             (EntityOperation("s1", "Subject"),),
@@ -207,7 +207,7 @@ class ProcessingTests(unittest.TestCase):
         )
 
         class GraphModel:
-            def propose(self, inbound, version):
+            def propose(self, inbound, version, context_pack):
                 return SemanticProposal(1, version, inbound.id, (), "A graph draft", (
                     EntityOperation("s1", "Subject"), ContextOperation("ctx", ("s1",)),
                     RelationshipOperation("related", "s1", "ctx"),
@@ -254,7 +254,7 @@ class ProcessingTests(unittest.TestCase):
 
     def test_interrupted_legacy_unserializable_rejection_keeps_its_decision(self):
         class UnserializableModel:
-            def propose(self, inbound, version):
+            def propose(self, inbound, version, context_pack):
                 return SemanticProposal(1, version, inbound.id, (), "Unsafe draft", (
                     EntityOperation("e1", "Forbidden", {"raw": object()}),
                 ))
@@ -272,7 +272,7 @@ class ProcessingTests(unittest.TestCase):
 
     def test_unserializable_capture_with_storage_failure_remains_retryable(self):
         class UnserializableModel:
-            def propose(self, inbound, version):
+            def propose(self, inbound, version, context_pack):
                 return SemanticProposal(1, version, inbound.id, (), "Unsafe draft", (
                     EntityOperation("e1", "Forbidden", {"raw": object()}),
                 ))
@@ -292,7 +292,7 @@ class ProcessingTests(unittest.TestCase):
 
     def test_stale_and_fresh_attempts_remain_inspectable_after_restart(self):
         class StaleModel:
-            def propose(self, inbound, version):
+            def propose(self, inbound, version, context_pack):
                 return SemanticProposal(1, "obsolete-v1", inbound.id, (), "Old draft")
 
         first_core = Core(self.config, model=StaleModel())
@@ -316,9 +316,9 @@ class ProcessingTests(unittest.TestCase):
         seen = []
 
         class ObservedForbiddenModel(ForbiddenModel):
-            def propose(self, inbound, version):
+            def propose(self, inbound, version, context_pack):
                 seen.append(inbound.id)
-                return super().propose(inbound, version)
+                return super().propose(inbound, version, context_pack)
 
         core = Core(self.config, model=ObservedForbiddenModel())
         self.database_fault("""

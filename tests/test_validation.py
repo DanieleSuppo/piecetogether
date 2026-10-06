@@ -48,7 +48,7 @@ class ValidationTests(unittest.TestCase):
 
     def propose(self, operations=(), contract_provider=None, **changes):
         class ProposalModel:
-            def propose(model, inbound, contract_version):
+            def propose(model, inbound, contract_version, context_pack):
                 return SemanticProposal(**{
                     'schema_version': 1,
                     'contract_version': contract_version,
@@ -175,7 +175,7 @@ class ValidationTests(unittest.TestCase):
 
     def test_old_contract_requires_fresh_processing_without_exposure(self):
         class OldContractModel:
-            def propose(self, inbound, contract_version):
+            def propose(self, inbound, contract_version, context_pack):
                 return SemanticProposal(
                     1, 'obsolete-v1', inbound.id,
                     (CandidateClaim(inbound.id, inbound.text),), 'A draft'
@@ -339,11 +339,11 @@ class ValidationTests(unittest.TestCase):
 
     def test_reprocessing_does_not_reuse_a_previous_semantic_result_after_model_failure(self):
         class StaleModel:
-            def propose(self, inbound, contract_version):
+            def propose(self, inbound, contract_version, context_pack):
                 return SemanticProposal(1, 'old', inbound.id, (), 'A draft')
 
         class FailingModel:
-            def propose(self, inbound, contract_version):
+            def propose(self, inbound, contract_version, context_pack):
                 raise OSError('temporary failure')
 
         stale = Core(self.config, model=StaleModel()).accept(self.message)
@@ -409,7 +409,7 @@ class ValidationTests(unittest.TestCase):
             def __init__(model, count):
                 model.count = count
 
-            def propose(model, inbound, contract_version):
+            def propose(model, inbound, contract_version, context_pack):
                 return SemanticProposal(
                     1, contract_version, inbound.id,
                     tuple(CandidateClaim(inbound.id, f'Interpretation {i}') for i in range(model.count)),
@@ -433,7 +433,7 @@ class ValidationTests(unittest.TestCase):
 
     def test_typed_context_requests_cannot_fetch_uncontrolled_memory(self):
         for i, (operation, reason) in enumerate((
-            (ContextRequestOperation(('ctx1',), 'continuity', 10), 'context_retrieval_unavailable'),
+            (ContextRequestOperation(('ctx1',), 'continuity', 10), 'context_scope_not_allowed'),
             (ContextRequestOperation(('ctx1',), 'historical_retrieval', 10), 'invalid_context_request'),
             (ContextRequestOperation((), 'grounding', 10), 'invalid_context_request'),
             (ContextRequestOperation(('ctx1',), 'grounding', False), 'invalid_context_request'),

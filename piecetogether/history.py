@@ -172,8 +172,6 @@ def check(
                 return ValidationResult('rejected', ('grounding_target_not_allowed',))
             planned.update(ids)
     if proposal.intent == 'candidate':
-        if len(grounding_response(proposal)) > 65536:
-            return ValidationResult('rejected', ('grounding_response_too_large',))
         return result
     # ponytail: deployment-wide revision, scope revisions in #22 if contention matters.
     if proposal.semantic_revision != state['revision']:

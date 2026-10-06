@@ -27,14 +27,14 @@ class ProposalModel:
         self.operations = operations
         self.envelope = envelope
 
-    def propose(self, inbound, version):
+    def propose(self, inbound, version, context_pack):
         operations = self.operations(inbound) if callable(self.operations) else self.operations
         return SemanticProposal(1, version, inbound.id, (), 'An interpretation',
                                 operations, **self.envelope)
 
 
 class MustNotRunModel:
-    def propose(self, inbound, version):
+    def propose(self, inbound, version, context_pack):
         raise AssertionError('durable work must not invoke the model again')
 
 
@@ -349,7 +349,7 @@ class HistoryTests(unittest.TestCase):
                                                      'explicit', 'accepted')
                          for item in exposed['grounding_items'])
         class RacingModel:
-            def propose(model, inbound, version):
+            def propose(model, inbound, version, context_pack):
                 other = Core(self.config, model=ProposalModel(operations, intent='semantic_commit', semantic_revision=0),
                              contract_provider=ContractProvider(self.contract))
                 completed.append(other.accept(payload))
@@ -462,7 +462,7 @@ class HistoryTests(unittest.TestCase):
             return tuple(GroundingResolutionOperation(item['id'], 'p', inbound.id, 'explicit', 'accepted')
                          for item in exposed['grounding_items'])
         class FailedRacingModel:
-            def propose(model, inbound, version):
+            def propose(model, inbound, version, context_pack):
                 other = Core(self.config, model=ProposalModel(operations, intent='semantic_commit', semantic_revision=0),
                              contract_provider=ContractProvider(self.contract))
                 completed.append(other.accept(payload))
@@ -480,8 +480,8 @@ class HistoryTests(unittest.TestCase):
 
     def test_core_exposes_every_groundable_interpretation_even_with_unrelated_model_draft(self):
         class UnrelatedDraft(ProposalModel):
-            def propose(model, inbound, version):
-                return replace(super().propose(inbound, version), draft_response='Would you like to continue?')
+            def propose(model, inbound, version, context_pack):
+                return replace(super().propose(inbound, version, context_pack), draft_response='Would you like to continue?')
         operations = (
             EntityOperation('subject', 'Subject'),
             ClaimOperation('count', 'subject', 'count', 999, 'p'),
@@ -507,7 +507,7 @@ class HistoryTests(unittest.TestCase):
         winner = Core(self.config, model=ProposalModel(operations, intent='semantic_commit', semantic_revision=0),
                       contract_provider=ContractProvider(self.contract))
         class FailedModel:
-            def propose(model, inbound, version):
+            def propose(model, inbound, version, context_pack):
                 raise ValueError('losing model failed')
         loser = Core(self.config, model=FailedModel(), contract_provider=ContractProvider(self.contract))
         completed = []

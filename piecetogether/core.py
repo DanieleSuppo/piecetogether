@@ -5,7 +5,7 @@ import os
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from time import monotonic
@@ -14,7 +14,8 @@ from uuid import uuid4
 
 from .contracts import DeclarativeContractProvider, DomainContractProvider
 from . import history
-from .proposals import CandidateClaim, SemanticProposal, ValidationResult
+from . import context
+from .proposals import CandidateClaim, ContextRequestOperation, SemanticProposal, ValidationResult
 
 
 def now() -> str:
@@ -31,8 +32,11 @@ class Bootstrap:
     capabilities: tuple[str, ...] = ("receive", "reply")
     secret_references: dict[str, str] = field(default_factory=dict)
     contract: Path | None = None
+    selection: context.SelectionConfig = field(default_factory=context.SelectionConfig)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.selection, context.SelectionConfig):
+            raise ValueError('selection must be a static SelectionConfig')
         if self.contract is not None and not isinstance(self.contract, Path):
             raise ValueError("contract must name a declarative file")
         if self.channel != "development" or self.model != "deterministic":
@@ -86,6 +90,7 @@ class Bootstrap:
             "capabilities",
             "secret_references",
             "contract",
+            "selection",
         }
         if not isinstance(data, dict) or set(data) - allowed:
             raise ValueError("invalid bootstrap configuration")
@@ -96,6 +101,13 @@ class Bootstrap:
         ):
             raise ValueError("capabilities must be a string array")
         database = Path(data.pop("database"))
+        if 'selection' in data:
+            if not isinstance(data['selection'], dict):
+                raise ValueError('selection must be an object')
+            try:
+                data['selection'] = context.SelectionConfig(**data['selection'])
+            except TypeError as error:
+                raise ValueError('invalid selector configuration') from error
         if "contract" in data:
             if not isinstance(data["contract"], str) or not data["contract"].strip():
                 raise ValueError("contract must name a declarative file")
@@ -127,7 +139,7 @@ class Communication:
 
 class ModelProvider(Protocol):
     def propose(
-        self, inbound: Communication, contract_version: str
+        self, inbound: Communication, contract_version: str, context_pack: context.ContextPack
     ) -> SemanticProposal: ...
 
 
@@ -137,7 +149,7 @@ class ChannelPlugin(Protocol):
 
 class DeterministicModel:
     def propose(
-        self, inbound: Communication, contract_version: str
+        self, inbound: Communication, contract_version: str, context_pack: context.ContextPack
     ) -> SemanticProposal:
         return SemanticProposal(
             schema_version=1,
@@ -194,6 +206,7 @@ class Core:
         model: ModelProvider | None = None,
         channel: ChannelPlugin | None = None,
         contract_provider: DomainContractProvider | None = None,
+        selector: context.SemanticSelector | None = None,
     ):
         self.config = config
         provider = contract_provider or DeclarativeContractProvider(config.contract)
@@ -202,6 +215,15 @@ class Core:
             raise ValueError("provider returned a different Contract version")
         self.model = model or DeterministicModel()
         self.channel = channel or DevelopmentChannel(config.database)
+        if config.selection.adapter == 'jev':
+            from .jev import JevSelector
+            reference = config.secret_references.get(config.selection.secret_reference or '')
+            api_key = os.environ.get(reference or '')
+            if not reference or not api_key:
+                raise ValueError('Jev secret reference is unresolved')
+            self.selector: context.SemanticSelector = selector or JevSelector(config.selection, api_key)
+        else:
+            self.selector = selector or context.ReferenceSelector()
         config.database.parent.mkdir(parents=True, exist_ok=True)
         with connect(config.database) as db:
             db.executescript("""
@@ -368,17 +390,58 @@ class Core:
         saved_outbound = row["outbound"]
         captured = row["proposal"] if outbound else None
         stage = "model"
+        pack: context.ContextPack | None = None
+        requests: tuple[ContextRequestOperation, ...] = ()
+        preliminary = ValidationResult('accepted')
         try:
             if outbound is None:
-                proposal = self.model.propose(inbound, self.config.contract_version)
+                with connect(self.config.database) as db:
+                    db.execute('BEGIN')
+                    pack = context.assemble(db, asdict(inbound), self.config.contract_version, self.config.selection)
+                    pack = replace(pack, contract_json=context.encoded(asdict(self.contract)))
+                trace['selection'] = []
+                pack = context.select(pack, asdict(inbound), self.selector, trace['selection'])
+                trace['context_pack'] = pack.captured()
+                if pack.outcome == 'budget_exhausted':
+                    raise context.BudgetExhausted()
+                trace['retrieval'] = []
+                for model_call in range(self.config.selection.max_model_calls):
+                    trace['model_calls'] = model_call + 1
+                    model_pack = context.model_view(pack)
+                    if len(context.encoded([asdict(inbound), asdict(model_pack)]).encode()) > pack.budget.max_bytes:
+                        raise context.BudgetExhausted()
+                    proposal = self.model.propose(inbound, self.config.contract_version, model_pack)
+                    with connect(self.config.database) as db:
+                        preliminary = history.check(db, proposal, asdict(inbound), self.contract)
+                    requests = tuple(op for op in proposal.operations if isinstance(op, ContextRequestOperation))
+                    if preliminary.outcome != 'accepted' or not requests:
+                        break
+                    pack, preliminary = context.retrieve(pack, requests, trace['retrieval'])
+                    trace['context_pack'] = pack.captured()
+                    if preliminary.outcome != 'accepted':
+                        break
+                else:
+                    raise context.BudgetExhausted()
             else:
                 stage = "validation"
                 proposal = SemanticProposal.from_dict(json.loads(row["proposal"]))
+                if previous_trace.get('context_pack'):
+                    pack = context.ContextPack.from_dict(previous_trace['context_pack'])
+                    for name in ('context_pack', 'selection', 'retrieval', 'model_calls'):
+                        if name in previous_trace:
+                            trace[name] = previous_trace[name]
             with connect(self.config.database) as db:
                 validation = (ValidationResult("accepted") if prior_commit else
                               history.check(db, proposal, asdict(inbound), self.contract))
+                if validation.outcome == 'accepted' and not prior_commit:
+                    if pack is not None and not context.current(db, pack):
+                        validation = ValidationResult('stale', ('context_revision_changed',))
+                    elif outbound is None and requests and preliminary.outcome != 'accepted':
+                        validation = preliminary
+                    else:
+                        validation = context.check_disclosure(proposal, pack, asdict(inbound))
             if (validation.outcome == "accepted" and not prior_commit and outbound is not None
-                    and outbound.text != history.grounding_response(proposal)):
+                    and outbound.text != context.response(proposal, asdict(inbound), pack)):
                 validation = ValidationResult("stale", ("grounding_exposure_changed",))
             trace["validation_result"] = validation.outcome
             trace["validation_reasons"] = list(validation.reasons)
@@ -410,7 +473,7 @@ class Core:
                         actor_id=inbound.actor_id,
                         direction="outbound",
                         idempotency_key=inbound.id,
-                        text=history.grounding_response(proposal),
+                        text=context.response(proposal, asdict(inbound), pack),
                         sent_at=now(),
                         received_at=now(),
                         thread_id=inbound.thread_id,
@@ -449,9 +512,12 @@ class Core:
                         _record_attempt(db, inbound.id, captured, checkpoint['outbound'], trace, 'completed')
                         return {"communication_id": inbound.id, "reply": outbound.text, "status": "completed"}
                 if not prior_commit and validation.outcome == "accepted":
-                    validation, semantic_commit = history.commit(
-                        db, proposal, asdict(inbound), self.contract, now(),
-                    )
+                    if pack is not None and not context.current(db, pack):
+                        validation, semantic_commit = ValidationResult('stale', ('context_revision_changed',)), None
+                    else:
+                        validation, semantic_commit = history.commit(
+                            db, proposal, asdict(inbound), self.contract, now(),
+                        )
                     trace["validation_result"] = validation.outcome
                     trace["validation_reasons"] = list(validation.reasons)
                     if semantic_commit:
@@ -481,7 +547,7 @@ class Core:
                 accepted = self.channel.deliver(outbound)
                 trace["delivery_result"] = "accepted" if accepted else "retryable"
         except (OSError, ValueError, TypeError, RecursionError, sqlite3.Error) as error:
-            status = "retryable"
+            status = 'budget_exhausted' if isinstance(error, context.BudgetExhausted) else "retryable"
             if stage == "validation":
                 saved_outbound = None
             trace["failure_stage"] = stage

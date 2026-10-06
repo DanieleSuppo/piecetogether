@@ -84,7 +84,7 @@ class CoreTests(unittest.TestCase):
             observed = []
 
             class FailingModel:
-                def propose(self, inbound, contract_version):
+                def propose(self, inbound, contract_version, context_pack):
                     observed.append(Core(config).inspect(inbound.id))
                     raise OSError("temporary provider failure")
 
@@ -120,7 +120,7 @@ class CoreTests(unittest.TestCase):
                     return True
 
             class MustNotRunModel:
-                def propose(self, inbound, contract_version):
+                def propose(self, inbound, contract_version, context_pack):
                     raise AssertionError("stored proposal must be reused")
 
             message = {
@@ -197,7 +197,7 @@ class CoreTests(unittest.TestCase):
             )
 
             class InvalidModel:
-                def propose(self, inbound, contract_version):
+                def propose(self, inbound, contract_version, context_pack):
                     return SemanticProposal(
                         1,
                         contract_version,
@@ -227,7 +227,7 @@ class CoreTests(unittest.TestCase):
             )
 
             class MalformedModel:
-                def propose(self, inbound, contract_version):
+                def propose(self, inbound, contract_version, context_pack):
                     return SemanticProposal(
                         1, contract_version, inbound.id, ({},), "Unsafe interpretation"
                     )

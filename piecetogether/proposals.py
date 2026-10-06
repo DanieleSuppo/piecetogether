@@ -91,12 +91,20 @@ class ContextRequestOperation:
     kind: Literal["context_request"] = field(default="context_request", init=False)
 
 
+@dataclass(frozen=True)
+class DisclosureOperation:
+    record_id: str
+    purpose: Literal['continuity', 'disambiguation', 'grounding']
+    kind: Literal['disclosure'] = field(default='disclosure', init=False)
+
+
 Operation = (
     EntityOperation | ContextOperation | ClaimOperation | RelationshipOperation
     | GroundingPlanOperation | GroundingResolutionOperation
     | ArtifactOperation
     | EmergentConceptOperation
     | ContextRequestOperation
+    | DisclosureOperation
 )
 
 
@@ -117,6 +125,7 @@ class SemanticProposal:
     operations: tuple[Operation, ...] = ()
     intent: Literal["candidate", "semantic_commit"] = "candidate"
     semantic_revision: int | None = None
+    response_intent: Literal['acquisition', 'retrieval'] = 'acquisition'
 
     @classmethod
     def from_dict(cls, data: Any) -> "SemanticProposal":
@@ -128,6 +137,7 @@ class SemanticProposal:
             "grounding_resolution": GroundingResolutionOperation,
             "artifact": ArtifactOperation, "emergent_concept": EmergentConceptOperation,
             "context_request": ContextRequestOperation,
+            'disclosure': DisclosureOperation,
         }
         try:
             if not isinstance(data, dict):
@@ -200,12 +210,18 @@ def validate(
         return ValidationResult("stale", ("contract_version_changed",))
     if proposal.intent not in ("candidate", "semantic_commit"):
         return ValidationResult("rejected", ("invalid_proposal_intent",))
+    if proposal.response_intent not in ('acquisition', 'retrieval'):
+        return ValidationResult('rejected', ('invalid_response_intent',))
     if proposal.intent == "semantic_commit" and (
         type(proposal.semantic_revision) is not int or proposal.semantic_revision < 0
     ):
         return ValidationResult("rejected", ("semantic_revision_required",))
     if not isinstance(proposal.operations, tuple) or len(proposal.operations) > 256:
         return ValidationResult("rejected", ("invalid_operations",))
+    if proposal.response_intent == 'retrieval' and (
+        proposal.intent == 'semantic_commit' or proposal.operations or proposal.candidate_claims
+    ):
+        return ValidationResult('rejected', ('retrieval_cannot_interpret',))
     targets: dict[str, str] = dict(existing_targets or {})
     emergent: set[str] = set(existing_concepts or ())
     local_ids: set[str] = set()
@@ -217,6 +233,7 @@ def validate(
             ArtifactOperation,
             EmergentConceptOperation,
             ContextRequestOperation,
+            DisclosureOperation,
         ):
             return ValidationResult("rejected", ("unsupported_operation",))
         if isinstance(operation, EntityOperation) and not valid_name(operation.entity_type):
@@ -384,6 +401,11 @@ def operation_reason(
             or type(operation.budget) is not int or operation.budget <= 0
         ):
             return "invalid_context_request"
-        # #16 owns scope, disclosure eligibility and bounded retrieval execution.
-        return "context_retrieval_unavailable"
+        if (len(set(operation.scope_ids)) != len(operation.scope_ids)
+                or operation.budget > 256 or len(operation.scope_ids) > operation.budget):
+            return 'invalid_context_request'
+    elif isinstance(operation, DisclosureOperation):
+        if (not valid_name(operation.record_id)
+                or operation.purpose not in ('continuity', 'disambiguation', 'grounding')):
+            return 'invalid_disclosure_request'
     return None
