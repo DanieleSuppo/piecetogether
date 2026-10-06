@@ -1,6 +1,6 @@
 # Atomic trusted semantic history (#15)
 
-Authority: SPEC #12, ticket #15, resolutions #3/#4/#6/#10, `CONTEXT.md`
+Authority: SPEC #12, ticket #15, resolutions #3/#4/#6/#10, `GLOSSARY.md`
 and `docs/PRD.md`. The user requested autonomous decisions based on this
 documentation, including test seams.
 
