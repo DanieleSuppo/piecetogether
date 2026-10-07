@@ -12,7 +12,7 @@ from time import monotonic
 from typing import Any, Protocol
 from uuid import uuid4
 
-from . import context, history
+from . import context, history, view
 from .contracts import DeclarativeContractProvider, DomainContractProvider
 from .proposals import (
     CandidateClaim,
@@ -663,6 +663,12 @@ class Core:
                 for name in ("inbound", "proposal", "outbound", "trace")
             },
         }
+
+    def current_view(self) -> dict[str, Any]:
+        """Trusted projection for local consumers; never a sender retrieval path."""
+        with connect(self.config.database) as db:
+            db.execute("BEGIN")
+            return view.current_view(db)
 
     def inspect_history(self) -> dict[str, Any]:
         """Operator-only ledger inspection, separate from sender acquisition."""

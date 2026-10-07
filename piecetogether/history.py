@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
+from . import view
 from .contracts import DomainContract
 from .proposals import (
     ClaimOperation,
@@ -77,7 +78,7 @@ def initialize(db: sqlite3.Connection, contract: DomainContract) -> None:
 
 def targets(db: sqlite3.Connection) -> dict[str, str]:
     result = {}
-    for row in db.execute("SELECT id, kind, record FROM trusted_records"):
+    for row in db.execute("SELECT id, kind, record FROM trusted_records WHERE kind != 'context_transition'"):
         result[row['id']] = (json.loads(row['record'])['entity_type']
                              if row['kind'] == 'entity' else '$' + row['kind'])
     return result
@@ -127,6 +128,8 @@ def grounding_response(proposal: SemanticProposal) -> str:
                                    f'{json.dumps(candidate.attributes, ensure_ascii=False, allow_nan=False)}.')
                 else:
                     clauses.append(f'The existing {candidate.entity_type} ({candidate.id}).')
+            elif candidate.action in ('suspend', 'resume'):
+                clauses.append(f'{candidate.action} context {candidate.id}.')
             else:
                 clauses.append(f'The {"new" if candidate.action == "create" else "existing"} '
                                f'context {candidate.id}' +
@@ -379,6 +382,13 @@ def check(
             if not set(ids) <= local:
                 return ValidationResult('rejected', ('grounding_target_not_allowed',))
             planned.update(ids)
+    contexts = view.contexts(db)
+    for context_operation in proposal.operations:
+        if isinstance(context_operation, ContextOperation) and context_operation.action in ('suspend', 'resume'):
+            expected = 'active' if context_operation.action == 'suspend' else 'suspended'
+            current_context = contexts.get(context_operation.id)
+            if current_context is None or current_context['status'] != expected:
+                return ValidationResult('rejected', ('invalid_context_transition',))
     if proposal.intent == 'candidate':
         return result
     # ponytail: deployment-wide revision, scope revisions in #22 if contention matters.
@@ -409,6 +419,12 @@ def check(
         if pending is None:
             return ValidationResult('rejected', ('grounding_item_unavailable',))
         row, source, candidate = pending
+        if (operation.outcome == 'accepted' and isinstance(candidate, ContextOperation)
+                and candidate.action in ('suspend', 'resume')):
+            current = contexts.get(candidate.id)
+            expected = 'active' if candidate.action == 'suspend' else 'suspended'
+            if current is None or current['status'] != expected:
+                return ValidationResult('stale', ('context_lifecycle_changed',))
         if db.execute("SELECT 1 FROM trusted_grounding_items WHERE id=?",
                       (operation.item_id,)).fetchone():
             return ValidationResult('stale', ('grounding_item_already_resolved',))
@@ -530,20 +546,23 @@ def commit(
         record = {**asdict(candidate), **metadata, 'id': str(uuid4()),
                   'provenance': provenance, 'provenance_class': 'grounded'}
         is_resolution = isinstance(candidate, (EntityOperation, ContextOperation)) and candidate.action == 'resolve'
+        is_transition = isinstance(candidate, ContextOperation) and candidate.action in ('suspend', 'resume')
+        if is_transition:
+            record.update(kind='context_transition', context_id=candidate.id)
         if operation.outcome == 'accepted' and not is_resolution:
             records[row['grounding_id'], row['candidate_id']] = record
         item = {'id': operation.item_id, **metadata, 'outcome': operation.outcome,
                 'policy': operation.policy, 'acceptance_mode': operation.acceptance_mode,
                 'rationale': operation.rationale, 'provenance': provenance,
-                'target_id': candidate.id if is_resolution or operation.outcome != 'accepted' else record['id'],
+                'target_id': candidate.id if is_resolution or is_transition or operation.outcome != 'accepted' else record['id'],
                 'candidate_id': row['candidate_id'], 'exposed_at': row['exposed_at']}
         if operation.outcome == 'corrected':
             item['successor_candidate_ids'] = list(operation.successor_ids)
         items.append(item)
 
     mapping = {(row['grounding_id'], row['candidate_id']): row['id'] for row in db.execute(
-        "SELECT id, grounding_id, candidate_id FROM trusted_records")}
-    mapping.update({key: record['id'] for key, record in records.items()})
+        "SELECT id, grounding_id, candidate_id FROM trusted_records WHERE kind != 'context_transition'")}
+    mapping.update({key: record['id'] for key, record in records.items() if record['kind'] != 'context_transition'})
     existing = targets(db)
 
     def resolve(grounding_id: str, candidate_id: str) -> str | None:
@@ -639,7 +658,8 @@ def commit(
     db.execute("UPDATE semantic_state SET revision=?", (revision + 1,))
     event = {'id': str(uuid4()), **metadata, 'event_type': 'semantic_committed',
              'timestamp': timestamp, 'entity_ids': [r['id'] for r in records.values() if r['kind'] == 'entity'],
-             'context_ids': [r['id'] for r in records.values() if r['kind'] == 'context'],
+             'context_ids': list(dict.fromkeys(r['context_id'] if r['kind'] == 'context_transition' else r['id']
+                                              for r in records.values() if r['kind'] in ('context', 'context_transition'))),
              'artifact_ids': [], 'assertion_ids': [r['id'] for r in records.values() if r['kind'] == 'claim'],
              'grounding_item_ids': summary['grounding_item_ids']}
     db.execute("INSERT INTO semantic_outbox VALUES (?, ?)", (event['id'], json.dumps(event)))
@@ -652,6 +672,7 @@ def inspect_history(db: sqlite3.Connection) -> dict[str, Any]:
     result = {'revision': state['revision'],
               'entities': [r for r in records if r['kind'] == 'entity'],
               'contexts': [r for r in records if r['kind'] == 'context'],
+              'context_transitions': [r for r in records if r['kind'] == 'context_transition'],
               'claims': [r for r in records if r['kind'] == 'claim']}
     for name, table in (('commits', 'semantic_commits'), ('relationships', 'trusted_relationships'),
                         ('groundings', 'trusted_groundings'), ('grounding_items', 'trusted_grounding_items'),

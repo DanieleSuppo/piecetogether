@@ -730,7 +730,7 @@ Extension points exist to support real applications. Connector frameworks and pl
 
 ## Status
 
-The development Core implements durable text ingress and observable interpretation ([#13](https://github.com/DanieleSuppo/piecetogether/issues/13)), deterministic Domain Contract and typed Semantic Proposal validation ([#14](https://github.com/DanieleSuppo/piecetogether/issues/14)), atomic trusted semantic history ([#15](https://github.com/DanieleSuppo/piecetogether/issues/15)), bounded Context Packs with disclosure controls ([#16](https://github.com/DanieleSuppo/piecetogether/issues/16)), and the conversational Grounding lifecycle ([#17](https://github.com/DanieleSuppo/piecetogether/issues/17)). Current Trusted View, production channels and application APIs remain subsequent tickets. Product boundaries are captured in [docs/PRD.md](docs/PRD.md); technical authority is [SPEC #12](https://github.com/DanieleSuppo/piecetogether/issues/12).
+The development Core implements durable text ingress and observable interpretation ([#13](https://github.com/DanieleSuppo/piecetogether/issues/13)), deterministic Domain Contract and typed Semantic Proposal validation ([#14](https://github.com/DanieleSuppo/piecetogether/issues/14)), atomic trusted semantic history ([#15](https://github.com/DanieleSuppo/piecetogether/issues/15)), bounded Context Packs with disclosure controls ([#16](https://github.com/DanieleSuppo/piecetogether/issues/16)), the conversational Grounding lifecycle ([#17](https://github.com/DanieleSuppo/piecetogether/issues/17)), and Current Trusted View with grounded Context lifecycle ([#18](https://github.com/DanieleSuppo/piecetogether/issues/18)). Production channels and authenticated application APIs remain subsequent tickets. Product boundaries are captured in [docs/PRD.md](docs/PRD.md); technical authority is [SPEC #12](https://github.com/DanieleSuppo/piecetogether/issues/12).
 
 ## Run the development Core
 
@@ -750,7 +750,7 @@ Replies contain only `communication_id`, `status` and `reply`. Repeated delivery
 
 `config/development.json` selects the static development ChannelPlugin, deterministic ModelProvider, declarative Contract file and version, enabled capabilities and identity mappings. Relative database and Contract paths resolve from the config file's directory; absolute paths are also supported. Optional `secret_references` map names to environment variable names; values stay outside configuration. The development adapters need no credentials. Unknown adapters and unmapped senders are rejected; runtime input cannot change configuration.
 
-SQLite stores normalized inbound/outbound Communications, candidate proposals, processing outcomes and per-attempt Evaluation Traces separately from trusted semantic history and non-authoritative vocabulary. Validation checkpoints atomically persist the proposal, outbound, outcome and attempt evidence; accepted semantic commits also append trusted history, Grounding outcomes, revision and an outbox event in that transaction. The development ChannelPlugin accepts handoff into a durable local mailbox; it does not send Email or Telegram. Model and channel work run outside database transactions. State API, Current Trusted View and event dispatch are subsequent tickets.
+SQLite stores normalized inbound/outbound Communications, candidate proposals, processing outcomes and per-attempt Evaluation Traces separately from trusted semantic history and non-authoritative vocabulary. Validation checkpoints atomically persist the proposal, outbound, outcome and attempt evidence; accepted semantic commits also append trusted history, Grounding outcomes, revision and an outbox event in that transaction. The development ChannelPlugin accepts handoff into a durable local mailbox; it does not send Email or Telegram. Model and channel work run outside database transactions. Current Trusted View is derived from committed history in a consistent read transaction. Authenticated State API and event dispatch are subsequent tickets.
 
 Run one sequential development worker per database. This transport is operator-local, not a public network ingress or production connector. Candidates and traces are not returned to senders. A local operator with deployment filesystem access can inspect an outcome separately:
 
@@ -779,7 +779,7 @@ Value constraints support `type` (`string`, `boolean`, `integer`, `number`, `obj
 
 Model adapters return `SemanticProposal` records from `piecetogether.proposals`. Envelope schema `1` versions both the envelope and its operation union. Operations are frozen typed records with durable `kind` discriminators:
 
-- `EntityOperation`, `ContextOperation`: propose candidate creation or resolution.
+- `EntityOperation`, `ContextOperation`: propose candidate creation or resolution. Contexts also support `action='suspend'` and `action='resume'` against an existing trusted Context ID, with empty `entity_ids`; these transitions require independently exposed and accepted Grounding Items.
 - `ClaimOperation`: propose a constrained candidate assertion; provenance defaults to the envelope's inbound Communication and may never refer to another sender's input.
 - `RelationshipOperation`: propose a Contract-permitted relationship with permitted endpoints.
 - `GroundingPlanOperation`, `GroundingResolutionOperation`: describe a policy-governed plan or resolution. A plan's `claim_ids` expose Claims; optional `resolution_ids` expose Entity/Context resolutions as independent items. A resolution names a Core-generated item ID and later sender evidence; optional `rationale` supports the later conversational-policy extension.
@@ -803,7 +803,7 @@ Each Entity or Context creation needs its own accepted resolution item. Acceptin
 
 The short SQLite transaction rechecks the semantic revision and appends immutable Entities, Contexts, Grounded Claims, Grounding snapshots/items, provenance links, relationships, an opaque semantic commit ID and Contract version. It advances the revision and inserts a trusted change in the outbox together with the processing checkpoint. A storage failure rolls all these writes back. A rejected or stale proposal leaves trusted history unchanged. The initial deployment-wide revision conservatively fences all trusted changes; #22 can refine the relevant scope without relaxing atomicity.
 
-Corrections, supersessions and contradictions must be Contract-permitted relationships in the exposed candidate graph. They connect a newly accepted Claim to assertions on the same target/concept; correction and supersession predecessors must already be committed. A differing assertion on the same semantic key needs an explicit history relationship to conflicting current heads. Previous assertions are never overwritten. Current Trusted View projection and its conflict representation belong to #18.
+Corrections, supersessions and contradictions must be Contract-permitted relationships in the exposed candidate graph. They connect a newly accepted Claim to assertions on the same target/concept; correction and supersession predecessors must already be committed. A differing assertion on the same semantic key needs an explicit history relationship to conflicting current heads. Previous assertions are never overwritten. Current Trusted View exposes every current head, its lineage and explicit conflicts without choosing a winner.
 
 A committed turn's delivery failure cannot undo trusted history. Redelivery restores the durable commit and outbound without another model call or semantic effect, even after a Contract change or restart. Completed historical outcomes remain idempotent. A losing processing attempt, including a model/parsing failure, cannot replace an already committed checkpoint; its trace is retained separately. The outbox is recorded atomically now; at-least-once event dispatch and consumer authentication belong to #23/#24.
 
@@ -820,6 +820,27 @@ core.inspect_concepts()        # separate non-authoritative vocabulary and prove
 ```
 
 These are local Core/verification interfaces, not sender retrieval or an application State API. Sender replies still contain only `communication_id`, `status` and `reply`. Deterministic adapter scenarios in `tests/test_history.py` exercise authorized commits and failure/recovery invariants without a live model.
+
+## Current Trusted View and Context lifecycle
+
+```python
+core.current_view()  # committed revision, Entities, Contexts and assertion sets
+```
+
+This local consumer/verification seam derives a consistent snapshot from immutable trusted history, so an accepted semantic commit is immediately visible without a separate projection checkpoint. Candidates, pending interpretations, vocabulary, Communications, Evaluation Traces and outbox records are not part of the view. The authenticated, scoped and paginated application transport belongs to #24; acquisition never exposes this read seam to senders.
+
+Each `assertion_sets` entry identifies a semantic key (`target_id`, `concept`) and contains:
+
+- `heads`: all current Grounded Claims, preserving original IDs, values, Contract/commit metadata and provenance, plus `current: true` and transitive `lineage_ids` (including the head itself).
+- `lineage`: non-current assertions with full evidence and `current: false`; correction/supersession changes currentness, never historical records.
+- `relationships`: committed relationships between assertions on that key.
+- `conflicts`: pairs of competing current assertion IDs with explicit contradiction relationship IDs where present. Different values or an explicit `contradicts` relation produce a conflict; equal independent assertions remain separate heads. No scalar winner is selected.
+
+Authoritative Reference Assertion ingestion and grounded-versus-authoritative coexistence belong to #21, not this grounded-only slice. The projection is calculated on read with Python/SQLite; materialization and semantic-key indexes can be added when ledger size warrants them.
+
+Context creation may relate one stable Context to multiple accepted Entities. New Contexts are active. Grounded suspend/resume operations append immutable `context_transition` records with their own Contract, commit and source/exposure/evidence provenance; creation identity and membership remain unchanged. The projected Context carries `status` (`active` or `suspended`) and ordered `lifecycle` evidence. `inspect_history()` exposes those transitions separately as `context_transitions`. Context Packs include the current lifecycle, not merely the original creation record.
+
+A transition cannot rewrite members, target an unknown/non-Context object, suspend an already suspended Context or resume an active one. The committer rechecks lifecycle and revision atomically with Grounding outcomes and the outbox; changed lifecycle requires reprocessing and storage failure rolls back the transition. Events name the stable affected Context ID. Retries and restarts preserve one transition per accepted Grounding Item. Thread/session metadata neither owns nor resets lifecycle; delayed acceptance uses the existing Actor-bound evidence rules without requiring a transport reply.
 
 ## Bounded Context Packs and semantic decision adapters
 

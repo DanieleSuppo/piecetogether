@@ -19,7 +19,7 @@ class EntityOperation:
 class ContextOperation:
     id: str
     entity_ids: tuple[str, ...] = ()
-    action: Literal["create", "resolve"] = "create"
+    action: Literal["create", "resolve", "suspend", "resume"] = "create"
     kind: Literal["context"] = field(default="context", init=False)
 
 
@@ -279,13 +279,14 @@ def validate(
         if isinstance(operation, (EntityOperation, ContextOperation, ClaimOperation, ArtifactOperation)):
             if not valid_name(operation.id) or operation.id in local_ids or (
                 operation.id in targets and not (
-                    isinstance(operation, (EntityOperation, ContextOperation))
-                    and operation.action == "resolve"
+                    isinstance(operation, EntityOperation) and operation.action == "resolve"
+                    or isinstance(operation, ContextOperation) and operation.action in ("resolve", "suspend", "resume")
                 )
             ):
                 return ValidationResult("rejected", ("invalid_or_duplicate_id",))
             local_ids.add(operation.id)
-            if isinstance(operation, (EntityOperation, ContextOperation)) and operation.action == "resolve":
+            if (isinstance(operation, EntityOperation) and operation.action == "resolve"
+                    or isinstance(operation, ContextOperation) and operation.action != "create"):
                 continue
             targets[operation.id] = (
                 operation.entity_type if isinstance(operation, EntityOperation)
@@ -354,14 +355,14 @@ def operation_reason(
         ):
             return "invalid_entity_attributes"
     elif isinstance(operation, ContextOperation):
-        if operation.action == "resolve" and targets.get(operation.id) == "$context" and not operation.entity_ids:
+        if operation.action in ("resolve", "suspend", "resume") and targets.get(operation.id) == "$context" and operation.entity_ids == ():
             return None
         if operation.action != "create":
             return "context_resolution_unavailable"
         if not isinstance(operation.entity_ids, tuple) or any(
             not valid_name(entity_id) or targets.get(entity_id) not in contract.entity_types
             for entity_id in operation.entity_ids
-        ):
+        ) or len(set(operation.entity_ids)) != len(operation.entity_ids):
             return "invalid_context_entities"
     elif isinstance(operation, ClaimOperation):
         if operation.source_communication_id not in (None, communication_id):

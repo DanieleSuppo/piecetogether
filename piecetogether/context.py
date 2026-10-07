@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass, replace
 from time import monotonic
 from typing import Any, Protocol
 
+from . import view
 from .contracts import DomainContract, finite_number
 from .history import _candidate_supported, grounding_response, phrase_boundary, source_candidate
 from .proposals import (
@@ -214,7 +215,8 @@ def check_disclosure(proposal: SemanticProposal, pack: ContextPack | None,
                         local.add(successor.target_id)
         for operation in proposal.operations:
             references: tuple[str, ...] = ()
-            if isinstance(operation, (EntityOperation, ContextOperation)) and operation.action == 'resolve':
+            if (isinstance(operation, EntityOperation) and operation.action == 'resolve'
+                    or isinstance(operation, ContextOperation) and operation.action != 'create'):
                 references = (operation.id,)
             elif isinstance(operation, ContextOperation):
                 references = operation.entity_ids
@@ -332,8 +334,11 @@ def assemble(db: sqlite3.Connection, inbound: dict[str, Any], contract_version: 
             mandatory=False, purposes=('disambiguation', 'grounding') if explicit else ())
 
     trusted = [json.loads(row['record']) for row in db.execute(
-        "SELECT record FROM trusted_records WHERE json_extract(record, '$.provenance.actor_id')=? "
+        "SELECT record FROM trusted_records WHERE kind != 'context_transition' "
+        "AND json_extract(record, '$.provenance.actor_id')=? "
         "ORDER BY rowid DESC LIMIT ?", (actor_id, limit))]
+    current_contexts = view.contexts(db)
+    trusted = [current_contexts[record['id']] if record['kind'] == 'context' else record for record in trusted]
     by_id = {record['id']: record for record in trusted}
     for record in trusted:
         summary = encoded(record.get('attributes', record.get('value', record['kind'])))
