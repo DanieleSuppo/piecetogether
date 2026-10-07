@@ -11,6 +11,7 @@ from uuid import uuid4
 from . import view
 from .contracts import DomainContract
 from .proposals import (
+    ArtifactOperation,
     ClaimOperation,
     ContextOperation,
     EmergentConceptOperation,
@@ -76,6 +77,31 @@ def initialize(db: sqlite3.Connection, contract: DomainContract) -> None:
             name TEXT NOT NULL, communication_id TEXT NOT NULL,
             record TEXT NOT NULL, PRIMARY KEY(name, communication_id)
         );
+        CREATE TABLE IF NOT EXISTS artifact_ingress (
+            communication_id TEXT NOT NULL, attachment_id TEXT NOT NULL,
+            actor_id TEXT NOT NULL, media_type TEXT NOT NULL, checksum TEXT NOT NULL,
+            size INTEGER NOT NULL, received_at TEXT NOT NULL,
+            PRIMARY KEY(communication_id, attachment_id)
+        );
+        CREATE TABLE IF NOT EXISTS artifact_stages (
+            communication_id TEXT NOT NULL, attachment_id TEXT NOT NULL,
+            actor_id TEXT NOT NULL, stage_ref TEXT NOT NULL, checksum TEXT NOT NULL,
+            size INTEGER NOT NULL, state TEXT NOT NULL,
+            PRIMARY KEY(communication_id, attachment_id)
+        );
+        CREATE TABLE IF NOT EXISTS trusted_artifacts (
+            id TEXT PRIMARY KEY, communication_id TEXT NOT NULL, attachment_id TEXT NOT NULL,
+            record TEXT NOT NULL, UNIQUE(communication_id, attachment_id)
+        );
+        CREATE TABLE IF NOT EXISTS artifact_publications (
+            artifact_id TEXT PRIMARY KEY REFERENCES trusted_artifacts(id),
+            stage_ref TEXT NOT NULL, checksum TEXT NOT NULL, size INTEGER NOT NULL,
+            state TEXT NOT NULL, storage_ref TEXT
+        );
+        CREATE TABLE IF NOT EXISTS artifact_publication_failures (
+            artifact_id TEXT PRIMARY KEY REFERENCES artifact_publications(artifact_id),
+            record TEXT NOT NULL
+        );
     """)
     db.execute("INSERT INTO semantic_state VALUES (1, 0, ?) "
                "ON CONFLICT(singleton) DO UPDATE SET contract_version=excluded.contract_version",
@@ -92,6 +118,25 @@ def targets(db: sqlite3.Connection) -> dict[str, str]:
 
 def concept_names(db: sqlite3.Connection) -> set[str]:
     return {row['name'] for row in db.execute("SELECT DISTINCT name FROM emergent_concepts")}
+
+
+def artifact_binding(
+    db: sqlite3.Connection, artifact_id: str, communication_id: str, actor_id: str,
+) -> dict[str, Any] | None:
+    """Resolve a Claim Artifact reference to an Actor-owned Artifact or source ingress."""
+    artifact = db.execute("SELECT id FROM trusted_artifacts WHERE id=? "
+                          "AND json_extract(record, '$.provenance.actor_id')=?",
+                          (artifact_id, actor_id)).fetchone()
+    if artifact is not None:
+        return {'artifact_id': artifact['id']}
+    ingress = db.execute("SELECT attachment_id, checksum, size FROM artifact_ingress "
+                         "WHERE communication_id=? AND attachment_id=? AND actor_id=?",
+                         (communication_id, artifact_id, actor_id)).fetchone()
+    if ingress is None:
+        return None
+    return {'artifact_ingress': {'communication_id': communication_id,
+                                 'attachment_id': ingress['attachment_id'],
+                                 'checksum': ingress['checksum'], 'size': ingress['size']}}
 
 
 def remember_concepts(db: sqlite3.Connection, proposal: SemanticProposal, actor_id: str) -> None:
@@ -374,6 +419,22 @@ def check(
     result = validate(proposal, inbound['id'], contract, available, concept_names(db))
     if result.outcome != 'accepted':
         return result
+    for proposal_operation in proposal.operations:
+        if isinstance(proposal_operation, ArtifactOperation) and proposal.intent == 'semantic_commit':
+            ingress = db.execute("SELECT 1 FROM artifact_ingress WHERE communication_id=? AND attachment_id=? "
+                                 "AND actor_id=?", (inbound['id'], proposal_operation.id, inbound['actor_id'])).fetchone()
+            if ingress is None:
+                return ValidationResult('rejected', ('invalid_artifact_provenance',))
+        if isinstance(proposal_operation, ArtifactOperation) and proposal_operation.action == 'persist':
+            staged = db.execute("SELECT * FROM artifact_stages WHERE communication_id=? AND attachment_id=? "
+                                "AND actor_id=? AND state='staged'",
+                                (inbound['id'], proposal_operation.id, inbound['actor_id'])).fetchone()
+            if staged is None:
+                return ValidationResult('rejected', ('artifact_staging_unavailable',))
+        if isinstance(proposal_operation, ClaimOperation) and proposal_operation.artifact_id is not None:
+            if artifact_binding(db, proposal_operation.artifact_id, proposal.communication_id,
+                                inbound['actor_id']) is None:
+                return ValidationResult('rejected', ('invalid_artifact_provenance',))
     state = db.execute("SELECT * FROM semantic_state").fetchone()
     if state['contract_version'] != contract.version:
         return ValidationResult('stale', ('contract_version_changed',))
@@ -401,7 +462,8 @@ def check(
     if proposal.semantic_revision != state['revision']:
         return ValidationResult('stale', ('semantic_revision_changed',))
     resolutions = tuple(op for op in proposal.operations if isinstance(op, GroundingResolutionOperation))
-    if not resolutions:
+    artifacts = tuple(op for op in proposal.operations if isinstance(op, ArtifactOperation))
+    if not resolutions and not artifacts:
         return ValidationResult('rejected', ('ungrounded_trusted_mutation',))
     successor_list = [successor_id for operation in resolutions for successor_id in operation.successor_ids]
     if any(operation.outcome == 'corrected' and len(operation.successor_ids) != 1
@@ -414,8 +476,8 @@ def check(
                        if isinstance(operation, GroundingPlanOperation)
                        for target_id in operation.claim_ids + operation.resolution_ids}
     if any(not isinstance(op, (GroundingResolutionOperation, EntityOperation, ContextOperation,
-                               ClaimOperation, GroundingPlanOperation))
-           for op in proposal.operations) or candidate_ids != successor_ids or successor_ids != successor_plans:
+                               ClaimOperation, GroundingPlanOperation, ArtifactOperation))
+           for op in proposal.operations) or (candidate_ids != successor_ids or successor_ids != successor_plans) and candidate_ids:
         return ValidationResult('rejected', ('ungrounded_trusted_mutation',))
     resolution_ids = [op.item_id for op in resolutions]
     if len(resolution_ids) != len(set(resolution_ids)):
@@ -499,8 +561,11 @@ def normalized_successors(proposal: SemanticProposal, summary: dict[str, Any]) -
 
 
 def has_effect(proposal: SemanticProposal) -> bool:
-    return any(isinstance(operation, GroundingResolutionOperation)
-               and operation.outcome != 'pending' for operation in proposal.operations)
+    return any(
+        isinstance(operation, ArtifactOperation)
+        or isinstance(operation, GroundingResolutionOperation) and operation.outcome != 'pending'
+        for operation in proposal.operations
+    )
 
 
 def commit(
@@ -514,6 +579,8 @@ def commit(
     items: list[dict[str, Any]] = []
     sources: dict[str, SemanticProposal] = {}
     successor_bindings: dict[str, tuple[str, str]] = {}
+    artifact_records: list[dict[str, Any]] = []
+    publications: list[dict[str, Any]] = []
     commit_id = str(uuid4())
     revision = proposal.semantic_revision
     assert revision is not None
@@ -547,6 +614,12 @@ def commit(
                       'exposure_communication_id': row['grounding_id'],
                       'evidence_communication_id': inbound['id'], 'actor_id': inbound['actor_id'],
                       'grounding_id': row['grounding_id'], 'grounding_item_id': operation.item_id}
+        if isinstance(candidate, ClaimOperation) and candidate.artifact_id is not None:
+            artifact_provenance = artifact_binding(
+                db, candidate.artifact_id, row['communication_id'], row['actor_id'])
+            if artifact_provenance is None:
+                return ValidationResult('rejected', ('invalid_artifact_provenance',)), None
+            provenance.update(artifact_provenance)
         if parent:
             provenance['corrected_grounding_item_id'] = parent.item_id
         record = {**asdict(candidate), **metadata, 'id': str(uuid4()),
@@ -565,6 +638,33 @@ def commit(
         if operation.outcome == 'corrected':
             item['successor_candidate_ids'] = list(operation.successor_ids)
         items.append(item)
+
+    for artifact_operation in (op for op in proposal.operations if isinstance(op, ArtifactOperation)):
+        ingress = db.execute("SELECT * FROM artifact_ingress WHERE communication_id=? AND attachment_id=? "
+                             "AND actor_id=?", (inbound['id'], artifact_operation.id, inbound['actor_id'])).fetchone()
+        if ingress is None:
+            return ValidationResult('rejected', ('invalid_artifact_provenance',)), None
+        artifact_id = str(uuid4())
+        provenance = {'source_communication_id': inbound['id'], 'actor_id': inbound['actor_id'],
+                      'attachment_checksum': ingress['checksum'], 'attachment_size': ingress['size']}
+        record = {'id': artifact_id, 'kind': 'artifact', 'attachment_id': artifact_operation.id,
+                  'artifact_type': artifact_operation.artifact_type, 'roles': list(artifact_operation.roles),
+                  'action': artifact_operation.action, 'retention': artifact_operation.retention or contract.artifact_types[artifact_operation.artifact_type]['retention'],
+                  'media_type': ingress['media_type'], **metadata, 'provenance': provenance}
+        artifact_records.append(record)
+        if artifact_operation.action == 'persist':
+            staged = db.execute("SELECT * FROM artifact_stages WHERE communication_id=? AND attachment_id=? "
+                                "AND actor_id=? AND state='staged'", (inbound['id'], artifact_operation.id,
+                                                                        inbound['actor_id'])).fetchone()
+            if staged is None:
+                return ValidationResult('rejected', ('artifact_staging_unavailable',)), None
+            linked = db.execute("UPDATE artifact_stages SET state='linked' WHERE communication_id=? "
+                                "AND attachment_id=? AND state='staged' AND stage_ref=?",
+                                (inbound['id'], artifact_operation.id, staged['stage_ref']))
+            if not linked.rowcount:
+                return ValidationResult('stale', ('artifact_staging_changed',)), None
+            publications.append({'artifact_id': artifact_id, 'stage_ref': staged['stage_ref'],
+                                 'checksum': staged['checksum'], 'size': staged['size']})
 
     mapping = {(row['grounding_id'], row['candidate_id']): row['id'] for row in db.execute(
         "SELECT id, grounding_id, candidate_id FROM trusted_records WHERE kind != 'context_transition'")}
@@ -643,6 +743,12 @@ def commit(
     for record in relationships:
         db.execute("INSERT INTO trusted_relationships VALUES (?, ?)",
                    (record['id'], json.dumps(record)))
+    for record in artifact_records:
+        db.execute("INSERT INTO trusted_artifacts VALUES (?, ?, ?, ?)",
+                   (record['id'], inbound['id'], record['attachment_id'], json.dumps(record)))
+    for publication in publications:
+        db.execute("INSERT INTO artifact_publications VALUES (?, ?, ?, ?, 'pending', NULL)",
+                   (publication['artifact_id'], publication['stage_ref'], publication['checksum'], publication['size']))
     for item in items:
         db.execute("INSERT INTO trusted_grounding_items VALUES (?, ?)",
                    (item['id'], json.dumps(item)))
@@ -652,6 +758,7 @@ def commit(
                                              'source_communication_id': source.communication_id})))
     summary = {'id': commit_id, **metadata, 'communication_id': inbound['id'],
                'record_ids': [record['id'] for record in records.values()],
+               'artifact_ids': [record['id'] for record in artifact_records],
                'grounding_item_ids': [item['id'] for item in items],
                'successor_target_ids': {
                    operation.id: normalized_target
@@ -666,7 +773,7 @@ def commit(
              'timestamp': timestamp, 'entity_ids': [r['id'] for r in records.values() if r['kind'] == 'entity'],
              'context_ids': list(dict.fromkeys(r['context_id'] if r['kind'] == 'context_transition' else r['id']
                                               for r in records.values() if r['kind'] in ('context', 'context_transition'))),
-             'artifact_ids': [], 'assertion_ids': [r['id'] for r in records.values() if r['kind'] == 'claim'],
+             'artifact_ids': summary['artifact_ids'], 'assertion_ids': [r['id'] for r in records.values() if r['kind'] == 'claim'],
              'grounding_item_ids': summary['grounding_item_ids']}
     db.execute("INSERT INTO semantic_outbox VALUES (?, ?)", (event['id'], json.dumps(event)))
     return result, summary
@@ -675,8 +782,17 @@ def commit(
 def inspect_history(db: sqlite3.Connection) -> dict[str, Any]:
     state = db.execute("SELECT revision FROM semantic_state").fetchone()
     records = [json.loads(row['record']) for row in db.execute("SELECT record FROM trusted_records ORDER BY rowid")]
+    artifacts = []
+    for row in db.execute("SELECT a.record, p.state, f.record AS failure FROM trusted_artifacts a "
+                          "LEFT JOIN artifact_publications p ON p.artifact_id=a.id "
+                          "LEFT JOIN artifact_publication_failures f ON f.artifact_id=a.id ORDER BY a.rowid"):
+        artifact = {**json.loads(row['record']), 'availability': row['state'] or 'metadata_only'}
+        if row['failure']:
+            artifact['publication_failure'] = json.loads(row['failure'])
+        artifacts.append(artifact)
     result = {'revision': state['revision'],
               'entities': [r for r in records if r['kind'] == 'entity'],
+              'artifacts': artifacts,
               'contexts': [r for r in records if r['kind'] == 'context'],
               'context_transitions': [r for r in records if r['kind'] == 'context_transition'],
               'claims': [r for r in records if r['kind'] == 'claim']}

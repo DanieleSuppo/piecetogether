@@ -31,6 +31,7 @@ class ClaimOperation:
     value: Any
     grounding_policy: str
     source_communication_id: str | None = None
+    artifact_id: str | None = None
     kind: Literal["claim"] = field(default="claim", init=False)
 
 
@@ -367,6 +368,8 @@ def operation_reason(
     elif isinstance(operation, ClaimOperation):
         if operation.source_communication_id not in (None, communication_id):
             return "invalid_claim_provenance"
+        if operation.artifact_id is not None and not valid_name(operation.artifact_id):
+            return "invalid_artifact_provenance"
         if not valid_name(operation.concept) or (
             operation.concept not in contract.claim_concepts
             and operation.concept not in emergent
@@ -452,8 +455,12 @@ def operation_reason(
         if operation.action == "persist":
             if policy["persistence"] == "forbidden":
                 return "artifact_persistence_not_allowed"
-            # Only ArtifactStore-owned staged bytes can support persistence (#19).
-            return "artifact_staging_unavailable"
+            if not semantic_commit:
+                return "artifact_staging_unavailable"
+            # The attachment ID is bound to Core-owned ingress/staging evidence in history.check.
+            if operation.content_reference is not None or operation.predecessor_id is not None:
+                return "artifact_staging_unavailable"
+            return None
         if operation.action == "supersede":
             return "artifact_predecessor_unavailable" if policy["supersession"] else "artifact_supersession_not_allowed"
         if operation.action == "delete":

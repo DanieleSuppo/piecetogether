@@ -305,6 +305,13 @@ def assemble(db: sqlite3.Connection, inbound: dict[str, Any], contract_version: 
                                      ('structural',) if mandatory else (), purposes, mandatory))
 
     limit = config.catalogue_records + 1
+    # Current attachments are Core-owned ingress metadata, never bytes or provider locations.
+    for row in db.execute("SELECT attachment_id, media_type, size FROM artifact_ingress "
+                          "WHERE communication_id=? AND actor_id=? ORDER BY attachment_id",
+                          (inbound['id'], actor_id)):
+        add('attachment:' + row['attachment_id'], 'artifact',
+            {'attachment_id': row['attachment_id'], 'media_type': row['media_type'], 'size': row['size']},
+            'attachment ' + row['attachment_id'] + ' ' + row['media_type'], mandatory=True)
     # ponytail: every Actor-owned pending item is mandatory; narrow structural scope if long backlogs demand it.
     pending = db.execute(
         "SELECT i.*, g.proposal, g.communication_id FROM pending_items i "
@@ -349,6 +356,14 @@ def assemble(db: sqlite3.Connection, inbound: dict[str, Any], contract_version: 
         add(record['id'], record['kind'], record, summary, mandatory=explicit,
             purposes=('continuity', 'disambiguation') if explicit else ())
     for row in db.execute(
+        "SELECT record FROM trusted_artifacts WHERE json_extract(record, '$.provenance.actor_id')=? "
+        "ORDER BY rowid DESC LIMIT ?", (actor_id, limit),
+    ):
+        record = json.loads(row['record'])
+        add(record['id'], 'artifact', {'id': record['id'], 'artifact_type': record['artifact_type'],
+                                       'roles': record['roles'], 'attachment_id': record['attachment_id']},
+            record['artifact_type'] + ' ' + record['attachment_id'])
+    for row in db.execute(
         "SELECT r.id, r.record FROM reference_assertions r JOIN trusted_records t "
         "ON t.id=json_extract(r.record, '$.target_id') "
         "WHERE json_extract(t.record, '$.provenance.actor_id')=? "
@@ -381,7 +396,9 @@ def assemble(db: sqlite3.Connection, inbound: dict[str, Any], contract_version: 
             for operation in json.loads(row['proposal']).get('operations', []):
                 if operation['kind'] == 'artifact':
                     add('artifact:' + digest(encoded([row['id'], operation['id']])), 'artifact',
-                        {**operation, 'source_communication_id': row['id'], 'status': 'candidate'},
+                        {'id': operation['id'], 'artifact_type': operation['artifact_type'],
+                         'roles': operation['roles'], 'action': operation['action'],
+                         'source_communication_id': row['id'], 'status': 'candidate'},
                         communication['text'] + ' ' + operation['artifact_type'])
     mandatory = [record for record in records if record.mandatory]
     optional = [record for record in records if not record.mandatory]

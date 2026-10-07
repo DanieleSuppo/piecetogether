@@ -80,7 +80,13 @@ def current_view(db: sqlite3.Connection) -> dict[str, Any]:
                                'lineage': [{**claim, 'current': False} for claim in claims
                                            if claim['id'] in noncurrent],
                                'relationships': relations, 'conflicts': conflicts})
+    artifacts = []
+    for row in db.execute("SELECT a.record, p.state FROM trusted_artifacts a LEFT JOIN artifact_publications p ON p.artifact_id=a.id ORDER BY a.rowid"):
+        record = json.loads(row['record'])
+        # Publication is operational: pending bytes are never represented as available trusted content.
+        artifacts.append({**record, 'available': row['state'] == 'available'})
     return {'revision': revision,
             'entities': [record for record in records if record['kind'] == 'entity'],
             'contexts': list(contexts(db).values()),
+            'artifacts': artifacts,
             'assertion_sets': assertion_sets}

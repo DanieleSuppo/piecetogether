@@ -22,7 +22,7 @@ class ViewTests(unittest.TestCase):
         exposed = self.flow.expose()
         core = self.flow.core()
         self.assertEqual(core.current_view(), {
-            'revision': 0, 'entities': [], 'contexts': [], 'assertion_sets': [],
+            'revision': 0, 'entities': [], 'contexts': [], 'artifacts': [], 'assertion_sets': [],
         })
         self.assertTrue(core.inspect(exposed['inbound']['id'])['grounding_items'])
 

@@ -1,18 +1,23 @@
 """Development Core: durable acquisition and authorized semantic history."""
 
+import base64
+import hashlib
 import json
+import math
 import os
+import re
 import sqlite3
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from time import monotonic
-from typing import Any, Protocol
+from typing import Any, ContextManager, Protocol, cast
 from uuid import uuid4
 
 from . import context, history, references, view
+from .artifact_store import LocalArtifactStore, StagedContent
 from .contracts import DeclarativeContractProvider, DomainContractProvider
 from .proposals import (
     CandidateClaim,
@@ -40,6 +45,7 @@ class Bootstrap:
     contract: Path | None = None
     selection: context.SelectionConfig = field(default_factory=context.SelectionConfig)
     reference_state: references.ReferenceConfig | None = None
+    artifact_store: Path | None = None
 
     def __post_init__(self) -> None:
         if self.reference_state is not None and not isinstance(self.reference_state, references.ReferenceConfig):
@@ -48,6 +54,8 @@ class Bootstrap:
             raise ValueError('selection must be a static SelectionConfig')
         if self.contract is not None and not isinstance(self.contract, Path):
             raise ValueError("contract must name a declarative file")
+        if self.artifact_store is not None and not isinstance(self.artifact_store, Path):
+            raise ValueError("artifact_store must name a static local directory")
         if self.channel != "development" or self.model != "deterministic":
             raise ValueError("only static development adapters are available")
         if set(self.capabilities) != {"receive", "reply"}:
@@ -101,6 +109,7 @@ class Bootstrap:
             "contract",
             "selection",
             "reference_state",
+            "artifact_store",
         }
         if not isinstance(data, dict) or set(data) - allowed:
             raise ValueError("invalid bootstrap configuration")
@@ -130,6 +139,10 @@ class Bootstrap:
             if not isinstance(data["contract"], str) or not data["contract"].strip():
                 raise ValueError("contract must name a declarative file")
             data["contract"] = path.parent / data["contract"]
+        if "artifact_store" in data:
+            if not isinstance(data["artifact_store"], str) or not data["artifact_store"].strip():
+                raise ValueError("artifact_store must name a static local directory")
+            data["artifact_store"] = path.parent / data["artifact_store"]
         data["capabilities"] = tuple(data.get("capabilities", ["receive", "reply"]))
         config = cls(database=path.parent / database, **data)
         if any(
@@ -153,6 +166,7 @@ class Communication:
     received_at: str
     thread_id: str | None = None
     reply_to: str | None = None
+    attachments: tuple[dict[str, Any], ...] = ()
 
 
 class ModelProvider(Protocol):
@@ -204,6 +218,36 @@ def connect(database: Path) -> Iterator[sqlite3.Connection]:
         db.close()
 
 
+def _normalize_attachments(value: Any) -> tuple[tuple[dict[str, Any], ...], dict[str, bytes]]:
+    if value is None:
+        return (), {}
+    if not isinstance(value, list) or len(value) > 32:
+        raise ValueError('attachments must be a bounded array')
+    normalized: list[dict[str, Any]] = []
+    content: dict[str, bytes] = {}
+    for attachment in value:
+        if not isinstance(attachment, dict) or set(attachment) - {'id', 'content_base64', 'media_type'}:
+            raise ValueError('invalid attachment')
+        attachment_id = attachment.get('id')
+        encoded = attachment.get('content_base64')
+        media_type = attachment.get('media_type', 'application/octet-stream')
+        if (not isinstance(attachment_id, str) or not attachment_id.strip() or len(attachment_id) > 256
+                or not isinstance(encoded, str) or len(encoded) > 1_398_104
+                or not isinstance(media_type, str) or not media_type.strip() or len(media_type) > 256
+                or attachment_id in content):
+            raise ValueError('invalid attachment')
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+        except (ValueError, UnicodeEncodeError) as error:
+            raise ValueError('invalid attachment content') from error
+        if not raw or len(raw) > 1_048_576:
+            raise ValueError('attachment content exceeds bounds')
+        content[attachment_id] = raw
+        normalized.append({'id': attachment_id, 'media_type': media_type,
+                           'size': len(raw), 'checksum': hashlib.sha256(raw).hexdigest()})
+    return tuple(normalized), content
+
+
 def _snapshot(value: Any) -> tuple[Any, str | None]:
     try:
         return json.loads(json.dumps(value, allow_nan=False)), None
@@ -252,6 +296,7 @@ class Core:
         contract_provider: DomainContractProvider | None = None,
         selector: context.SemanticSelector | None = None,
         reference_provider: references.ReferenceStateProvider | None = None,
+        artifact_store: LocalArtifactStore | None = None,
     ):
         self.config = config
         provider = contract_provider or DeclarativeContractProvider(config.contract)
@@ -264,6 +309,8 @@ class Core:
                                    if config.reference_state is not None else None)
         self.model = model or DeterministicModel()
         self.channel = channel or DevelopmentChannel(config.database)
+        self.artifact_store = artifact_store or (LocalArtifactStore(config.artifact_store)
+                                                 if config.artifact_store is not None else None)
         if config.selection.adapter == 'jev':
             from .jev import JevSelector
             reference = config.secret_references.get(config.selection.secret_reference or '')
@@ -312,6 +359,10 @@ class Core:
                     json.loads(row["trace"]), row["status"],
                 )
             history.initialize(db, self.contract)
+        if self.artifact_store is not None:
+            with self._artifact_maintenance_lock():
+                self._release_abandoned_artifact_cleanup()
+            self.retry_artifact_finalization()
         if self.reference_provider is not None:
             self.refresh_references()
 
@@ -332,43 +383,184 @@ class Core:
             db.execute('BEGIN IMMEDIATE')
             return references.commit(db, assertions, config.provider_id, self.contract, now())
 
+    def _artifact_maintenance_lock(self) -> ContextManager[None]:
+        if self.artifact_store is None:
+            return nullcontext()
+        lock = getattr(self.artifact_store, 'maintenance_lock', None)
+        return cast(ContextManager[None], lock()) if callable(lock) else nullcontext()
+
+    def _release_abandoned_artifact_cleanup(self) -> None:
+        """The caller holds the local maintenance lock; a crash cannot retain it."""
+        with connect(self.config.database) as db:
+            db.execute('BEGIN IMMEDIATE')
+            db.execute("UPDATE artifact_stages SET state='staged' WHERE state='cleaning' "
+                       "AND NOT EXISTS (SELECT 1 FROM artifact_publications "
+                       "WHERE stage_ref=artifact_stages.stage_ref)")
+
+    def _stage_attachments(self, inbound: Communication, content: dict[str, bytes]) -> None:
+        if not content:
+            return
+        if self.artifact_store is None:
+            raise OSError('ArtifactStore is not configured')
+        with self._artifact_maintenance_lock():
+            self._release_abandoned_artifact_cleanup()
+            for attachment in inbound.attachments:
+                attachment_id = attachment['id']
+                staged = self.artifact_store.stage(content[attachment_id],
+                                                   f'{inbound.id}:{attachment_id}')
+                if (not isinstance(staged.reference, str) or not re.fullmatch(r'[0-9a-f]{32}', staged.reference)
+                        or staged.checksum != attachment['checksum'] or staged.size != attachment['size']):
+                    raise OSError('ArtifactStore returned invalid staged evidence')
+                with connect(self.config.database) as db:
+                    db.execute('BEGIN IMMEDIATE')
+                    db.execute("INSERT INTO artifact_stages VALUES (?, ?, ?, ?, ?, ?, 'staged') "
+                               "ON CONFLICT(communication_id, attachment_id) DO NOTHING",
+                               (inbound.id, attachment_id, inbound.actor_id, staged.reference,
+                                staged.checksum, staged.size))
+                    row = db.execute('SELECT * FROM artifact_stages WHERE communication_id=? AND attachment_id=?',
+                                     (inbound.id, attachment_id)).fetchone()
+                    if row is None or tuple(row[name] for name in ('actor_id', 'stage_ref', 'checksum', 'size')) != (
+                        inbound.actor_id, staged.reference, staged.checksum, staged.size):
+                        raise ValueError('conflicting staged artifact evidence')
+                    if row['state'] == 'deleted':
+                        db.execute("UPDATE artifact_stages SET state='staged' WHERE communication_id=? "
+                                   "AND attachment_id=? AND state='deleted'", (inbound.id, attachment_id))
+                    elif row['state'] == 'cleaning':
+                        raise OSError('artifact staging cleanup is in progress')
+
+    def retry_artifact_finalization(self) -> dict[str, str]:
+        """Finalize each linked Artifact independently; failures remain pending and inspectable."""
+        if self.artifact_store is None:
+            return {}
+        with connect(self.config.database) as db:
+            pending = db.execute("SELECT * FROM artifact_publications WHERE state='pending' ORDER BY rowid").fetchall()
+        outcomes: dict[str, str] = {}
+        for publication in pending:
+            try:
+                finalized = self.artifact_store.finalize(
+                    StagedContent(publication['stage_ref'], publication['checksum'], publication['size']))
+                if (not isinstance(finalized.reference, str) or finalized.reference != publication['stage_ref']
+                        or not isinstance(finalized.checksum, str) or finalized.checksum != publication['checksum']):
+                    raise OSError('ArtifactStore returned invalid finalization evidence')
+                with connect(self.config.database) as db:
+                    db.execute('BEGIN IMMEDIATE')
+                    updated = db.execute("UPDATE artifact_publications SET state='available', storage_ref=? "
+                                        "WHERE artifact_id=? AND state='pending' AND stage_ref=? AND checksum=?",
+                                        (finalized.reference, publication['artifact_id'], publication['stage_ref'],
+                                         publication['checksum']))
+                    if updated.rowcount:
+                        db.execute('DELETE FROM artifact_publication_failures WHERE artifact_id=?',
+                                   (publication['artifact_id'],))
+                outcomes[publication['artifact_id']] = 'available'
+            except (OSError, ValueError, TypeError, AttributeError) as error:
+                with connect(self.config.database) as db:
+                    db.execute('BEGIN IMMEDIATE')
+                    prior = db.execute('SELECT record FROM artifact_publication_failures WHERE artifact_id=?',
+                                       (publication['artifact_id'],)).fetchone()
+                    attempts = json.loads(prior['record'])['attempts'] + 1 if prior else 1
+                    record = {'artifact_id': publication['artifact_id'], 'attempts': attempts,
+                              'error_type': type(error).__name__, 'message': str(error)[:256], 'at': now()}
+                    db.execute("INSERT INTO artifact_publication_failures VALUES (?, ?) "
+                               "ON CONFLICT(artifact_id) DO UPDATE SET record=excluded.record",
+                               (publication['artifact_id'], json.dumps(record)))
+                outcomes[publication['artifact_id']] = 'pending'
+        return outcomes
+
+    def cleanup_artifact_staging(self, minimum_age_seconds: float = 3600) -> list[str]:
+        """Sweep old unlinked stages; abandoned reservations are released before each run."""
+        if self.artifact_store is None:
+            return []
+        if (type(minimum_age_seconds) not in (int, float)
+                or not math.isfinite(minimum_age_seconds) or minimum_age_seconds < 0):
+            raise ValueError('minimum_age_seconds must be a finite nonnegative number')
+        with self._artifact_maintenance_lock():
+            # A process crash releases the local lock but leaves this marker. No publication
+            # can have been linked from a cleaning state, so it is safe to retry maintenance.
+            self._release_abandoned_artifact_cleanup()
+            with connect(self.config.database) as db:
+                registered = {row['stage_ref'] for row in db.execute("SELECT stage_ref FROM artifact_stages")}
+                candidates = [row['stage_ref'] for row in db.execute(
+                    "SELECT stage_ref FROM artifact_stages WHERE state='staged' ORDER BY rowid")]
+            sweep = getattr(self.artifact_store, 'cleanup', None)
+            removed = sweep(registered, minimum_age_seconds) if callable(sweep) else []
+            for reference in candidates:
+                with connect(self.config.database) as db:
+                    db.execute('BEGIN IMMEDIATE')
+                    reserved = db.execute("UPDATE artifact_stages SET state='cleaning' WHERE stage_ref=? "
+                                          "AND state='staged' AND NOT EXISTS (SELECT 1 FROM artifact_publications "
+                                          "WHERE stage_ref=artifact_stages.stage_ref)", (reference,))
+                if not reserved.rowcount:
+                    continue
+                outcome = None
+                try:
+                    outcome = self.artifact_store.remove_staged(reference, minimum_age_seconds)
+                except OSError:
+                    # Return the reservation to normal staging so a future cleanup or redelivery can recover.
+                    outcome = None
+                finally:
+                    with connect(self.config.database) as db:
+                        db.execute('BEGIN IMMEDIATE')
+                        db.execute("UPDATE artifact_stages SET state=? WHERE stage_ref=? AND state='cleaning'",
+                                   ('deleted' if outcome is not None else 'staged', reference))
+                if outcome:
+                    removed.append(reference)
+        return removed
+
+    def artifact_bytes(self, artifact_id: str) -> bytes:
+        """Core-only accessor for finalized local bytes; sender acquisition has no byte URL."""
+        if self.artifact_store is None:
+            raise KeyError(artifact_id)
+        with connect(self.config.database) as db:
+            row = db.execute("SELECT storage_ref, checksum FROM artifact_publications "
+                             "WHERE artifact_id=? AND state='available'", (artifact_id,)).fetchone()
+        if row is None:
+            raise KeyError(artifact_id)
+        content = self.artifact_store.read(row['storage_ref'])
+        if hashlib.sha256(content).hexdigest() != row['checksum']:
+            raise OSError('artifact content checksum mismatch')
+        return content
+
     def accept(self, payload: Any) -> dict[str, Any]:
         required = {"channel", "sender", "idempotency_key", "text", "sent_at"}
-        optional = {"thread_id", "reply_to"}
+        optional = {"thread_id", "reply_to", "attachments"}
         if (
             not isinstance(payload, dict)
             or not required <= payload.keys()
             or set(payload) - required - optional
         ):
-            raise ValueError("expected a normalized text Communication")
+            raise ValueError("expected a normalized Communication")
+        attachments, attachment_content = _normalize_attachments(payload.get('attachments'))
+        normalized_payload = {name: payload[name] for name in required | {"thread_id", "reply_to"}
+                              if name in payload}
+        normalized_payload['attachments'] = attachments
         if any(
-            not isinstance(payload[name], str)
-            or not payload[name].strip()
-            or len(payload[name]) > (32768 if name == "text" else 256)
+            not isinstance(normalized_payload[name], str)
+            or not normalized_payload[name].strip()
+            or len(normalized_payload[name]) > (32768 if name == "text" else 256)
             for name in required
         ):
             raise ValueError("Communication fields must be bounded nonempty strings")
         if any(
-            payload.get(name) is not None
+            normalized_payload.get(name) is not None
             and (
-                not isinstance(payload[name], str)
-                or not payload[name].strip()
-                or len(payload[name]) > 256
+                not isinstance(normalized_payload[name], str)
+                or not normalized_payload[name].strip()
+                or len(normalized_payload[name]) > 256
             )
-            for name in optional
+            for name in ("thread_id", "reply_to")
         ):
             raise ValueError("thread and reply references must be bounded strings")
         try:
             timestamp = datetime.fromisoformat(
-                payload["sent_at"].replace("Z", "+00:00")
+                normalized_payload["sent_at"].replace("Z", "+00:00")
             )
         except ValueError:
             raise ValueError("sent_at must be an ISO-8601 timestamp") from None
         if timestamp.tzinfo is None:
             raise ValueError("sent_at must include a timezone")
-        if payload["channel"] != self.config.channel:
+        if normalized_payload["channel"] != self.config.channel:
             raise ValueError("channel is disabled")
-        actor = self.config.identities.get(f"{payload['channel']}:{payload['sender']}")
+        actor = self.config.identities.get(f"{normalized_payload['channel']}:{normalized_payload['sender']}")
         if actor is None:
             raise ValueError("unmapped channel identity")
         inbound = Communication(
@@ -376,7 +568,7 @@ class Core:
             actor_id=actor,
             direction="inbound",
             received_at=now(),
-            **payload,
+            **normalized_payload,
         )
         # Ingress commits before calling the model or handing off a reply.
         with connect(self.config.database) as db:
@@ -401,7 +593,7 @@ class Core:
             prior_commit = history.committed(db, row['id'])
         assert row is not None
         stored = json.loads(row["inbound"])
-        incoming = asdict(inbound)
+        incoming = json.loads(json.dumps(asdict(inbound)))
         if any(
             stored[name] != incoming[name]
             for name in incoming
@@ -411,6 +603,12 @@ class Core:
                 "idempotency key already belongs to a different Communication"
             )
         inbound = Communication(**stored)
+        if attachments:
+            with connect(self.config.database) as db:
+                for attachment in attachments:
+                    db.execute("INSERT OR IGNORE INTO artifact_ingress VALUES (?, ?, ?, ?, ?, ?, ?)",
+                               (inbound.id, attachment['id'], inbound.actor_id, attachment['media_type'],
+                                attachment['checksum'], attachment['size'], now()))
         if row["status"] == "completed":
             return {
                 "communication_id": inbound.id,
@@ -461,7 +659,12 @@ class Core:
         pack: context.ContextPack | None = None
         requests: tuple[ContextRequestOperation, ...] = ()
         preliminary = ValidationResult('accepted')
+        publication_pending = False
         try:
+            if inbound.attachments:
+                stage = 'artifact_stage'
+                self._stage_attachments(inbound, attachment_content)
+                stage = 'model'
             if outbound is None:
                 with connect(self.config.database) as db:
                     db.execute('BEGIN')
@@ -617,9 +820,23 @@ class Core:
                 )
                 _record_attempt(db, inbound.id, captured, encoded_outbound, trace, status)
             saved_outbound = encoded_outbound
+            with connect(self.config.database) as finalization_db:
+                committed_artifacts = (history.committed(finalization_db, inbound.id) or {}).get('artifact_ids', [])
+            if committed_artifacts:
+                stage = 'artifact_finalize'
+                self.retry_artifact_finalization()
+                with connect(self.config.database) as finalization_db:
+                    remaining = [artifact_id for artifact_id in committed_artifacts if finalization_db.execute(
+                        "SELECT 1 FROM artifact_publications WHERE artifact_id=? AND state='pending'", (artifact_id,)
+                    ).fetchone()]
+                if remaining:
+                    publication_pending = True
+                    status = 'retryable'
+                    trace.update(failure_stage='artifact_finalize', error_type='ArtifactPublicationPending',
+                                 artifact_publication_ids=remaining, delivery_result='not_attempted')
             if outbound is None:
                 return {"communication_id": inbound.id, "reply": None, "status": status}
-            if outbound is not None:
+            if outbound is not None and not publication_pending:
                 stage = "channel"
                 accepted = self.channel.deliver(outbound) is True
                 trace["delivery_result"] = "accepted" if accepted else "retryable"
