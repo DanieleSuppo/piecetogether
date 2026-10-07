@@ -349,6 +349,18 @@ def assemble(db: sqlite3.Connection, inbound: dict[str, Any], contract_version: 
         add(record['id'], record['kind'], record, summary, mandatory=explicit,
             purposes=('continuity', 'disambiguation') if explicit else ())
     for row in db.execute(
+        "SELECT r.id, r.record FROM reference_assertions r JOIN trusted_records t "
+        "ON t.id=json_extract(r.record, '$.target_id') "
+        "WHERE json_extract(t.record, '$.provenance.actor_id')=? "
+        "AND NOT EXISTS (SELECT 1 FROM reference_assertions successor "
+        "WHERE json_extract(successor.record, '$.supersedes_id')=r.id) "
+        "ORDER BY r.rowid DESC LIMIT ?", (actor_id, limit),
+    ):
+        record = json.loads(row['record'])
+        # Provider trust grants internal reference use, not sender-facing disclosure.
+        add(record['id'], 'reference_assertion', record,
+            record['concept'] + ' ' + encoded(record['value']), mandatory=record['id'] in inbound['text'])
+    for row in db.execute(
         "SELECT record FROM emergent_concepts WHERE json_extract(record, '$.provenance.actor_id')=? "
         "ORDER BY rowid DESC LIMIT ?", (actor_id, limit),
     ):

@@ -28,13 +28,22 @@ def current_view(db: sqlite3.Connection) -> dict[str, Any]:
     revision = db.execute('SELECT revision FROM semantic_state').fetchone()['revision']
     records = [json.loads(row['record']) for row in db.execute(
         'SELECT record FROM trusted_records ORDER BY rowid')]
+    records.extend(json.loads(row['record']) for row in db.execute(
+        'SELECT record FROM reference_assertions ORDER BY rowid'))
     relationships = [json.loads(row['record']) for row in db.execute(
         'SELECT record FROM trusted_relationships ORDER BY rowid')]
+    relationships.extend({
+        'id': record['id'] + ':supersedes', 'kind': 'relationship',
+        'relationship_type': 'supersedes', 'source_id': record['id'],
+        'target_id': record['supersedes_id'],
+        **{key: record[key] for key in ('semantic_commit_id', 'semantic_revision',
+                                      'contract_version', 'committed_at', 'provenance')},
+    } for record in records if record['kind'] == 'reference_assertion' and record.get('supersedes_id'))
     noncurrent = {relation['target_id'] for relation in relationships
                   if relation['relationship_type'] in REPLACEMENT_RELATIONS}
     groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for record in records:
-        if record['kind'] == 'claim':
+        if record['kind'] in ('claim', 'reference_assertion'):
             groups.setdefault((record['target_id'], record['concept']), []).append(record)
     assertion_sets = []
     # ponytail: derive from the ledger on read; materialize/index when ledger size demands it.

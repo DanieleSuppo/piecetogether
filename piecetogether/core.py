@@ -12,7 +12,7 @@ from time import monotonic
 from typing import Any, Protocol
 from uuid import uuid4
 
-from . import context, history, view
+from . import context, history, references, view
 from .contracts import DeclarativeContractProvider, DomainContractProvider
 from .proposals import (
     CandidateClaim,
@@ -39,8 +39,11 @@ class Bootstrap:
     secret_references: dict[str, str] = field(default_factory=dict)
     contract: Path | None = None
     selection: context.SelectionConfig = field(default_factory=context.SelectionConfig)
+    reference_state: references.ReferenceConfig | None = None
 
     def __post_init__(self) -> None:
+        if self.reference_state is not None and not isinstance(self.reference_state, references.ReferenceConfig):
+            raise ValueError('reference_state must be a static ReferenceConfig')
         if not isinstance(self.selection, context.SelectionConfig):
             raise ValueError('selection must be a static SelectionConfig')
         if self.contract is not None and not isinstance(self.contract, Path):
@@ -97,6 +100,7 @@ class Bootstrap:
             "secret_references",
             "contract",
             "selection",
+            "reference_state",
         }
         if not isinstance(data, dict) or set(data) - allowed:
             raise ValueError("invalid bootstrap configuration")
@@ -107,6 +111,14 @@ class Bootstrap:
         ):
             raise ValueError("capabilities must be a string array")
         database = Path(data.pop("database"))
+        if 'reference_state' in data:
+            reference = data['reference_state']
+            if (not isinstance(reference, dict) or set(reference) - {'provider_id', 'path'}
+                    or not isinstance(reference.get('provider_id'), str)
+                    or not isinstance(reference.get('path'), str) or not reference['path'].strip()):
+                raise ValueError('reference_state requires a static provider_id and file path')
+            data['reference_state'] = references.ReferenceConfig(
+                reference['provider_id'], path.parent / reference['path'])
         if 'selection' in data:
             if not isinstance(data['selection'], dict):
                 raise ValueError('selection must be an object')
@@ -239,12 +251,17 @@ class Core:
         channel: ChannelPlugin | None = None,
         contract_provider: DomainContractProvider | None = None,
         selector: context.SemanticSelector | None = None,
+        reference_provider: references.ReferenceStateProvider | None = None,
     ):
         self.config = config
         provider = contract_provider or DeclarativeContractProvider(config.contract)
         self.contract = provider.get(config.contract_version)
         if self.contract.version != config.contract_version:
             raise ValueError("provider returned a different Contract version")
+        if reference_provider is not None and config.reference_state is None:
+            raise ValueError('Reference State Provider must be explicitly configured')
+        self.reference_provider = (reference_provider or references.FileReferenceStateProvider(config.reference_state)
+                                   if config.reference_state is not None else None)
         self.model = model or DeterministicModel()
         self.channel = channel or DevelopmentChannel(config.database)
         if config.selection.adapter == 'jev':
@@ -295,6 +312,25 @@ class Core:
                     json.loads(row["trace"]), row["status"],
                 )
             history.initialize(db, self.contract)
+        if self.reference_provider is not None:
+            self.refresh_references()
+
+    def refresh_references(self) -> dict[str, Any]:
+        """Read the configured provider outside locks, then atomically append its assertions."""
+        provider = self.reference_provider
+        config = self.config.reference_state
+        if provider is None or config is None or provider.provider_id != config.provider_id:
+            raise ValueError('Reference State Provider is unavailable or has a different identity')
+        assertions = provider.get()
+        if (not isinstance(assertions, tuple) or len(assertions) > 256
+                or any(not isinstance(assertion, references.ReferenceAssertion) for assertion in assertions)):
+            raise ValueError('invalid Reference State Provider output')
+        # Detach provider-owned mutable values before validation or acquiring the writer lock.
+        assertions = tuple(references.ReferenceAssertion(**json.loads(json.dumps(asdict(assertion), allow_nan=False)))
+                           for assertion in assertions)
+        with connect(self.config.database) as db:
+            db.execute('BEGIN IMMEDIATE')
+            return references.commit(db, assertions, config.provider_id, self.contract, now())
 
     def accept(self, payload: Any) -> dict[str, Any]:
         required = {"channel", "sender", "idempotency_key", "text", "sent_at"}

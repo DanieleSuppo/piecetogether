@@ -39,6 +39,12 @@ def initialize(db: sqlite3.Connection, contract: DomainContract) -> None:
             grounding_id TEXT NOT NULL, candidate_id TEXT NOT NULL,
             UNIQUE(grounding_id, candidate_id)
         );
+        CREATE TABLE IF NOT EXISTS reference_assertions (
+            id TEXT PRIMARY KEY, record TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS reference_commits (
+            id TEXT PRIMARY KEY, record TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS trusted_relationships (
             id TEXT PRIMARY KEY, record TEXT NOT NULL
         );
@@ -674,7 +680,8 @@ def inspect_history(db: sqlite3.Connection) -> dict[str, Any]:
               'contexts': [r for r in records if r['kind'] == 'context'],
               'context_transitions': [r for r in records if r['kind'] == 'context_transition'],
               'claims': [r for r in records if r['kind'] == 'claim']}
-    for name, table in (('commits', 'semantic_commits'), ('relationships', 'trusted_relationships'),
+    for name, table in (('reference_assertions', 'reference_assertions'), ('reference_commits', 'reference_commits'),
+                        ('commits', 'semantic_commits'), ('relationships', 'trusted_relationships'),
                         ('groundings', 'trusted_groundings'), ('grounding_items', 'trusted_grounding_items'),
                         ('events', 'semantic_outbox')):
         result[name] = [json.loads(row['record']) for row in db.execute(f"SELECT record FROM {table} ORDER BY rowid")]

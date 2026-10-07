@@ -831,16 +831,40 @@ This local consumer/verification seam derives a consistent snapshot from immutab
 
 Each `assertion_sets` entry identifies a semantic key (`target_id`, `concept`) and contains:
 
-- `heads`: all current Grounded Claims, preserving original IDs, values, Contract/commit metadata and provenance, plus `current: true` and transitive `lineage_ids` (including the head itself).
+- `heads`: all current Grounded Claims and Authoritative Reference Assertions, preserving original IDs, values, Contract/commit metadata and distinct provenance, plus `current: true` and transitive `lineage_ids` (including the head itself).
 - `lineage`: non-current assertions with full evidence and `current: false`; correction/supersession changes currentness, never historical records.
 - `relationships`: committed relationships between assertions on that key.
 - `conflicts`: pairs of competing current assertion IDs with explicit contradiction relationship IDs where present. Different values or an explicit `contradicts` relation produce a conflict; equal independent assertions remain separate heads. No scalar winner is selected.
 
-Authoritative Reference Assertion ingestion and grounded-versus-authoritative coexistence belong to #21, not this grounded-only slice. The projection is calculated on read with Python/SQLite; materialization and semantic-key indexes can be added when ledger size warrants them.
+Grounded and authoritative lineages coexist on the same semantic key. Reference updates retire only their own provider/source lineage; they never supersede a Grounded Claim. The projection is calculated on read with Python/SQLite; materialization and semantic-key indexes can be added when ledger size warrants them.
 
 Context creation may relate one stable Context to multiple accepted Entities. New Contexts are active. Grounded suspend/resume operations append immutable `context_transition` records with their own Contract, commit and source/exposure/evidence provenance; creation identity and membership remain unchanged. The projected Context carries `status` (`active` or `suspended`) and ordered `lifecycle` evidence. `inspect_history()` exposes those transitions separately as `context_transitions`. Context Packs include the current lifecycle, not merely the original creation record.
 
 A transition cannot rewrite members, target an unknown/non-Context object, suspend an already suspended Context or resume an active one. The committer rechecks lifecycle and revision atomically with Grounding outcomes and the outbox; changed lifecycle requires reprocessing and storage failure rolls back the transition. Events name the stable affected Context ID. Retries and restarts preserve one transition per accepted Grounding Item. Thread/session metadata neither owns nor resets lifecycle; delayed acceptance uses the existing Actor-bound evidence rules without requiring a transport reply.
+
+## Authoritative Reference Assertions
+
+Optional bootstrap configuration explicitly trusts one static first-party file Reference State Provider:
+
+```json
+{"reference_state":{"provider_id":"application","path":"reference.json"}}
+```
+
+The path resolves relative to the bootstrap file. Omit `reference_state` to keep reference input disabled. Runtime Communications and ModelProviders cannot configure providers or create authoritative assertions. The provider file contains a JSON array, for example:
+
+```json
+[{"target_id":"<trusted Entity or Context ID>","concept":"count","value":4,"source_reference":"records/subject-1","observed_version":"v1","observed_at":"2026-10-07T10:00:00Z"}]
+```
+
+Assertions target existing trusted Entities or Contexts and satisfy the active Contract's canonical concept, target and value constraints. Each requires a nonempty source reference and an observed version, timezone-aware observation time, or both. Unknown fields, duplicate JSON keys, invalid values or missing provenance reject the complete batch. File input is limited to 1 MiB, 256 assertions and 64 KiB per value. Provider identity comes from static configuration, never from an assertion or model output.
+
+The Core reads the provider at startup. Local deployment/operator code can call `core.refresh_references()` to reread it; provider I/O runs outside the short atomic writer transaction. Deterministic adapters may instead inject a `ReferenceStateProvider` with matching `provider_id` and `get() -> tuple[ReferenceAssertion, ...]`, using a static `ReferenceConfig(provider_id)` on the Bootstrap. This is not a runtime sender or application-ingestion API.
+
+Each new observation appends an immutable `reference_assertion` with `provenance_class: authoritative`, provider/source/observation provenance, Contract version and semantic commit metadata. `inspect_history()` exposes these records and `reference_commits` separately from Grounded Claims and Groundings. Repeated source versions (or time-only observations) are idempotent, including after restart; reusing an observation with a different value is rejected. New observations supersede only the same provider/source/target/concept lineage. Previously seen observations never restore retired heads; older or equal supplied times cannot replace a newer head. Opaque versions without times are ordered by successful ingestion, not guessed version semantics. Missing entries do not retract historical reference assertions.
+
+The reference batch, revision and a distinct `reference_committed` outbox event commit together or roll back together. The event identifies affected targets/assertions and carries no Grounding Items. Changed reference state fences stale model work using the existing semantic revision. No reference observation creates a Grounded Claim or implies sender acceptance.
+
+`current_view()` preserves both provenance classes, authoritative lineage and explicit grounded-versus-authoritative conflicts. Agreement keeps distinct heads without inventing a conflict; disagreement never selects a scalar winner. Actor-scoped Context Packs may include current references for internal selection, but provider authority alone grants no sender disclosure eligibility; the generative model receives their identities/revisions with reference values withheld.
 
 ## Bounded Context Packs and semantic decision adapters
 
