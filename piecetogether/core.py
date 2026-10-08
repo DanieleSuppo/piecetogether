@@ -362,6 +362,7 @@ class Core:
         if self.artifact_store is not None:
             with self._artifact_maintenance_lock():
                 self._release_abandoned_artifact_cleanup()
+            self.retry_artifact_deletion()
             self.retry_artifact_finalization()
         if self.reference_provider is not None:
             self.refresh_references()
@@ -404,6 +405,9 @@ class Core:
             raise OSError('ArtifactStore is not configured')
         with self._artifact_maintenance_lock():
             self._release_abandoned_artifact_cleanup()
+            with connect(self.config.database) as db:
+                if history.committed(db, inbound.id):
+                    return
             for attachment in inbound.attachments:
                 attachment_id = attachment['id']
                 staged = self.artifact_store.stage(content[attachment_id],
@@ -428,8 +432,34 @@ class Core:
                     elif row['state'] == 'cleaning':
                         raise OSError('artifact staging cleanup is in progress')
 
+    def retry_artifact_deletion(self) -> dict[str, str]:
+        """Recover committed byte deletion outside semantic transactions."""
+        if self.artifact_store is None:
+            return {}
+        outcomes = {}
+        with self._artifact_maintenance_lock():
+            with connect(self.config.database) as db:
+                pending = db.execute('SELECT * FROM artifact_deletions ORDER BY rowid').fetchall()
+            for job in pending:
+                try:
+                    self.artifact_store.remove(job['reference'])
+                    with connect(self.config.database) as db:
+                        db.execute('DELETE FROM artifact_deletions WHERE artifact_id=?', (job['artifact_id'],))
+                    outcomes[job['artifact_id']] = 'deleted'
+                except (OSError, ValueError, TypeError, AttributeError) as error:
+                    with connect(self.config.database) as db:
+                        failure = {'error_type': type(error).__name__, 'message': str(error)[:256], 'at': now()}
+                        db.execute('UPDATE artifact_deletions SET failure=? WHERE artifact_id=?',
+                                   (json.dumps(failure), job['artifact_id']))
+                    outcomes[job['artifact_id']] = 'pending'
+        return outcomes
+
     def retry_artifact_finalization(self) -> dict[str, str]:
-        """Finalize each linked Artifact independently; failures remain pending and inspectable."""
+        """Serialize publication with local byte removal; never resurrect deleted content."""
+        with self._artifact_maintenance_lock():
+            return self._finalize_artifacts()
+
+    def _finalize_artifacts(self) -> dict[str, str]:
         if self.artifact_store is None:
             return {}
         with connect(self.config.database) as db:
@@ -451,10 +481,14 @@ class Core:
                     if updated.rowcount:
                         db.execute('DELETE FROM artifact_publication_failures WHERE artifact_id=?',
                                    (publication['artifact_id'],))
-                outcomes[publication['artifact_id']] = 'available'
+                outcomes[publication['artifact_id']] = 'available' if updated.rowcount else 'deleted'
             except (OSError, ValueError, TypeError, AttributeError) as error:
                 with connect(self.config.database) as db:
                     db.execute('BEGIN IMMEDIATE')
+                    if not db.execute("SELECT 1 FROM artifact_publications WHERE artifact_id=? AND state='pending'",
+                                      (publication['artifact_id'],)).fetchone():
+                        outcomes[publication['artifact_id']] = 'deleted'
+                        continue
                     prior = db.execute('SELECT record FROM artifact_publication_failures WHERE artifact_id=?',
                                        (publication['artifact_id'],)).fetchone()
                     attempts = json.loads(prior['record'])['attempts'] + 1 if prior else 1
@@ -510,15 +544,20 @@ class Core:
         """Core-only accessor for finalized local bytes; sender acquisition has no byte URL."""
         if self.artifact_store is None:
             raise KeyError(artifact_id)
-        with connect(self.config.database) as db:
-            row = db.execute("SELECT storage_ref, checksum FROM artifact_publications "
-                             "WHERE artifact_id=? AND state='available'", (artifact_id,)).fetchone()
-        if row is None:
-            raise KeyError(artifact_id)
-        content = self.artifact_store.read(row['storage_ref'])
-        if hashlib.sha256(content).hexdigest() != row['checksum']:
-            raise OSError('artifact content checksum mismatch')
-        return content
+        with self._artifact_maintenance_lock():
+            with connect(self.config.database) as db:
+                row = db.execute("SELECT storage_ref, checksum FROM artifact_publications "
+                                 "WHERE artifact_id=? AND state='available'", (artifact_id,)).fetchone()
+            if row is None:
+                raise KeyError(artifact_id)
+            content = self.artifact_store.read(row['storage_ref'])
+            if hashlib.sha256(content).hexdigest() != row['checksum']:
+                raise OSError('artifact content checksum mismatch')
+            with connect(self.config.database) as db:
+                if not db.execute("SELECT 1 FROM artifact_publications WHERE artifact_id=? AND state='available'",
+                                  (artifact_id,)).fetchone():
+                    raise KeyError(artifact_id)
+            return content
 
     def accept(self, payload: Any) -> dict[str, Any]:
         required = {"channel", "sender", "idempotency_key", "text", "sent_at"}
@@ -603,7 +642,7 @@ class Core:
                 "idempotency key already belongs to a different Communication"
             )
         inbound = Communication(**stored)
-        if attachments:
+        if attachments and not prior_commit:
             with connect(self.config.database) as db:
                 for attachment in attachments:
                     db.execute("INSERT OR IGNORE INTO artifact_ingress VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -661,7 +700,7 @@ class Core:
         preliminary = ValidationResult('accepted')
         publication_pending = False
         try:
-            if inbound.attachments:
+            if inbound.attachments and not prior_commit:
                 stage = 'artifact_stage'
                 self._stage_attachments(inbound, attachment_content)
                 stage = 'model'
@@ -824,16 +863,23 @@ class Core:
                 committed_artifacts = (history.committed(finalization_db, inbound.id) or {}).get('artifact_ids', [])
             if committed_artifacts:
                 stage = 'artifact_finalize'
+                self.retry_artifact_deletion()
                 self.retry_artifact_finalization()
                 with connect(self.config.database) as finalization_db:
+                    deletion_pending = [artifact_id for artifact_id in committed_artifacts if finalization_db.execute(
+                        'SELECT 1 FROM artifact_deletions WHERE artifact_id=?', (artifact_id,)
+                    ).fetchone()]
                     remaining = [artifact_id for artifact_id in committed_artifacts if finalization_db.execute(
-                        "SELECT 1 FROM artifact_publications WHERE artifact_id=? AND state='pending'", (artifact_id,)
+                        "SELECT 1 FROM artifact_publications WHERE artifact_id=? AND state='pending' "
+                        "UNION ALL SELECT 1 FROM artifact_deletions WHERE artifact_id=?", (artifact_id, artifact_id)
                     ).fetchone()]
                 if remaining:
                     publication_pending = True
                     status = 'retryable'
-                    trace.update(failure_stage='artifact_finalize', error_type='ArtifactPublicationPending',
-                                 artifact_publication_ids=remaining, delivery_result='not_attempted')
+                    trace.update(failure_stage='artifact_delete' if deletion_pending else 'artifact_finalize',
+                                 error_type='ArtifactDeletionPending' if deletion_pending else 'ArtifactPublicationPending',
+                                 artifact_publication_ids=[artifact_id for artifact_id in remaining if artifact_id not in deletion_pending],
+                                 artifact_deletion_ids=deletion_pending, delivery_result='not_attempted')
             if outbound is None:
                 return {"communication_id": inbound.id, "reply": None, "status": status}
             if outbound is not None and not publication_pending:

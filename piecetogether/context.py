@@ -355,13 +355,13 @@ def assemble(db: sqlite3.Connection, inbound: dict[str, Any], contract_version: 
         explicit = record['id'] in inbound['text']
         add(record['id'], record['kind'], record, summary, mandatory=explicit,
             purposes=('continuity', 'disambiguation') if explicit else ())
-    for row in db.execute(
-        "SELECT record FROM trusted_artifacts WHERE json_extract(record, '$.provenance.actor_id')=? "
-        "ORDER BY rowid DESC LIMIT ?", (actor_id, limit),
-    ):
-        record = json.loads(row['record'])
+    artifact_records = [record for record in view.artifacts(db)
+                        if record.get('provenance', {}).get('actor_id') == actor_id
+                        and 'artifact_type' in record]
+    for record in reversed(artifact_records[-limit:]):
         add(record['id'], 'artifact', {'id': record['id'], 'artifact_type': record['artifact_type'],
-                                       'roles': record['roles'], 'attachment_id': record['attachment_id']},
+                                       'roles': record['roles'], 'attachment_id': record['attachment_id'],
+                                       'availability': record['availability']},
             record['artifact_type'] + ' ' + record['attachment_id'])
     for row in db.execute(
         "SELECT r.id, r.record FROM reference_assertions r JOIN trusted_records t "
@@ -394,7 +394,7 @@ def assemble(db: sqlite3.Connection, inbound: dict[str, Any], contract_version: 
             ('continuity',) if structural else ())
         if row['proposal']:
             for operation in json.loads(row['proposal']).get('operations', []):
-                if operation['kind'] == 'artifact':
+                if operation['kind'] == 'artifact' and json.loads(row['proposal']).get('intent') != 'semantic_commit':
                     add('artifact:' + digest(encoded([row['id'], operation['id']])), 'artifact',
                         {'id': operation['id'], 'artifact_type': operation['artifact_type'],
                          'roles': operation['roles'], 'action': operation['action'],

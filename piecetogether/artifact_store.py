@@ -114,6 +114,16 @@ class LocalArtifactStore:
     def read(self, reference: str) -> bytes:
         return (self.persistent / reference).read_bytes()
 
+    def remove(self, reference: str) -> None:
+        """Idempotently remove publication, stage and its durable staging key."""
+        if not re.fullmatch(r'[0-9a-f]{32}', reference):
+            raise ValueError('invalid Artifact storage reference')
+        for path in (self.persistent / reference, self.staging / reference,
+                     self.staging / (reference + '.tmp')):
+            path.unlink(missing_ok=True)
+        for key in self.keys.glob(reference + '*'):
+            key.unlink(missing_ok=True)
+
     def remove_staged(self, reference: str, minimum_age_seconds: float) -> bool | None:
         """Remove one old staged file: True removed, False missing, None still young."""
         path = self.staging / reference

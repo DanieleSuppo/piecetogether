@@ -76,6 +76,7 @@ class ArtifactOperation:
     predecessor_id: str | None = None
     content_reference: str | None = None
     source_communication_id: str | None = None
+    reason: str | None = None
     kind: Literal["artifact"] = field(default="artifact", init=False)
 
 
@@ -444,6 +445,8 @@ def operation_reason(
         if not valid_name(operation.artifact_type) or operation.artifact_type not in contract.artifact_types:
             return "artifact_type_not_allowed"
         policy = contract.artifact_types[operation.artifact_type]
+        if operation.action != 'delete' and operation.reason is not None:
+            return 'invalid_artifact_classification'
         if not isinstance(operation.roles, tuple) or not operation.roles or any(
             not valid_name(role) or role not in policy["roles"] for role in operation.roles
         ):
@@ -452,19 +455,32 @@ def operation_reason(
             return "artifact_persistence_required"
         if operation.retention is not None and operation.retention != policy["retention"]:
             return "artifact_retention_not_allowed"
-        if operation.action == "persist":
+        if operation.action in ("persist", "supersede"):
+            if operation.action == 'supersede' and not policy['supersession']:
+                return 'artifact_supersession_not_allowed'
+            if operation.action == 'supersede' and not semantic_commit:
+                return 'artifact_predecessor_unavailable'
             if policy["persistence"] == "forbidden":
                 return "artifact_persistence_not_allowed"
             if not semantic_commit:
                 return "artifact_staging_unavailable"
             # The attachment ID is bound to Core-owned ingress/staging evidence in history.check.
-            if operation.content_reference is not None or operation.predecessor_id is not None:
+            if operation.content_reference is not None:
                 return "artifact_staging_unavailable"
+            if operation.action == 'supersede':
+                if not valid_name(operation.predecessor_id):
+                    return 'artifact_predecessor_unavailable'
+            elif operation.predecessor_id is not None:
+                return 'artifact_staging_unavailable'
             return None
-        if operation.action == "supersede":
-            return "artifact_predecessor_unavailable" if policy["supersession"] else "artifact_supersession_not_allowed"
         if operation.action == "delete":
-            return "artifact_lifecycle_unavailable"
+            if not semantic_commit:
+                return 'artifact_lifecycle_unavailable'
+            if (not isinstance(operation.reason, str) or not operation.reason.strip()
+                    or len(operation.reason) > 4096 or operation.content_reference is not None
+                    or operation.predecessor_id is not None):
+                return 'invalid_artifact_deletion'
+            return None
         if operation.action != "classify" or operation.content_reference is not None or operation.predecessor_id is not None:
             return "invalid_artifact_classification"
     elif isinstance(operation, ContextRequestOperation):

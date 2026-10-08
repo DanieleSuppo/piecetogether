@@ -23,6 +23,22 @@ def contexts(db: sqlite3.Connection) -> dict[str, dict[str, Any]]:
     return result
 
 
+def artifacts(db: sqlite3.Connection) -> list[dict[str, Any]]:
+    result = []
+    for row in db.execute("SELECT a.record, p.state, l.record AS lifecycle, f.record AS failure "
+                          "FROM trusted_artifacts a LEFT JOIN artifact_publications p ON p.artifact_id=a.id "
+                          "LEFT JOIN artifact_lifecycle l ON l.artifact_id=a.id "
+                          "LEFT JOIN artifact_publication_failures f ON f.artifact_id=a.id ORDER BY a.rowid"):
+        record = {**json.loads(row['record']), 'availability':
+                  'deleted' if row['lifecycle'] else row['state'] or 'metadata_only'}
+        if row['lifecycle']:
+            record['lifecycle'] = [json.loads(row['lifecycle'])]
+        if row['failure']:
+            record['publication_failure'] = json.loads(row['failure'])
+        result.append(record)
+    return result
+
+
 def current_view(db: sqlite3.Connection) -> dict[str, Any]:
     """Derive the view inside the caller's read transaction; no stale cache."""
     revision = db.execute('SELECT revision FROM semantic_state').fetchone()['revision']
@@ -80,13 +96,11 @@ def current_view(db: sqlite3.Connection) -> dict[str, Any]:
                                'lineage': [{**claim, 'current': False} for claim in claims
                                            if claim['id'] in noncurrent],
                                'relationships': relations, 'conflicts': conflicts})
-    artifacts = []
-    for row in db.execute("SELECT a.record, p.state FROM trusted_artifacts a LEFT JOIN artifact_publications p ON p.artifact_id=a.id ORDER BY a.rowid"):
-        record = json.loads(row['record'])
-        # Publication is operational: pending bytes are never represented as available trusted content.
-        artifacts.append({**record, 'available': row['state'] == 'available'})
+    projected_artifacts = [{**record, 'available': record['availability'] == 'available',
+                            'current': record['id'] not in noncurrent and record['availability'] != 'deleted'}
+                           for record in artifacts(db)]
     return {'revision': revision,
             'entities': [record for record in records if record['kind'] == 'entity'],
             'contexts': list(contexts(db).values()),
-            'artifacts': artifacts,
+            'artifacts': projected_artifacts,
             'assertion_sets': assertion_sets}

@@ -98,6 +98,12 @@ def initialize(db: sqlite3.Connection, contract: DomainContract) -> None:
             stage_ref TEXT NOT NULL, checksum TEXT NOT NULL, size INTEGER NOT NULL,
             state TEXT NOT NULL, storage_ref TEXT
         );
+        CREATE TABLE IF NOT EXISTS artifact_lifecycle (
+            id TEXT PRIMARY KEY, artifact_id TEXT NOT NULL UNIQUE, record TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS artifact_deletions (
+            artifact_id TEXT PRIMARY KEY, reference TEXT NOT NULL, failure TEXT
+        );
         CREATE TABLE IF NOT EXISTS artifact_publication_failures (
             artifact_id TEXT PRIMARY KEY REFERENCES artifact_publications(artifact_id),
             record TEXT NOT NULL
@@ -125,6 +131,7 @@ def artifact_binding(
 ) -> dict[str, Any] | None:
     """Resolve a Claim Artifact reference to an Actor-owned Artifact or source ingress."""
     artifact = db.execute("SELECT id FROM trusted_artifacts WHERE id=? "
+                          "AND NOT EXISTS (SELECT 1 FROM artifact_lifecycle WHERE artifact_id=trusted_artifacts.id) "
                           "AND json_extract(record, '$.provenance.actor_id')=?",
                           (artifact_id, actor_id)).fetchone()
     if artifact is not None:
@@ -419,21 +426,37 @@ def check(
     result = validate(proposal, inbound['id'], contract, available, concept_names(db))
     if result.outcome != 'accepted':
         return result
+    deleting = {op.id for op in proposal.operations if isinstance(op, ArtifactOperation) and op.action == 'delete'}
     for proposal_operation in proposal.operations:
-        if isinstance(proposal_operation, ArtifactOperation) and proposal.intent == 'semantic_commit':
+        if (isinstance(proposal_operation, ArtifactOperation) and proposal.intent == 'semantic_commit'
+                and proposal_operation.action != 'delete'):
             ingress = db.execute("SELECT 1 FROM artifact_ingress WHERE communication_id=? AND attachment_id=? "
                                  "AND actor_id=?", (inbound['id'], proposal_operation.id, inbound['actor_id'])).fetchone()
             if ingress is None:
                 return ValidationResult('rejected', ('invalid_artifact_provenance',))
-        if isinstance(proposal_operation, ArtifactOperation) and proposal_operation.action == 'persist':
+        if (isinstance(proposal_operation, ArtifactOperation)
+                and proposal_operation.action in ('supersede', 'delete')):
+            target_id = (proposal_operation.predecessor_id if proposal_operation.action == 'supersede'
+                         else proposal_operation.id)
+            predecessor = db.execute("SELECT record FROM trusted_artifacts WHERE id=? "
+                                     "AND NOT EXISTS (SELECT 1 FROM artifact_lifecycle WHERE artifact_id=?)",
+                                     (target_id, target_id)).fetchone()
+            previous = json.loads(predecessor['record']) if predecessor else {}
+            if (previous.get('artifact_type') != proposal_operation.artifact_type
+                    or previous.get('roles') != list(proposal_operation.roles)
+                    or previous.get('provenance', {}).get('actor_id') != inbound['actor_id']):
+                return ValidationResult('rejected', ('artifact_predecessor_unavailable'
+                    if proposal_operation.action == 'supersede' else 'artifact_lifecycle_unavailable',))
+        if isinstance(proposal_operation, ArtifactOperation) and proposal_operation.action in ('persist', 'supersede'):
             staged = db.execute("SELECT * FROM artifact_stages WHERE communication_id=? AND attachment_id=? "
                                 "AND actor_id=? AND state='staged'",
                                 (inbound['id'], proposal_operation.id, inbound['actor_id'])).fetchone()
             if staged is None:
                 return ValidationResult('rejected', ('artifact_staging_unavailable',))
         if isinstance(proposal_operation, ClaimOperation) and proposal_operation.artifact_id is not None:
-            if artifact_binding(db, proposal_operation.artifact_id, proposal.communication_id,
-                                inbound['actor_id']) is None:
+            if (proposal_operation.artifact_id in deleting
+                    or artifact_binding(db, proposal_operation.artifact_id, proposal.communication_id,
+                                        inbound['actor_id']) is None):
                 return ValidationResult('rejected', ('invalid_artifact_provenance',))
     state = db.execute("SELECT * FROM semantic_state").fetchone()
     if state['contract_version'] != contract.version:
@@ -560,6 +583,55 @@ def normalized_successors(proposal: SemanticProposal, summary: dict[str, Any]) -
     ))
 
 
+def delete_artifact(
+    db: sqlite3.Connection, operation: ArtifactOperation, inbound: dict[str, Any],
+    contract: DomainContract, metadata: dict[str, Any],
+) -> None:
+    """Explicit retention is the only exception to immutable Artifact history."""
+    row = db.execute('SELECT * FROM trusted_artifacts WHERE id=?', (operation.id,)).fetchone()
+    original = json.loads(row['record'])
+    retention = contract.artifact_types[operation.artifact_type]['retention']
+    keep_metadata = retention['metadata'] == 'retain'
+    keep_provenance = retention['provenance'] == 'retain'
+    transition = {'id': str(uuid4()), 'kind': 'artifact_transition', 'artifact_id': operation.id,
+                  'action': 'delete', 'reason': operation.reason, 'retention': retention, **metadata}
+    if keep_provenance:
+        transition['provenance'] = {'source_communication_id': inbound['id'], 'actor_id': inbound['actor_id']}
+    if keep_metadata or keep_provenance:
+        db.execute('INSERT INTO artifact_lifecycle VALUES (?, ?, ?)',
+                   (transition['id'], operation.id, json.dumps(transition)))
+    publication = db.execute('SELECT * FROM artifact_publications WHERE artifact_id=?', (operation.id,)).fetchone()
+    if publication and retention['bytes'] == 'delete':
+        db.execute('INSERT INTO artifact_deletions VALUES (?, ?, NULL)',
+                   (operation.id, publication['stage_ref']))
+    db.execute("UPDATE artifact_publications SET state='deleted' WHERE artifact_id=?", (operation.id,))
+    db.execute('DELETE FROM artifact_publication_failures WHERE artifact_id=?', (operation.id,))
+    if not keep_provenance:
+        original.pop('provenance', None)
+        db.execute('DELETE FROM artifact_ingress WHERE communication_id=? AND attachment_id=?',
+                   (row['communication_id'], row['attachment_id']))
+        db.execute('DELETE FROM artifact_stages WHERE communication_id=? AND attachment_id=?',
+                   (row['communication_id'], row['attachment_id']))
+        # Keep a unique tombstone key without preserving the source Communication/attachment pair.
+        db.execute("UPDATE trusted_artifacts SET communication_id='', attachment_id=id WHERE id=?", (operation.id,))
+    if not keep_metadata:
+        original = {key: value for key, value in original.items() if key in ('id', 'kind', 'provenance')}
+    if keep_metadata or keep_provenance:
+        db.execute('UPDATE trusted_artifacts SET record=? WHERE id=?', (json.dumps(original), operation.id))
+    else:
+        db.execute('DELETE FROM artifact_publications WHERE artifact_id=?', (operation.id,))
+        db.execute('DELETE FROM trusted_artifacts WHERE id=?', (operation.id,))
+    for relation in db.execute('SELECT id, record FROM trusted_relationships').fetchall():
+        record = json.loads(relation['record'])
+        if operation.id not in (record['source_id'], record['target_id']):
+            continue
+        if not keep_metadata and not keep_provenance:
+            db.execute('DELETE FROM trusted_relationships WHERE id=?', (relation['id'],))
+        elif not keep_provenance and record['source_id'] == operation.id:
+            record.pop('provenance', None)
+            db.execute('UPDATE trusted_relationships SET record=? WHERE id=?', (json.dumps(record), relation['id']))
+
+
 def has_effect(proposal: SemanticProposal) -> bool:
     return any(
         isinstance(operation, ArtifactOperation)
@@ -581,6 +653,7 @@ def commit(
     successor_bindings: dict[str, tuple[str, str]] = {}
     artifact_records: list[dict[str, Any]] = []
     publications: list[dict[str, Any]] = []
+    artifact_relationships: list[dict[str, Any]] = []
     commit_id = str(uuid4())
     revision = proposal.semantic_revision
     assert revision is not None
@@ -639,7 +712,13 @@ def commit(
             item['successor_candidate_ids'] = list(operation.successor_ids)
         items.append(item)
 
+    deleted_artifact_ids = [op.id for op in proposal.operations
+                            if isinstance(op, ArtifactOperation) and op.action == 'delete']
+    if any(record['provenance'].get('artifact_id') in deleted_artifact_ids for record in records.values()):
+        return ValidationResult('rejected', ('invalid_artifact_provenance',)), None
     for artifact_operation in (op for op in proposal.operations if isinstance(op, ArtifactOperation)):
+        if artifact_operation.action == 'delete':
+            continue
         ingress = db.execute("SELECT * FROM artifact_ingress WHERE communication_id=? AND attachment_id=? "
                              "AND actor_id=?", (inbound['id'], artifact_operation.id, inbound['actor_id'])).fetchone()
         if ingress is None:
@@ -652,19 +731,19 @@ def commit(
                   'action': artifact_operation.action, 'retention': artifact_operation.retention or contract.artifact_types[artifact_operation.artifact_type]['retention'],
                   'media_type': ingress['media_type'], **metadata, 'provenance': provenance}
         artifact_records.append(record)
-        if artifact_operation.action == 'persist':
+        if artifact_operation.action == 'supersede':
+            artifact_relationships.append({'id': str(uuid4()), 'kind': 'relationship',
+                                          'relationship_type': 'supersedes', 'source_id': artifact_id,
+                                          'target_id': artifact_operation.predecessor_id,
+                                          **metadata, 'provenance': provenance})
+        if artifact_operation.action in ('persist', 'supersede'):
             staged = db.execute("SELECT * FROM artifact_stages WHERE communication_id=? AND attachment_id=? "
                                 "AND actor_id=? AND state='staged'", (inbound['id'], artifact_operation.id,
                                                                         inbound['actor_id'])).fetchone()
             if staged is None:
                 return ValidationResult('rejected', ('artifact_staging_unavailable',)), None
-            linked = db.execute("UPDATE artifact_stages SET state='linked' WHERE communication_id=? "
-                                "AND attachment_id=? AND state='staged' AND stage_ref=?",
-                                (inbound['id'], artifact_operation.id, staged['stage_ref']))
-            if not linked.rowcount:
-                return ValidationResult('stale', ('artifact_staging_changed',)), None
-            publications.append({'artifact_id': artifact_id, 'stage_ref': staged['stage_ref'],
-                                 'checksum': staged['checksum'], 'size': staged['size']})
+            publications.append({'artifact_id': artifact_id, 'attachment_id': artifact_operation.id,
+                                 'stage_ref': staged['stage_ref'], 'checksum': staged['checksum'], 'size': staged['size']})
 
     mapping = {(row['grounding_id'], row['candidate_id']): row['id'] for row in db.execute(
         "SELECT id, grounding_id, candidate_id FROM trusted_records WHERE kind != 'context_transition'")}
@@ -695,7 +774,7 @@ def commit(
             if None in entity_ids:
                 return ValidationResult('rejected', ('ungrounded_dependency',)), None
             record['entity_ids'] = entity_ids
-    relationships = []
+    relationships = artifact_relationships
     for grounding_id, source in sources.items():
         for op in source.operations:
             if op.kind != 'relationship':
@@ -737,6 +816,16 @@ def commit(
                         and {relation['source_id'], relation['target_id']} == {record['id'], head['id']}
                         for relation in relationships)):
                 return ValidationResult('rejected', ('claim_history_relationship_required',)), None
+    # Reserve stages only after every deterministic rejection check has passed.
+    for publication in publications:
+        linked = db.execute("UPDATE artifact_stages SET state='linked' WHERE communication_id=? "
+                            "AND attachment_id=? AND state='staged' AND stage_ref=?",
+                            (inbound['id'], publication['attachment_id'], publication['stage_ref']))
+        if not linked.rowcount:
+            raise sqlite3.IntegrityError('artifact staging changed inside semantic transaction')
+    for deletion_operation in proposal.operations:
+        if isinstance(deletion_operation, ArtifactOperation) and deletion_operation.action == 'delete':
+            delete_artifact(db, deletion_operation, inbound, contract, metadata)
     for (grounding_id, candidate_id), record in records.items():
         db.execute("INSERT INTO trusted_records VALUES (?, ?, ?, ?, ?)",
                    (record['id'], record['kind'], json.dumps(record), grounding_id, candidate_id))
@@ -758,7 +847,7 @@ def commit(
                                              'source_communication_id': source.communication_id})))
     summary = {'id': commit_id, **metadata, 'communication_id': inbound['id'],
                'record_ids': [record['id'] for record in records.values()],
-               'artifact_ids': [record['id'] for record in artifact_records],
+               'artifact_ids': [record['id'] for record in artifact_records] + deleted_artifact_ids,
                'grounding_item_ids': [item['id'] for item in items],
                'successor_target_ids': {
                    operation.id: normalized_target
@@ -782,21 +871,18 @@ def commit(
 def inspect_history(db: sqlite3.Connection) -> dict[str, Any]:
     state = db.execute("SELECT revision FROM semantic_state").fetchone()
     records = [json.loads(row['record']) for row in db.execute("SELECT record FROM trusted_records ORDER BY rowid")]
-    artifacts = []
-    for row in db.execute("SELECT a.record, p.state, f.record AS failure FROM trusted_artifacts a "
-                          "LEFT JOIN artifact_publications p ON p.artifact_id=a.id "
-                          "LEFT JOIN artifact_publication_failures f ON f.artifact_id=a.id ORDER BY a.rowid"):
-        artifact = {**json.loads(row['record']), 'availability': row['state'] or 'metadata_only'}
-        if row['failure']:
-            artifact['publication_failure'] = json.loads(row['failure'])
-        artifacts.append(artifact)
+    artifacts = view.artifacts(db)
     result = {'revision': state['revision'],
+              'artifact_deletions': [{'artifact_id': row['artifact_id'], 'state': 'pending',
+                                      'failure': json.loads(row['failure']) if row['failure'] else None}
+                                     for row in db.execute('SELECT artifact_id, failure FROM artifact_deletions ORDER BY rowid')],
               'entities': [r for r in records if r['kind'] == 'entity'],
               'artifacts': artifacts,
               'contexts': [r for r in records if r['kind'] == 'context'],
               'context_transitions': [r for r in records if r['kind'] == 'context_transition'],
               'claims': [r for r in records if r['kind'] == 'claim']}
     for name, table in (('reference_assertions', 'reference_assertions'), ('reference_commits', 'reference_commits'),
+                        ('artifact_lifecycle', 'artifact_lifecycle'),
                         ('commits', 'semantic_commits'), ('relationships', 'trusted_relationships'),
                         ('groundings', 'trusted_groundings'), ('grounding_items', 'trusted_grounding_items'),
                         ('events', 'semantic_outbox')):
