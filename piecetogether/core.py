@@ -287,6 +287,12 @@ def _record_attempt(
     )
 
 
+def _checkpoint_result(row: sqlite3.Row) -> dict[str, Any]:
+    return {'communication_id': row['id'],
+            'status': row['status'] if row['status'] in ('completed', 'rejected', 'reprocess_required') else 'retryable',
+            'reply': json.loads(row['outbound'])['text'] if row['status'] == 'completed' else None}
+
+
 class Core:
     def __init__(
         self,
@@ -623,24 +629,26 @@ class Core:
                     json.dumps(asdict(inbound)),
                 ),
             )
+        # Attempt-storage failure must not undo durable ingress.
+        with connect(self.config.database) as db:
+            db.execute('BEGIN IMMEDIATE')
             row = db.execute(
                 "SELECT * FROM turns WHERE channel=? AND sender=? AND idempotency_key=?",
                 (inbound.channel, inbound.sender, inbound.idempotency_key),
             ).fetchone()
             assert row is not None
+            stored = json.loads(row['inbound'])
+            incoming = json.loads(json.dumps(asdict(inbound)))
+            if any(stored[name] != incoming[name] for name in incoming if name not in ('id', 'received_at')):
+                raise ValueError('idempotency key already belongs to a different Communication')
+            if row['status'] in ('completed', 'rejected'):
+                return _checkpoint_result(row)
+            # Reserve a unique attempt without holding the transaction during I/O.
+            attempt = db.execute('SELECT COALESCE(MAX(attempt), 0) + 1 FROM processing_attempts '
+                                 'WHERE communication_id=?', (row['id'],)).fetchone()[0]
+            _record_attempt(db, row['id'], None, None, {'attempt': attempt, 'started_at': now()}, 'processing')
             # The turn checkpoint and its commit must come from the same transaction.
             prior_commit = history.committed(db, row['id'])
-        assert row is not None
-        stored = json.loads(row["inbound"])
-        incoming = json.loads(json.dumps(asdict(inbound)))
-        if any(
-            stored[name] != incoming[name]
-            for name in incoming
-            if name not in ("id", "received_at")
-        ):
-            raise ValueError(
-                "idempotency key already belongs to a different Communication"
-            )
         inbound = Communication(**stored)
         if attachments and not prior_commit:
             with connect(self.config.database) as db:
@@ -678,7 +686,7 @@ class Core:
             "input_communication_id": inbound.id,
             "contract_version": self.config.contract_version,
             "model_provider": self.config.model,
-            "attempt": previous_trace.get("attempt", 0) + 1,
+            "attempt": attempt,
             "started_at": now(),
             "commit_result": "not_requested",
             "delivery_result": "pending",
@@ -723,6 +731,7 @@ class Core:
                         raise context.BudgetExhausted()
                     proposal = self.model.propose(inbound, self.config.contract_version, model_pack)
                     with connect(self.config.database) as db:
+                        db.execute('BEGIN')
                         preliminary = history.check(db, proposal, asdict(inbound), self.contract)
                     requests = tuple(op for op in proposal.operations if isinstance(op, ContextRequestOperation))
                     if preliminary.outcome != 'accepted' or not requests:
@@ -742,12 +751,15 @@ class Core:
                         if name in previous_trace:
                             trace[name] = previous_trace[name]
             with connect(self.config.database) as db:
-                validation = (ValidationResult("accepted") if prior_commit else
-                              history.check(db, proposal, asdict(inbound), self.contract))
+                db.execute('BEGIN')
+                # A changed read set needs fresh interpretation, not a terminal policy rejection.
+                if not prior_commit and pack is not None and not context.current(db, pack):
+                    validation = ValidationResult('stale', ('context_revision_changed',))
+                else:
+                    validation = (ValidationResult('accepted') if prior_commit else
+                                  history.check(db, proposal, asdict(inbound), self.contract))
                 if validation.outcome == 'accepted' and not prior_commit:
-                    if pack is not None and not context.current(db, pack):
-                        validation = ValidationResult('stale', ('context_revision_changed',))
-                    elif outbound is None and requests and preliminary.outcome != 'accepted':
+                    if outbound is None and requests and preliminary.outcome != 'accepted':
                         validation = preliminary
                     else:
                         validation = context.check_disclosure(proposal, pack, asdict(inbound))
@@ -800,6 +812,18 @@ class Core:
             with connect(self.config.database) as db:
                 db.execute("BEGIN IMMEDIATE")
                 raced_commit = history.committed(db, inbound.id)
+                latest_attempt = db.execute('SELECT MAX(attempt) FROM processing_attempts '
+                                            'WHERE communication_id=?', (inbound.id,)).fetchone()[0]
+                if latest_attempt != attempt:
+                    checkpoint = db.execute('SELECT * FROM turns WHERE id=?', (inbound.id,)).fetchone()
+                    trace.update(recovery='superseded_attempt', finished_at=now(),
+                                 duration_ms=round((monotonic() - started) * 1000, 3),
+                                 delivery_result='not_attempted')
+                    if raced_commit:
+                        trace.update(commit_result='committed', semantic_commit_id=raced_commit['id'],
+                                     semantic_revision=raced_commit['semantic_revision'])
+                    _record_attempt(db, inbound.id, captured, None, trace, 'superseded')
+                    return _checkpoint_result(checkpoint)
                 if raced_commit and not prior_commit:
                     checkpoint = db.execute("SELECT * FROM turns WHERE id=?", (inbound.id,)).fetchone()
                     checkpoint_trace = json.loads(checkpoint['trace'])
@@ -808,8 +832,7 @@ class Core:
                                  contract_version=raced_commit['contract_version'],
                                  recovery="already_committed",
                                  discarded_proposal=json.loads(captured) if captured else None,
-                                 validation_result="accepted", validation_reasons=[],
-                                 attempt=checkpoint_trace['attempt'] + 1)
+                                 validation_result="accepted", validation_reasons=[])
                     captured = checkpoint['proposal']
                     proposal = SemanticProposal.from_dict(json.loads(captured))
                     outbound = Communication(**json.loads(checkpoint['outbound']))
@@ -907,17 +930,17 @@ class Core:
         with connect(self.config.database) as db:
             db.execute("BEGIN IMMEDIATE")
             durable_commit = history.committed(db, inbound.id)
-            if durable_commit and trace.get('semantic_commit_id') != durable_commit['id']:
-                checkpoint = db.execute("SELECT * FROM turns WHERE id=?", (inbound.id,)).fetchone()
-                checkpoint_trace = json.loads(checkpoint['trace'])
-                trace.update(commit_result="committed", semantic_commit_id=durable_commit['id'],
-                             semantic_revision=durable_commit['semantic_revision'],
-                             recovery="already_committed", attempt=checkpoint_trace['attempt'] + 1)
-                # Retain the losing attempt's evidence without replacing the committed checkpoint.
-                _record_attempt(db, inbound.id, captured, saved_outbound, trace, checkpoint['status'])
-                return {"communication_id": inbound.id, "status": checkpoint['status'],
-                        "reply": json.loads(checkpoint['outbound'])['text']
-                        if checkpoint['status'] == 'completed' else None}
+            latest_attempt = db.execute('SELECT MAX(attempt) FROM processing_attempts '
+                                        'WHERE communication_id=?', (inbound.id,)).fetchone()[0]
+            if latest_attempt != attempt or durable_commit and trace.get('semantic_commit_id') != durable_commit['id']:
+                checkpoint = db.execute('SELECT * FROM turns WHERE id=?', (inbound.id,)).fetchone()
+                trace['recovery'] = 'superseded_attempt'
+                if durable_commit:
+                    trace.update(commit_result='committed', semantic_commit_id=durable_commit['id'],
+                                 semantic_revision=durable_commit['semantic_revision'])
+                # Preserve the winning checkpoint; losing attempts retain only operational evidence.
+                _record_attempt(db, inbound.id, captured, saved_outbound, trace, 'superseded')
+                return _checkpoint_result(checkpoint)
             db.execute(
                 "UPDATE turns SET status=?, trace=?, outbound=? WHERE id=?",
                 (status, json.dumps(trace), saved_outbound, inbound.id),

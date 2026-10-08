@@ -487,7 +487,10 @@ class HistoryTests(unittest.TestCase):
         restarted = Core(self.config, model=MustNotRunModel(), contract_provider=ContractProvider(self.contract))
         self.assertEqual(restarted.accept(payload), result)
         self.assertEqual(len(restarted.inspect_history()['commits']), 1)
-        self.assertEqual(checkpoint['attempts'][-1]['trace']['failure_stage'], 'model')
+        failed_attempts = [attempt for attempt in checkpoint['attempts']
+                           if attempt['trace'].get('failure_stage') == 'model']
+        self.assertEqual(len(failed_attempts), 1)
+        self.assertEqual(failed_attempts[0]['status'], 'superseded')
 
     def test_core_exposes_every_groundable_interpretation_even_with_unrelated_model_draft(self):
         class UnrelatedDraft(ProposalModel):

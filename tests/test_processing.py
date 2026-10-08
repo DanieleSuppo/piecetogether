@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from dataclasses import asdict, replace
 from pathlib import Path
+from unittest.mock import patch
 
 from piecetogether.core import Bootstrap, Communication, Core, SemanticProposal
 from piecetogether.contracts import DomainContract
@@ -313,22 +314,15 @@ class ProcessingTests(unittest.TestCase):
         self.assertEqual(core.inspect(fresh["communication_id"])["attempts"], attempts)
 
     def test_attempt_record_failure_cannot_leave_a_partial_terminal_rejection(self):
-        seen = []
-
-        class ObservedForbiddenModel(ForbiddenModel):
-            def propose(self, inbound, version, context_pack):
-                seen.append(inbound.id)
-                return super().propose(inbound, version, context_pack)
-
-        core = Core(self.config, model=ObservedForbiddenModel())
+        core = Core(self.config, model=ForbiddenModel())
         self.database_fault("""
             CREATE TRIGGER fail_attempt BEFORE INSERT ON processing_attempts
             BEGIN SELECT RAISE(ABORT, 'attempt storage unavailable'); END;
         """)
-        with self.assertRaises(sqlite3.Error):
+        with patch('piecetogether.core.uuid4', return_value='faulted-input'), self.assertRaises(sqlite3.Error):
             core.accept(self.message)
         self.database_fault("DROP TRIGGER fail_attempt;")
-        outcome = Core(self.config).inspect(seen[0])
+        outcome = Core(self.config).inspect('faulted-input')
         self.assertEqual(outcome["status"], "pending")
         self.assertIsNone(outcome["proposal"])
         self.assertIsNone(outcome["trace"])
