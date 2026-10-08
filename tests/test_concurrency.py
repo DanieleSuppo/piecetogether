@@ -11,8 +11,9 @@ from threading import Barrier, Event
 import test_history as fixtures
 from piecetogether.artifact_store import LocalArtifactStore
 from piecetogether.core import Core
+from piecetogether.context import SelectionConfig
 from piecetogether.proposals import (
-    ArtifactOperation, ContextOperation, EntityOperation, GroundingPlanOperation,
+    ArtifactOperation, ContextOperation, EmergentConceptOperation, EntityOperation, GroundingPlanOperation,
     GroundingResolutionOperation, SemanticProposal,
 )
 
@@ -214,6 +215,77 @@ class ConcurrencyTests(unittest.TestCase):
                 artifact = history['artifacts'][-1]
                 self.assertEqual(artifact['availability'], 'available')
                 self.assertEqual(artifact_core.artifact_bytes(artifact['id']), boundary.encode())
+
+    def test_scope_only_changes_require_fresh_pack_without_trusted_revision_change(self):
+        for change in ('pending_grounding', 'vocabulary', 'completed_communication'):
+            with self.subTest(change=change):
+                packs = []
+
+                class RacingModel:
+                    def propose(model, inbound, version, context_pack):
+                        packs.append(context_pack)
+                        if change == 'pending_grounding':
+                            exposure = self.flow.expose()
+                            self.assertEqual({item['outcome'] for item in exposure['grounding_items']}, {'pending'})
+                        elif change == 'vocabulary':
+                            declarer = self.core(fixtures.ProposalModel((
+                                EmergentConceptOperation('scope-vocabulary', 'Reusable vocabulary'),
+                            )), channel=fixtures.RefusingChannel())
+                            outcome = declarer.accept(self.flow.message())
+                            self.assertEqual(outcome['status'], 'retryable')
+                            self.assertEqual(declarer.inspect(outcome['communication_id'])['grounding_items'], [])
+                            self.assertEqual(declarer.inspect_concepts()[0]['name'], 'scope-vocabulary')
+                        else:
+                            other = self.core(fixtures.ProposalModel(()))
+                            self.assertEqual(other.accept(self.flow.message())['status'], 'completed')
+                        return SemanticProposal(1, version, inbound.id, (), 'Stale draft')
+
+                core = self.core(RacingModel())
+                payload = self.flow.message()
+                before = core.inspect_history()
+                result = core.accept(payload)
+                self.assertEqual(result['status'], 'reprocess_required')
+                self.assertEqual(core.inspect_history(), before)
+                checkpoint = core.inspect(result['communication_id'])
+                self.assertEqual(checkpoint['trace']['validation_reasons'], ['context_revision_changed'])
+                self.assertIsNone(checkpoint['outbound'])
+                self.assertEqual(checkpoint['grounding_items'], [])
+
+                class FreshModel:
+                    def propose(model, inbound, version, context_pack):
+                        packs.append(context_pack)
+                        return SemanticProposal(1, version, inbound.id, (), 'Fresh draft')
+
+                fresh = self.core(FreshModel())
+                self.assertEqual(fresh.accept(payload)['status'], 'completed')
+                self.assertEqual([pack.semantic_revision for pack in packs], [0, 0])
+                self.assertNotEqual(packs[0].scope_revision, packs[1].scope_revision)
+                self.assertEqual(fresh.inspect_history(), before)
+                self.assertEqual([attempt['trace']['validation_result'] for attempt in
+                                  fresh.inspect(result['communication_id'])['attempts']], ['stale', 'accepted'])
+
+    def test_loser_preserves_winning_budget_exhaustion_classification(self):
+        payload = self.flow.message()
+        winner = Core(replace(self.flow.config, selection=SelectionConfig(max_bytes=1)),
+                      model=fixtures.MustNotRunModel(),
+                      contract_provider=fixtures.ContractProvider(self.flow.contract))
+        outcomes = []
+
+        class RacingModel:
+            def propose(model, inbound, version, context_pack):
+                outcomes.append(winner.accept(payload))
+                return SemanticProposal(1, version, inbound.id, (), 'Losing draft')
+
+        core = self.core(RacingModel())
+        result = core.accept(payload)
+        self.assertEqual(outcomes[0]['status'], 'budget_exhausted')
+        self.assertEqual(result, outcomes[0])
+        checkpoint = core.inspect(result['communication_id'])
+        self.assertEqual(checkpoint['status'], 'budget_exhausted')
+        self.assertIsNone(checkpoint['outbound'])
+        self.assertEqual(checkpoint['grounding_items'], [])
+        self.assertEqual([attempt['status'] for attempt in checkpoint['attempts']], ['superseded', 'budget_exhausted'])
+        self.assertEqual(core.inspect_history()['events'], [])
 
     def test_changed_context_is_stale_not_terminal_rejection_and_retry_uses_fresh_pack(self):
         initial, _, _ = self.flow.accept_items(self.flow.expose())

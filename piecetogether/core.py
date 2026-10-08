@@ -289,7 +289,7 @@ def _record_attempt(
 
 def _checkpoint_result(row: sqlite3.Row) -> dict[str, Any]:
     return {'communication_id': row['id'],
-            'status': row['status'] if row['status'] in ('completed', 'rejected', 'reprocess_required') else 'retryable',
+            'status': 'retryable' if row['status'] == 'pending' else row['status'],
             'reply': json.loads(row['outbound'])['text'] if row['status'] == 'completed' else None}
 
 
@@ -932,9 +932,9 @@ class Core:
             durable_commit = history.committed(db, inbound.id)
             latest_attempt = db.execute('SELECT MAX(attempt) FROM processing_attempts '
                                         'WHERE communication_id=?', (inbound.id,)).fetchone()[0]
-            if latest_attempt != attempt or durable_commit and trace.get('semantic_commit_id') != durable_commit['id']:
+            if latest_attempt != attempt or (durable_commit and trace.get('semantic_commit_id') != durable_commit['id']):
                 checkpoint = db.execute('SELECT * FROM turns WHERE id=?', (inbound.id,)).fetchone()
-                trace['recovery'] = 'superseded_attempt'
+                trace['recovery'] = 'superseded_attempt' if latest_attempt != attempt else 'already_committed'
                 if durable_commit:
                     trace.update(commit_result='committed', semantic_commit_id=durable_commit['id'],
                                  semantic_revision=durable_commit['semantic_revision'])
