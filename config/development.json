@@ -8,5 +8,6 @@
   "identities": {
     "development:sender-1": "actor-1"
   },
-  "secret_references": {}
+  "secret_references": {},
+  "projection": {"adapter": "development", "max_attempts": 3, "backoff_seconds": 1, "max_backoff_seconds": 60, "lease_seconds": 60}
 }

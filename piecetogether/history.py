@@ -864,6 +864,23 @@ def commit(
                                               for r in records.values() if r['kind'] in ('context', 'context_transition'))),
              'artifact_ids': summary['artifact_ids'], 'assertion_ids': [r['id'] for r in records.values() if r['kind'] == 'claim'],
              'grounding_item_ids': summary['grounding_item_ids']}
+    # Currentness changes also affect existing targets and predecessor assertions.
+    affected = [record.get('target_id') for record in records.values()]
+    affected += [item['target_id'] for item in items if item['outcome'] == 'accepted']
+    affected += [endpoint for relation in relationships for endpoint in (relation['source_id'], relation['target_id'])]
+    affected += [entity_id for record in records.values() if record['kind'] == 'context'
+                 for entity_id in record['entity_ids']]
+    known = targets(db)
+    artifact_ids = {row['id'] for row in db.execute('SELECT id FROM trusted_artifacts')}
+    for affected_id in affected:
+        if affected_id in artifact_ids:
+            field = 'artifact_ids'
+        elif affected_id in known:
+            field = {'$context': 'context_ids', '$claim': 'assertion_ids'}.get(known[affected_id], 'entity_ids')
+        else:
+            continue
+        if affected_id not in event[field]:
+            event[field].append(affected_id)
     db.execute("INSERT INTO semantic_outbox VALUES (?, ?)", (event['id'], json.dumps(event)))
     return result, summary
 

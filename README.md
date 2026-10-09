@@ -760,7 +760,7 @@ For deletion, `ArtifactOperation(artifact_id, artifact_type, roles, action="dele
 
 Deletion applies to Core-owned Artifact records and storage, not automatically to normalized Communications, Grounded Claims, semantic commits/events, or operational traces; their retention policies are separate. It is not a Grounding Outcome, and supersession alone never triggers deletion.
 
-SQLite stores normalized inbound/outbound Communications, candidate proposals, processing outcomes and per-attempt Evaluation Traces separately from trusted semantic history and non-authoritative vocabulary. Validation checkpoints atomically persist the proposal, outbound, outcome and attempt evidence; accepted semantic commits also append trusted history, Grounding outcomes, revision and an outbox event in that transaction. The development ChannelPlugin accepts handoff into a durable local mailbox; it does not send Email or Telegram. Model and channel work run outside database transactions. Current Trusted View is derived from committed history in a consistent read transaction. Authenticated State API and event dispatch are subsequent tickets.
+SQLite stores normalized inbound/outbound Communications, candidate proposals, processing outcomes and per-attempt Evaluation Traces separately from trusted semantic history and non-authoritative vocabulary. Validation checkpoints atomically persist the proposal, outbound, outcome and attempt evidence; accepted semantic commits also append trusted history, Grounding outcomes, revision and an outbox event in that transaction. The development ChannelPlugin accepts handoff into a durable local mailbox; it does not send Email or Telegram. Model and channel work run outside database transactions. Current Trusted View is derived from committed history in a consistent read transaction. Authenticated State API is a subsequent ticket; committed events can be dispatched through the ProjectionSink boundary described below.
 
 Concurrent Core workers may share a database. After durable ingress, each inbound delivery reserves a unique processing attempt in a separate short transaction; attempt-storage failure cannot undo the inbound. Only the latest attempt may update the turn checkpoint or expose Grounding Items; a superseded attempt retains its own operational evidence without replacing the winning proposal, reply or outcome. Concurrent handoff retries reuse the durable outbound identity and require an idempotent ChannelPlugin. This transport is operator-local, not a public network ingress or production connector. Candidates and traces are not returned to senders. A local operator with deployment filesystem access can inspect an outcome separately:
 
@@ -815,7 +815,7 @@ The short SQLite transaction rechecks the semantic revision and appends immutabl
 
 Corrections, supersessions and contradictions must be Contract-permitted relationships in the exposed candidate graph. They connect a newly accepted Claim to assertions on the same target/concept; correction and supersession predecessors must already be committed. A differing assertion on the same semantic key needs an explicit history relationship to conflicting current heads. Previous assertions are never overwritten. Current Trusted View exposes every current head, its lineage and explicit conflicts without choosing a winner.
 
-A committed turn's delivery failure cannot undo trusted history. Redelivery restores the durable commit and outbound without another model call or semantic effect, even after a Contract change or restart. Completed historical outcomes remain idempotent. A losing processing attempt, including a model/parsing failure, cannot replace an already committed checkpoint; its trace is retained separately. The outbox is recorded atomically now; at-least-once event dispatch and consumer authentication belong to #23/#24.
+A committed turn's delivery failure cannot undo trusted history. Redelivery restores the durable commit and outbound without another model call or semantic effect, even after a Contract change or restart. Completed historical outcomes remain idempotent. A losing processing attempt, including a model/parsing failure, cannot replace an already committed checkpoint; its trace is retained separately. The outbox is recorded atomically; at-least-once event dispatch is independent of conversational reply delivery. Consumer authentication belongs to #24.
 
 Accepted Emergent Concept declarations persist in a separate `non_authoritative` catalogue with source Communication, Actor and Contract provenance. Later declarations preserve earlier source descriptions. Previously declared names are available to validation and later Core-owned reconciliation without redeclaration, but every use still satisfies the active emergent policy or canonical constraints. Vocabulary never creates Entity Types or modifies the Contract.
 
@@ -830,6 +830,30 @@ core.inspect_concepts()        # separate non-authoritative vocabulary and prove
 ```
 
 These are local Core/verification interfaces, not sender retrieval or an application State API. Sender replies still contain only `communication_id`, `status` and `reply`. Deterministic adapter scenarios in `tests/test_history.py` exercise authorized commits and failure/recovery invariants without a live model.
+
+## Post-commit Grounded Change Events
+
+Optional static bootstrap configuration enables the durable local development ProjectionSink (no network service or credentials):
+
+```json
+{"projection": {"adapter": "development", "max_attempts": 3, "backoff_seconds": 1, "max_backoff_seconds": 60, "lease_seconds": 60}}
+```
+
+Omit `projection` to leave the existing outbox undispatched. Tests/first-party integrations may inject `projection_sink` into `Core`; its typed `ProjectionSink.deliver(event)` returns exactly `True` for accepted handoff. Other returns and ordinary exceptions are delivery failures. The supplied development sink accepts identical event IDs idempotently into a local mailbox and rejects changed payloads under an existing ID. No HTTP, database or spreadsheet connector framework is introduced.
+
+The dispatcher sends the **original stored outbox record**, including event `id`, opaque `semantic_commit_id`, `event_type`, `timestamp`, `contract_version`, affected `entity_ids`/`context_ids`/`artifact_ids`/`assertion_ids`/`grounding_item_ids`, and `semantic_revision` (the relevant Current Trusted View revision). Corrections include existing targets and predecessor assertion IDs. Already recorded events are not rewritten on deployment upgrade. Candidate values, proposals, Evaluation Traces and operational delivery data are never added to the event. Reference events retain their separate `reference_committed` type and assertion provenance in the view.
+
+```python
+core.dispatch_events()                 # one bounded pass, at most 100 due events
+core.inspect_event_delivery()          # operator-only states and immutable attempt evidence
+core.recover_event_delivery(event_id)  # resume a failed budget; preserve payload and all attempts
+```
+
+Configured delivery runs at startup, after acquisition processing and after reference refresh, always outside semantic transactions. During idle periods or large backlogs, invoke `dispatch_events()` periodically as local maintenance; this development service does not create a background scheduler. Retry deadlines and lease expirations are persisted UTC epoch seconds, so restart does not reset backoff. Failed attempts use exponential backoff capped by `max_backoff_seconds`; exhaustion of `max_attempts` leaves a recoverable `failed` operational state. Timings must be finite positive seconds (at most one day); attempt limits are integers from 1 to 100.
+
+A short atomic reservation records each attempt before handoff. Concurrent dispatchers respect its lease; lease expiry marks interrupted work `indeterminate` and permits redelivery within the attempt budget. Late results cannot overwrite a newer reservation. An exhausted interrupted delivery remains recoverable through the same operator method. Choose a lease longer than the sink's normal handoff duration; a slower or crashed sink may still receive duplicates.
+
+Delivery is **at least once, not exactly once**. Consumers deduplicate using event ID and semantic commit ID, then obtain the complete trusted view through the future State API. A crash after sink acceptance but before local recording deliberately replays the same event. Sink failure never cancels a semantic commit, changes Grounding, advances the trusted revision or invokes a model. Delivery bookkeeping storage failures likewise leave the outbox and any durable started attempt recoverable; automatic passes do not replace an acquisition result with a delivery-storage error, while explicit `dispatch_events()` surfaces that error. Inspection records error classes, not arbitrary sink exception text that might contain secrets.
 
 ## Current Trusted View and Context lifecycle
 

@@ -7,16 +7,16 @@ import math
 import os
 import re
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from time import monotonic
+from time import monotonic, time
 from typing import Any, ContextManager, Protocol, cast
 from uuid import uuid4
 
-from . import context, history, references, view
+from . import context, history, projections, references, view
 from .artifact_store import LocalArtifactStore, StagedContent
 from .contracts import DeclarativeContractProvider, DomainContractProvider
 from .proposals import (
@@ -46,8 +46,11 @@ class Bootstrap:
     selection: context.SelectionConfig = field(default_factory=context.SelectionConfig)
     reference_state: references.ReferenceConfig | None = None
     artifact_store: Path | None = None
+    projection: projections.ProjectionConfig | None = None
 
     def __post_init__(self) -> None:
+        if self.projection is not None and not isinstance(self.projection, projections.ProjectionConfig):
+            raise ValueError('projection must be a static ProjectionConfig')
         if self.reference_state is not None and not isinstance(self.reference_state, references.ReferenceConfig):
             raise ValueError('reference_state must be a static ReferenceConfig')
         if not isinstance(self.selection, context.SelectionConfig):
@@ -110,6 +113,7 @@ class Bootstrap:
             "selection",
             "reference_state",
             "artifact_store",
+            "projection",
         }
         if not isinstance(data, dict) or set(data) - allowed:
             raise ValueError("invalid bootstrap configuration")
@@ -120,6 +124,13 @@ class Bootstrap:
         ):
             raise ValueError("capabilities must be a string array")
         database = Path(data.pop("database"))
+        if 'projection' in data:
+            if not isinstance(data['projection'], dict):
+                raise ValueError('projection must be an object')
+            try:
+                data['projection'] = projections.ProjectionConfig(**data['projection'])
+            except TypeError as error:
+                raise ValueError('invalid projection configuration') from error
         if 'reference_state' in data:
             reference = data['reference_state']
             if (not isinstance(reference, dict) or set(reference) - {'provider_id', 'path'}
@@ -303,6 +314,8 @@ class Core:
         selector: context.SemanticSelector | None = None,
         reference_provider: references.ReferenceStateProvider | None = None,
         artifact_store: LocalArtifactStore | None = None,
+        projection_sink: projections.ProjectionSink | None = None,
+        delivery_clock: Callable[[], float] = time,
     ):
         self.config = config
         provider = contract_provider or DeclarativeContractProvider(config.contract)
@@ -313,6 +326,9 @@ class Core:
             raise ValueError('Reference State Provider must be explicitly configured')
         self.reference_provider = (reference_provider or references.FileReferenceStateProvider(config.reference_state)
                                    if config.reference_state is not None else None)
+        self.projection_sink = projection_sink or (projections.DevelopmentProjectionSink(config.database)
+                                                  if config.projection is not None else None)
+        self.delivery_clock = delivery_clock
         self.model = model or DeterministicModel()
         self.channel = channel or DevelopmentChannel(config.database)
         self.artifact_store = artifact_store or (LocalArtifactStore(config.artifact_store)
@@ -365,6 +381,7 @@ class Core:
                     json.loads(row["trace"]), row["status"],
                 )
             history.initialize(db, self.contract)
+            projections.initialize(db)
         if self.artifact_store is not None:
             with self._artifact_maintenance_lock():
                 self._release_abandoned_artifact_cleanup()
@@ -372,6 +389,7 @@ class Core:
             self.retry_artifact_finalization()
         if self.reference_provider is not None:
             self.refresh_references()
+        self._dispatch_events_after_commit()
 
     def refresh_references(self) -> dict[str, Any]:
         """Read the configured provider outside locks, then atomically append its assertions."""
@@ -388,7 +406,9 @@ class Core:
                            for assertion in assertions)
         with connect(self.config.database) as db:
             db.execute('BEGIN IMMEDIATE')
-            return references.commit(db, assertions, config.provider_id, self.contract, now())
+            result = references.commit(db, assertions, config.provider_id, self.contract, now())
+        self._dispatch_events_after_commit()
+        return result
 
     def _artifact_maintenance_lock(self) -> ContextManager[None]:
         if self.artifact_store is None:
@@ -566,6 +586,11 @@ class Core:
             return content
 
     def accept(self, payload: Any) -> dict[str, Any]:
+        result = self._accept(payload)
+        self._dispatch_events_after_commit()
+        return result
+
+    def _accept(self, payload: Any) -> dict[str, Any]:
         required = {"channel", "sender", "idempotency_key", "text", "sent_at"}
         optional = {"thread_id", "reply_to", "attachments"}
         if (
@@ -997,6 +1022,61 @@ class Core:
         with connect(self.config.database) as db:
             db.execute("BEGIN")
             return history.inspect_history(db)
+
+    def _dispatch_events_after_commit(self) -> None:
+        try:
+            self.dispatch_events()
+        except sqlite3.Error:
+            # The durable outbox/started attempt survives unavailable delivery bookkeeping.
+            # Explicit maintenance surfaces the storage error; acquisition keeps its outcome.
+            pass
+
+    def dispatch_events(self) -> dict[str, str]:
+        """Publish durable trusted events without semantic locks or model work."""
+        if self.projection_sink is None:
+            return {}
+        config = self.config.projection or projections.ProjectionConfig()
+        timestamp = self.delivery_clock()
+        with connect(self.config.database) as db:
+            pending = db.execute("SELECT o.* FROM semantic_outbox o LEFT JOIN event_delivery d "
+                                 "ON d.event_id=o.id WHERE d.event_id IS NULL "
+                                 "OR d.state='pending' AND d.next_attempt_at<=? "
+                                 "OR d.state='delivering' AND d.lease_until<=? "
+                                 "ORDER BY o.rowid LIMIT 100", (timestamp, timestamp)).fetchall()
+        outcomes = {}
+        for row in pending:
+            with connect(self.config.database) as db:
+                db.execute('BEGIN IMMEDIATE')
+                attempt = projections.claim(db, row['id'], self.delivery_clock(), config)
+            if attempt is None:
+                continue
+            error_type = None
+            try:
+                accepted = self.projection_sink.deliver(json.loads(row['record'])) is True
+                if not accepted:
+                    error_type = 'SinkNotAccepted'
+            except Exception as error:
+                accepted = False
+                # Store classification, not arbitrary sink text which may contain secrets.
+                error_type = type(error).__name__
+            with connect(self.config.database) as db:
+                db.execute('BEGIN IMMEDIATE')
+                outcomes[row['id']] = projections.finish(
+                    db, row['id'], attempt, self.delivery_clock(), config, accepted, error_type)
+        return outcomes
+
+    def recover_event_delivery(self, event_id: str) -> bool:
+        """Operator resumes an exhausted delivery budget, keeping payload and attempt history."""
+        with connect(self.config.database) as db:
+            return bool(db.execute("UPDATE event_delivery SET state='pending', attempts_since_recovery=0, "
+                                   "next_attempt_at=?, lease_until=NULL WHERE event_id=? AND state='failed'",
+                                   (self.delivery_clock(), event_id)).rowcount)
+
+    def inspect_event_delivery(self) -> list[dict[str, Any]]:
+        """Operational delivery evidence, never trusted knowledge or sender replies."""
+        with connect(self.config.database) as db:
+            db.execute('BEGIN')
+            return projections.inspect(db)
 
     def inspect_concepts(self) -> list[dict[str, Any]]:
         """Non-authoritative vocabulary for later Core-owned reconciliation."""
