@@ -17,6 +17,7 @@ from typing import Any, ContextManager, Protocol, cast
 from uuid import uuid4
 
 from . import context, history, projections, references, view
+from .application_api import ApplicationApiConfig
 from .artifact_store import LocalArtifactStore, StagedContent
 from .contracts import DeclarativeContractProvider, DomainContractProvider
 from .proposals import (
@@ -47,10 +48,13 @@ class Bootstrap:
     reference_state: references.ReferenceConfig | None = None
     artifact_store: Path | None = None
     projection: projections.ProjectionConfig | None = None
+    application_api: ApplicationApiConfig | None = None
 
     def __post_init__(self) -> None:
         if self.projection is not None and not isinstance(self.projection, projections.ProjectionConfig):
             raise ValueError('projection must be a static ProjectionConfig')
+        if self.application_api is not None and not isinstance(self.application_api, ApplicationApiConfig):
+            raise ValueError('application_api must be a static ApplicationApiConfig')
         if self.reference_state is not None and not isinstance(self.reference_state, references.ReferenceConfig):
             raise ValueError('reference_state must be a static ReferenceConfig')
         if not isinstance(self.selection, context.SelectionConfig):
@@ -97,6 +101,11 @@ class Bootstrap:
             raise ValueError(
                 "secret_references must contain environment variable names"
             )
+        if self.application_api is not None and any(
+            credential.secret_reference not in self.secret_references
+            for credential in self.application_api.credentials
+        ):
+            raise ValueError("application API credentials must use configured secret references")
 
     @classmethod
     def from_file(cls, path: Path) -> "Bootstrap":
@@ -114,6 +123,7 @@ class Bootstrap:
             "reference_state",
             "artifact_store",
             "projection",
+            "application_api",
         }
         if not isinstance(data, dict) or set(data) - allowed:
             raise ValueError("invalid bootstrap configuration")
@@ -131,6 +141,8 @@ class Bootstrap:
                 data['projection'] = projections.ProjectionConfig(**data['projection'])
             except TypeError as error:
                 raise ValueError('invalid projection configuration') from error
+        if 'application_api' in data:
+            data['application_api'] = ApplicationApiConfig.from_dict(data['application_api'])
         if 'reference_state' in data:
             reference = data['reference_state']
             if (not isinstance(reference, dict) or set(reference) - {'provider_id', 'path'}
@@ -1077,6 +1089,13 @@ class Core:
         with connect(self.config.database) as db:
             db.execute('BEGIN')
             return projections.inspect(db)
+
+    def trusted_events(self) -> list[dict[str, Any]]:
+        """Immutable public-event payloads, excluding delivery and processing internals."""
+        with connect(self.config.database) as db:
+            db.execute('BEGIN')
+            return [json.loads(row['record']) for row in db.execute(
+                'SELECT record FROM semantic_outbox ORDER BY rowid')]
 
     def inspect_concepts(self) -> list[dict[str, Any]]:
         """Non-authoritative vocabulary for later Core-owned reconciliation."""

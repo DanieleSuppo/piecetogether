@@ -770,6 +770,10 @@ python3 -m piecetogether --config config/development.json --inspect <communicati
 
 Inspection returns the latest turn fields and an ordered `attempts` collection containing each attempt's number, status, proposal, outbound and trace. Reprocessing preserves earlier stale decisions and captured proposals. Startup imports the last available checkpoint from older deployments once; earlier attempts that those deployments already overwrote cannot be reconstructed.
 
+### Application State API
+
+The versioned, authenticated application transport is separate from this sender acquisition worker. Configure loopback deployment credentials through `secret_references` and start it with `python3 -m piecetogether --config deployment.json --serve-api`. It exposes scoped Current Trusted View queries and trusted event consumption only; it never exposes candidates, traces, acquisition data or secret values. See [Application State API](docs/application-api.md) for the static configuration, scopes, endpoints, and cursor semantics.
+
 ## Declarative Domain Contracts and Proposals
 
 The `contract` bootstrap field names a JSON file in the format of [config/development-contract.json](config/development-contract.json). Its `version` must match `contract_version`; `schema_version` is integer `1`. The Core loads and validates a Contract snapshot at startup. Domain rules are data, never executable plugins. Unknown fields, duplicate JSON keys, unsupported schema versions, contradictory constraints and dangling policy/type references fail bootstrap.

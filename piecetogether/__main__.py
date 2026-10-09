@@ -6,6 +6,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
+from .application_api import ApplicationApiServer
 from .core import Bootstrap, Core
 
 MAX_LINE = 65536
@@ -16,6 +17,9 @@ def main() -> int:
     parser.add_argument("--config", type=Path, default=Path("config/development.json"))
     parser.add_argument(
         "--inspect", metavar="COMMUNICATION_ID", help="local operator inspection"
+    )
+    parser.add_argument(
+        "--serve-api", action="store_true", help="serve the configured application API"
     )
     args = parser.parse_args()
     try:
@@ -28,6 +32,13 @@ def main() -> int:
             print(json.dumps(core.inspect(args.inspect)))
         except (KeyError, sqlite3.Error):
             print("Communication unavailable.", file=sys.stderr)
+            return 1
+        return 0
+    if args.serve_api:
+        try:
+            ApplicationApiServer(core).serve_forever()
+        except (ValueError, OSError, sqlite3.Error):
+            print("Invalid or unavailable application API configuration/state.", file=sys.stderr)
             return 1
         return 0
     # ponytail: one local JSONL worker; add a work scheduler for concurrent transports.
