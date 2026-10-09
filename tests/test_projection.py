@@ -259,7 +259,8 @@ class ProjectionTests(unittest.TestCase):
         sink = FailingSink()
         # Drain the old event first so this test observes only the new semantic effect.
         self.delivery_core(RecordingSink())
-        core, payload, result = self.flow.accept_items(exposed, revision=1, projection_sink=sink)
+        core, payload, result = self.flow.accept_items(exposed, revision=1, projection_sink=sink,
+                                                     delivery_clock=self.clock)
         self.assertEqual(result['status'], 'completed')
         history = core.inspect_history()
         view = core.current_view()
