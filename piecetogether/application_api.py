@@ -47,8 +47,8 @@ class ApplicationApiConfig:
     credentials: tuple[ApplicationCredential, ...]
 
     def __post_init__(self) -> None:
-        if self.host not in {"127.0.0.1", "::1"}:
-            raise ValueError("application API must bind a loopback host")
+        if self.host != "127.0.0.1":
+            raise ValueError("application API must bind the IPv4 loopback host")
         if type(self.port) is not int or not 0 <= self.port <= 65535:
             raise ValueError("application API port must be an integer from 0 to 65535")
         if (
@@ -264,7 +264,7 @@ class ApplicationApiServer:
         port = int(self._httpd.server_address[1])
         return f"http://{self.config.host}:{port}"
 
-    def start(self) -> None:
+    def _build_server(self) -> ThreadingHTTPServer:
         if self._httpd is not None:
             raise RuntimeError("application API server is already started")
         self._credentials = self.config.resolve_credentials(self.core.config.secret_references)
@@ -280,6 +280,10 @@ class ApplicationApiServer:
         server = ThreadingHTTPServer((self.config.host, self.config.port), Handler)
         server.daemon_threads = True
         self._httpd = server
+        return server
+
+    def start(self) -> None:
+        server = self._build_server()
         self._thread = threading.Thread(target=server.serve_forever, daemon=True)
         self._thread.start()
 
@@ -296,24 +300,11 @@ class ApplicationApiServer:
 
     def serve_forever(self) -> None:
         """Run the configured server in the foreground for the service entry point."""
-        if self._httpd is not None:
-            raise RuntimeError("application API server is already started")
-        self._credentials = self.config.resolve_credentials(self.core.config.secret_references)
-        transport = self
-
-        class Handler(BaseHTTPRequestHandler):
-            def do_GET(self) -> None:  # noqa: N802 - stdlib callback name
-                transport._handle(self)
-
-            def log_message(self, format: str, *args: object) -> None:
-                return
-
-        self._httpd = ThreadingHTTPServer((self.config.host, self.config.port), Handler)
-        self._httpd.daemon_threads = True
+        server = self._build_server()
         try:
-            self._httpd.serve_forever()
+            server.serve_forever()
         finally:
-            self._httpd.server_close()
+            server.server_close()
             self._httpd = None
             self._credentials = None
 

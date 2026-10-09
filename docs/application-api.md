@@ -23,7 +23,7 @@ Enable the transport with static bootstrap configuration. Credential values are 
 }
 ```
 
-The only supported scopes are `state:read` and `events:consume`. A credential can list both. The service resolves each opaque bearer token at startup and does not expose it in configuration, responses, traces, or a runtime issuer. Missing configuration, an unresolved secret, an invalid bearer token, and an absent bearer token deny access. Bindings are restricted to loopback; a deployment may place its own TLS/reverse-proxy boundary in front of the local service.
+The only supported scopes are `state:read` and `events:consume`. A credential can list both. The service resolves each opaque bearer token at startup and does not expose it in configuration, responses, traces, or a runtime issuer. Missing configuration, an unresolved secret, an invalid bearer token, and an absent bearer token deny access. Bindings are restricted to IPv4 loopback (`127.0.0.1`); a deployment may place its own TLS/reverse-proxy boundary in front of the local service.
 
 Start the configured transport instead of the JSONL acquisition worker:
 

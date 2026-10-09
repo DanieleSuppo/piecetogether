@@ -16,6 +16,10 @@ from piecetogether.application_api import (
     ApplicationCredential,
 )
 from piecetogether.core import Bootstrap, Core
+from piecetogether.proposals import (
+    ClaimOperation, ContextOperation, EntityOperation, GroundingPlanOperation,
+)
+from piecetogether.references import ReferenceConfig
 
 
 class ApplicationApiTests(unittest.TestCase):
@@ -145,6 +149,118 @@ class ApplicationApiTests(unittest.TestCase):
         self.assertIsNone(event_second["next_cursor"])
         self.assertEqual(context["entities"][0]["id"], self.entity_id)
 
+    def test_cursors_reject_changed_queries_and_stale_state_but_keep_event_watermark(self):
+        exposed = self.flow.next_claim(self.core.inspect_history(), 4, "corrects")
+        self.core, _, result = self.flow.accept_items(exposed, revision=1)
+        self.assertEqual(result["status"], "completed")
+        with patch.dict(os.environ, {
+            "PT_API_READER": "reader-secret", "PT_API_CONSUMER": "consumer-secret",
+            "PT_API_BOTH": "both-secret",
+        }, clear=True):
+            server = self.server()
+            _, first = self.request(server, "/v1/state?actor_id=a1&limit=1", "reader-secret")
+            cursor = first["next_cursor"]
+            self.assertIsNotNone(cursor)
+            for path in (
+                "/v1/state?actor_id=a2&cursor=" + cursor,
+                "/v1/state?actor_id=a1&cursor=invalid",
+                "/v1/state?actor_id=a1&entity_id=" + self.entity_id,
+                "/v1/state?actor_id=a1&actor_id=a2",
+                "/v1/state?actor_id=a1&limit=101",
+            ):
+                with self.subTest(path=path):
+                    self.assertEqual(self.request(server, path, "reader-secret")[0], 400)
+            _, events = self.request(server, "/v1/events?limit=1", "consumer-secret")
+            exposed = self.flow.next_claim(self.core.inspect_history(), 5, "supersedes")
+            self.core, _, result = self.flow.accept_items(exposed, revision=2)
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(self.request(
+                server, "/v1/state?actor_id=a1&cursor=" + cursor, "reader-secret"
+            ), (400, {"error": "invalid_cursor"}))
+            status, next_events = self.request(
+                server, "/v1/events?limit=1&cursor=" + events["next_cursor"], "consumer-secret"
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual([event["semantic_revision"] for event in next_events["events"]], [2])
+            self.assertIsNone(next_events["next_cursor"])
+            _, fresh_events = self.request(server, "/v1/events", "consumer-secret")
+            self.assertEqual([event["semantic_revision"] for event in fresh_events["events"]], [1, 2, 3])
+
+    def test_public_filters_exclude_other_actor_targets_and_pending_acquisition(self):
+        operations = (
+            EntityOperation("other", "Subject"),
+            ContextOperation("other-context", ("other",)),
+            ClaimOperation("count", "other", "count", 42, "p"),
+            GroundingPlanOperation("p", ("count",), "explicit", resolution_ids=("other", "other-context")),
+        )
+        other = self.flow.core(operations)
+        result = other.accept(self.flow.message(sender="s2", text="There are 42"))
+        self.core, _, result = self.flow.accept_items(
+            other.inspect(result["communication_id"]), revision=1, evidence={"sender": "s2"}
+        )
+        self.assertEqual(result["status"], "completed")
+        self.flow.expose()  # pending candidates must not become public targets
+        acquisition = Core(
+            self.flow.config, model=fixtures.ProposalModel((), response_intent="retrieval"),
+            contract_provider=fixtures.ContractProvider(self.flow.contract),
+        )
+        result = acquisition.accept(self.flow.message(text="List all historical assertions"))
+        self.assertEqual(set(result), {"communication_id", "status", "reply"})
+        self.assertNotIn(self.entity_id, result["reply"])
+        with patch.dict(os.environ, {
+            "PT_API_READER": "reader-secret", "PT_API_CONSUMER": "consumer-secret",
+            "PT_API_BOTH": "both-secret",
+        }, clear=True):
+            server = self.server()
+            status, first_actor = self.request(server, "/v1/state?actor_id=a1", "reader-secret")
+            self.assertEqual(status, 200)
+            self.assertEqual([entity["id"] for entity in first_actor["entities"]], [self.entity_id])
+            self.assertEqual([context["id"] for context in first_actor["contexts"]], [self.context_id])
+            _, second_actor = self.request(server, "/v1/state?actor_id=a2", "reader-secret")
+            self.assertEqual([group["heads"][0]["value"] for group in second_actor["assertion_sets"]], [42])
+            self.assertNotIn(self.entity_id, json.dumps(second_actor))
+            for path, expected in (("/v1/state?actor_id=unknown", 200),
+                                   ("/v1/state?entity_id=unknown", 404),
+                                   ("/v1/state?context_id=" + self.entity_id, 404),
+                                   ("/inspect", 404)):
+                with self.subTest(path=path):
+                    status, body = self.request(server, path, "reader-secret")
+                    self.assertEqual(status, expected)
+                    self.assertNotIn(self.entity_id, json.dumps(body))
+            _, events = self.request(server, "/v1/events", "consumer-secret")
+            for body in (first_actor, second_actor, events):
+                serialized = json.dumps(body)
+                for forbidden in ("candidate_claims", "trace", "proposal", "reader-secret", "consumer-secret"):
+                    self.assertNotIn(forbidden, serialized)
+
+    def test_state_returns_conflicting_provenance_classes_and_correction_lineage(self):
+        for revision, value, relation in ((1, 4, "corrects"), (2, 5, "contradicts")):
+            exposed = self.flow.next_claim(self.core.inspect_history(), value, relation)
+            self.core, _, result = self.flow.accept_items(exposed, revision=revision)
+            self.assertEqual(result["status"], "completed")
+        reference_file = Path(self.flow.directory.name) / "reference.json"
+        reference_file.write_text(json.dumps([{
+            "target_id": self.entity_id, "concept": "count", "value": 6,
+            "source_reference": "records/subject-1", "observed_version": "v1",
+        }]))
+        self.flow.config = replace(self.flow.config, reference_state=ReferenceConfig("application", reference_file))
+        with patch.dict(os.environ, {
+            "PT_API_READER": "reader-secret", "PT_API_CONSUMER": "consumer-secret",
+            "PT_API_BOTH": "both-secret",
+        }, clear=True):
+            server = self.server()
+            status, body = self.request(server, f"/v1/state?entity_id={self.entity_id}", "reader-secret")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["revision"], 4)
+        group = body["assertion_sets"][0]
+        self.assertEqual([head["value"] for head in group["heads"]], [4, 5, 6])
+        self.assertEqual([head["provenance_class"] for head in group["heads"]],
+                         ["grounded", "grounded", "authoritative"])
+        self.assertEqual([head["value"] for head in group["lineage"]], [3])
+        self.assertFalse(group["lineage"][0]["current"])
+        self.assertEqual(len(group["conflicts"]), 3)
+        self.assertEqual(group["heads"][-1]["provenance"]["provider_id"], "application")
+
     def test_bootstrap_accepts_only_declared_scoped_secret_credentials(self):
         config_path = Path(self.flow.directory.name) / "deployment.json"
         base = {
@@ -167,6 +283,23 @@ class ApplicationApiTests(unittest.TestCase):
         with patch.dict(os.environ, {"PT_API_READER": "reader-secret"}, clear=True):
             with self.assertRaises(ValueError):
                 Bootstrap.from_file(config_path)
+
+    def test_bootstrap_rejects_hosts_the_transport_cannot_bind(self):
+        config_path = Path(self.flow.directory.name) / "deployment.json"
+        for host in ("::1", "0.0.0.0", "localhost"):
+            with self.subTest(host=host):
+                config_path.write_text(json.dumps({
+                    "database": "api.sqlite3",
+                    "identities": {"development:s1": "a1"},
+                    "secret_references": {"reader": "PT_API_READER"},
+                    "application_api": {
+                        "host": host, "port": 0,
+                        "credentials": [{"secret_reference": "reader", "scopes": ["state:read"]}],
+                    },
+                }))
+                with patch.dict(os.environ, {"PT_API_READER": "reader-secret"}, clear=True):
+                    with self.assertRaises(ValueError):
+                        Bootstrap.from_file(config_path)
 
     def test_credentials_rotate_only_by_changed_deployment_configuration_and_restart(self):
         with patch.dict(os.environ, {
