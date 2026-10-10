@@ -20,7 +20,10 @@ from . import context, history, projections, references, view
 from .application_api import ApplicationApiConfig
 from .artifact_store import LocalArtifactStore, StagedContent
 from .contracts import DeclarativeContractProvider, DomainContractProvider
-from .email_channel import CAPABILITIES as EMAIL_CAPABILITIES, DeliveryResult, EmailChannel, EmailConfig, SmtpTransport, address, message_ids
+from .email_channel import (
+    CAPABILITIES as EMAIL_CAPABILITIES, DeliveryResult, EmailChannel, EmailConfig,
+    ImapConfig, SmtpTransport, address, message_ids,
+)
 from .proposals import (
     CandidateClaim,
     ContextRequestOperation,
@@ -33,6 +36,27 @@ from .proposals import (
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _load_local_env(path: Path) -> None:
+    """Load local deployment secrets without overriding the process environment."""
+    try:
+        lines = path.read_text().splitlines()
+    except FileNotFoundError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        if line.startswith('export '):
+            line = line[7:].lstrip()
+        name, separator, value = line.partition('=')
+        if not separator or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name):
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+            value = value[1:-1]
+        os.environ.setdefault(name, value)
 
 
 @dataclass(frozen=True)
@@ -51,6 +75,7 @@ class Bootstrap:
     projection: projections.ProjectionConfig | None = None
     application_api: ApplicationApiConfig | None = None
     email: EmailConfig | None = None
+    imap: ImapConfig | None = None
 
     def __post_init__(self) -> None:
         if self.projection is not None and not isinstance(self.projection, projections.ProjectionConfig):
@@ -69,6 +94,8 @@ class Bootstrap:
             raise ValueError('only static configured adapters are available')
         if (self.channel == 'email') != isinstance(self.email, EmailConfig):
             raise ValueError('Email channel requires a static Email transport configuration')
+        if self.imap is not None and self.channel != 'email':
+            raise ValueError('IMAP acquisition requires the Email channel')
         expected = EMAIL_CAPABILITIES if self.channel == 'email' else ('receive', 'reply')
         if set(self.capabilities) != set(expected):
             raise ValueError('enabled capabilities must match the static channel declaration')
@@ -113,9 +140,13 @@ class Bootstrap:
         if (self.email is not None and self.email.password_secret_reference is not None
                 and self.email.password_secret_reference not in self.secret_references):
             raise ValueError('SMTP credentials must use configured secret references')
+        if (self.imap is not None
+                and self.imap.password_secret_reference not in self.secret_references):
+            raise ValueError('IMAP credentials must use configured secret references')
 
     @classmethod
     def from_file(cls, path: Path) -> "Bootstrap":
+        _load_local_env(path.parent / '.env')
         data = json.loads(path.read_text())
         allowed = {
             "database",
@@ -132,6 +163,7 @@ class Bootstrap:
             "projection",
             "application_api",
             "email",
+            "imap",
         }
         if not isinstance(data, dict) or set(data) - allowed:
             raise ValueError("invalid bootstrap configuration")
@@ -144,6 +176,8 @@ class Bootstrap:
         database = Path(data.pop("database"))
         if 'email' in data:
             data['email'] = EmailConfig.from_dict(data['email'])
+        if 'imap' in data:
+            data['imap'] = ImapConfig.from_dict(data['imap'])
         if 'projection' in data:
             if not isinstance(data['projection'], dict):
                 raise ValueError('projection must be an object')
@@ -178,9 +212,11 @@ class Bootstrap:
             data["artifact_store"] = path.parent / data["artifact_store"]
         data["capabilities"] = tuple(data.get("capabilities", ["receive", "reply"]))
         config = cls(database=path.parent / database, **data)
+        deferred = {config.imap.password_secret_reference} if config.imap is not None else set()
         if any(
             not os.environ.get(reference)
-            for reference in config.secret_references.values()
+            for name, reference in config.secret_references.items()
+            if name not in deferred
         ):
             raise ValueError("a deployment secret reference is unresolved")
         return config
@@ -639,6 +675,24 @@ class Core:
         self._dispatch_events_after_commit()
         return result
 
+    def recover_pending(self, channel: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        """Resume saved canonical ingress without requiring the source transport to retain mail."""
+        if channel is not None and channel != self.config.channel:
+            raise ValueError('channel is disabled')
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError('limit must be a bounded integer')
+        with connect(self.config.database) as db:
+            rows = db.execute("SELECT inbound FROM turns WHERE status NOT IN ('completed', 'rejected') "
+                              "ORDER BY rowid LIMIT ?", (limit,)).fetchall()
+        fields = {'channel', 'sender', 'idempotency_key', 'text', 'sent_at', 'thread_id', 'reply_to',
+                  'transport_message_id', 'transport_reply_to', 'references', 'subject'}
+        outcomes = []
+        for row in rows:
+            inbound = json.loads(row['inbound'])
+            outcomes.append(self.accept({name: inbound[name] for name in fields if name in inbound
+                                         and inbound[name] is not None}))
+        return outcomes
+
     def _accept(self, payload: Any) -> dict[str, Any]:
         required = {"channel", "sender", "idempotency_key", "text", "sent_at"}
         optional = {'thread_id', 'reply_to', 'attachments', 'transport_message_id',
@@ -1085,6 +1139,13 @@ class Core:
                 for name in ("inbound", "proposal", "outbound", "trace")
             },
         }
+
+    def inspect_email_acquisition(self) -> list[dict[str, str | None]]:
+        """Operator-only Email acquisition checkpoints; never sender or State API data."""
+        inspect = getattr(self.channel, 'acquisition_outcomes', None)
+        if not callable(inspect):
+            raise ValueError('Email acquisition is unavailable')
+        return cast(list[dict[str, str | None]], inspect())
 
     def current_view(self) -> dict[str, Any]:
         """Trusted projection for local consumers; never a sender retrieval path."""

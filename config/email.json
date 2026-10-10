@@ -13,5 +13,16 @@
     "security": "plain",
     "timeout_seconds": 30
   },
-  "secret_references": {}
+  "secret_references": {"imap-password": "PT_IMAP_PASSWORD"},
+  "imap": {
+    "host": "mail.example.com",
+    "port": 993,
+    "security": "tls",
+    "mailbox": "INBOX",
+    "username": "mailbox-user",
+    "password_secret_reference": "imap-password",
+    "timeout_seconds": 30,
+    "poll_seconds": 30,
+    "batch_size": 32
+  }
 }

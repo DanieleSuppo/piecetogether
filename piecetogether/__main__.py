@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .application_api import ApplicationApiServer
 from .core import Bootstrap, Core
-from .email_channel import MAX_EMAIL_BYTES
+from .email_channel import EmailAcquisitionWorker, EmailChannel, ImapTransport, MAX_EMAIL_BYTES
 
 MAX_LINE = 65536
 
@@ -24,6 +24,7 @@ def main() -> int:
         "--serve-api", action="store_true", help="serve the configured application API"
     )
     mode.add_argument('--receive-email', action='store_true', help='receive one MIME Email from stdin')
+    mode.add_argument('--serve-email', action='store_true', help='poll the configured IMAP mailbox')
     args = parser.parse_args()
     try:
         core = Core(Bootstrap.from_file(args.config))
@@ -43,6 +44,21 @@ def main() -> int:
         except (ValueError, OSError, sqlite3.Error):
             print("Invalid or unavailable application API configuration/state.", file=sys.stderr)
             return 1
+        return 0
+    if args.serve_email:
+        if core.config.channel != 'email' or core.config.imap is None or not isinstance(core.channel, EmailChannel):
+            print('Email IMAP acquisition is not configured.', file=sys.stderr)
+            return 1
+        try:
+            EmailAcquisitionWorker(core, core.channel,
+                                   ImapTransport(core.config.imap, core.config.secret_references,
+                                                 core.channel.acquired),
+                                   core.config.imap).run()
+        except (ValueError, TypeError, RecursionError, OSError, sqlite3.Error):
+            print('Invalid or unavailable Email acquisition configuration/state.', file=sys.stderr)
+            return 1
+        except KeyboardInterrupt:
+            return 0
         return 0
     if args.receive_email:
         if core.config.channel != 'email':

@@ -403,13 +403,201 @@ class EmailTests(unittest.TestCase):
             finally:
                 server.close()
 
+    def test_imap_acquisition_persists_then_replies_through_the_configured_email_channel(self):
+        from piecetogether.email_channel import EmailAcquisitionWorker, ImapConfig
+
+        class CapturedImap:
+            def fetch(self):
+                return '42', (('7', RAW),)
+
+        transport = CapturedTransport()
+        core = self.core(transport)
+        worker = EmailAcquisitionWorker(core, core.channel, CapturedImap(), ImapConfig(
+            'mail.example.com', 'operator', 'imap-password'))
+        self.assertEqual(worker.poll_once(), 1)
+        outcomes = core.inspect_email_acquisition()
+        self.assertEqual(outcomes[0]['uidvalidity'], '42')
+        self.assertEqual(outcomes[0]['uid'], '7')
+        self.assertEqual(outcomes[0]['status'], 'acquired')
+        self.assertEqual(len(transport.messages), 1)
+        self.assertEqual(worker.poll_once(), 0)
+        self.assertEqual(len(transport.messages), 1)
+
+    def test_imap_unsupported_message_does_not_block_later_messages_and_uidvalidity_is_checkpointed(self):
+        from piecetogether.email_channel import EmailAcquisitionWorker, ImapConfig
+
+        class CapturedImap:
+            def __init__(self, uidvalidity):
+                self.uidvalidity = uidvalidity
+            def fetch(self):
+                return self.uidvalidity, (('1', b'not an email'), ('2', RAW))
+
+        transport = CapturedTransport()
+        core = self.core(transport)
+        config = ImapConfig('mail.example.com', 'operator', 'imap-password')
+        self.assertEqual(EmailAcquisitionWorker(core, core.channel, CapturedImap('1'), config).poll_once(), 2)
+        self.assertEqual([item['status'] for item in core.inspect_email_acquisition()], ['unsupported', 'acquired'])
+        self.assertEqual(len(transport.messages), 1)
+        self.assertEqual(EmailAcquisitionWorker(core, core.channel, CapturedImap('2'), config).poll_once(), 2)
+        self.assertEqual(len(transport.messages), 1)
+        self.assertEqual([(item['uidvalidity'], item['uid']) for item in core.inspect_email_acquisition()],
+                         [('1', '1'), ('1', '2'), ('2', '1'), ('2', '2')])
+
+    def test_acquisition_checkpoint_crash_redelivers_to_durable_core_without_duplicate_reply(self):
+        from piecetogether.email_channel import EmailAcquisitionWorker, ImapConfig
+
+        class CapturedImap:
+            def fetch(self):
+                return '42', (('7', RAW),)
+
+        config = ImapConfig('mail.example.com', 'operator', 'imap-password')
+        first_transport = CapturedTransport()
+        first = self.core(first_transport)
+        original_record = first.channel.record_acquisition
+        def crash_before_checkpoint(*args):
+            raise KeyboardInterrupt()
+        first.channel.record_acquisition = crash_before_checkpoint
+        with self.assertRaises(KeyboardInterrupt):
+            EmailAcquisitionWorker(first, first.channel, CapturedImap(), config).poll_once()
+        self.assertEqual(len(first_transport.messages), 1)
+
+        second_transport = CapturedTransport()
+        restarted = self.core(second_transport)
+        self.assertEqual(EmailAcquisitionWorker(restarted, restarted.channel, CapturedImap(), config).poll_once(), 1)
+        self.assertEqual(len(second_transport.messages), 0)
+        self.assertEqual(restarted.inspect_email_acquisition()[0]['status'], 'acquired')
+        first.channel.record_acquisition = original_record
+
+    def test_documented_email_service_path_loads_local_env_without_overriding_process_environment(self):
+        from piecetogether.__main__ import main
+        data = json.loads(self.path.read_text())
+        data['imap'] = {'host': 'mail.example.com', 'username': 'operator',
+                        'password_secret_reference': 'imap-password', 'mailbox': 'Support'}
+        data['secret_references'] = {'imap-password': 'PT_IMAP_PASSWORD'}
+        self.path.write_text(json.dumps(data))
+        (self.path.parent / '.env').write_text('PT_IMAP_PASSWORD=from-file\\n')
+        with (patch.object(sys, 'argv', ['piecetogether', '--config', str(self.path), '--serve-email']),
+              patch.dict(os.environ, {'PT_IMAP_PASSWORD': 'from-process'}, clear=True),
+              patch('piecetogether.__main__.EmailAcquisitionWorker.run') as run):
+            self.assertEqual(main(), 0)
+            self.assertEqual(os.environ.get('PT_IMAP_PASSWORD'), 'from-process')
+        self.assertTrue(run.called)
+
+    def test_email_worker_recovers_saved_work_without_mail_still_available_and_backs_off_disconnects(self):
+        from piecetogether.email_channel import EmailAcquisitionWorker, ImapConfig
+
+        class FailingModel:
+            def propose(self, inbound, version, context_pack):
+                raise OSError('temporary')
+
+        failed_transport = CapturedTransport()
+        first = self.core(failed_transport, model=FailingModel())
+        pending = first.accept_transport(RAW)
+        self.assertEqual(pending['status'], 'retryable')
+        recovered_transport = CapturedTransport()
+        restarted = self.core(recovered_transport)
+        config = ImapConfig('mail.example.com', 'operator', 'imap-password', poll_seconds=2)
+        waits = []
+
+        class UnavailableMailbox:
+            def fetch(self):
+                return '4', ()
+
+        def stop_after_recovery(delay):
+            waits.append(delay)
+            raise KeyboardInterrupt()
+
+        with self.assertRaises(KeyboardInterrupt):
+            EmailAcquisitionWorker(restarted, restarted.channel, UnavailableMailbox(), config,
+                                   stop_after_recovery).run()
+        self.assertEqual(restarted.inspect(pending['communication_id'])['status'], 'completed')
+        self.assertEqual(len(recovered_transport.messages), 1)
+        self.assertEqual(waits, [2])
+
+        class FlakyMailbox:
+            def __init__(self):
+                self.calls = 0
+            def fetch(self):
+                self.calls += 1
+                if self.calls == 1:
+                    raise OSError('down')
+                return '4', ()
+
+        waits = []
+        def stop_after_second_wait(delay):
+            waits.append(delay)
+            if len(waits) == 2:
+                raise KeyboardInterrupt()
+
+        with self.assertRaises(KeyboardInterrupt):
+            EmailAcquisitionWorker(restarted, restarted.channel, FlakyMailbox(), config,
+                                   stop_after_second_wait).run()
+        self.assertEqual(waits, [2, 2])
+
+    def test_imap_wire_adapter_uses_validated_tls_readonly_uid_and_body_peek(self):
+        from piecetogether.email_channel import ImapConfig, ImapTransport
+
+        class CapturedSession:
+            def __init__(self):
+                self.calls = []
+                self.tls = None
+            def starttls(self, ssl_context):
+                self.tls = ssl_context
+            def login(self, username, password):
+                self.calls.append(('login', username, password))
+            def select(self, mailbox, readonly):
+                self.calls.append(('select', mailbox, readonly))
+                return 'OK', [b'2']
+            def response(self, name):
+                self.calls.append(('response', name))
+                return 'UIDVALIDITY', [b'99']
+            def uid(self, command, *args):
+                self.calls.append(('uid', command, *args))
+                if command == 'search':
+                    return 'OK', [b'7 8']
+                return 'OK', [(b'7 (BODY[] {3})', RAW)]
+            def logout(self):
+                self.calls.append(('logout',))
+
+        for security in ('tls', 'starttls'):
+            with self.subTest(security=security):
+                session = CapturedSession()
+                config = ImapConfig('mail.example.com', 'operator', 'imap-password', security=security)
+                with (patch.dict(os.environ, {'PT_IMAP_PASSWORD': 'secret-not-for-output'}, clear=True),
+                      patch('piecetogether.email_channel.imaplib.IMAP4_SSL', return_value=session) as implicit,
+                      patch('piecetogether.email_channel.imaplib.IMAP4', return_value=session)):
+                    fetched = ImapTransport(config, {'imap-password': 'PT_IMAP_PASSWORD'}).fetch()
+                self.assertEqual(fetched, ('99', (('7', RAW), ('8', RAW))))
+                self.assertIn(('select', 'INBOX', True), session.calls)
+                self.assertIn(('uid', 'fetch', b'7', '(BODY.PEEK[])'), session.calls)
+                if security == 'tls':
+                    self.assertTrue(implicit.call_args.kwargs['ssl_context'].check_hostname)
+                else:
+                    self.assertTrue(session.tls.check_hostname)
+                self.assertNotIn('secret-not-for-output', repr(config))
+
+        session = CapturedSession()
+        with (patch.dict(os.environ, {'PT_IMAP_PASSWORD': 'secret-not-for-output'}, clear=True),
+              patch('piecetogether.email_channel.imaplib.IMAP4_SSL', return_value=session)):
+            fetched = ImapTransport(ImapConfig('mail.example.com', 'operator', 'imap-password'),
+                                    {'imap-password': 'PT_IMAP_PASSWORD'},
+                                    lambda mailbox, validity, uid: uid == '7').fetch()
+        self.assertEqual(fetched, ('99', (('8', RAW),)))
+        self.assertNotIn(('uid', 'fetch', b'7', '(BODY.PEEK[])'), session.calls)
+
     def test_email_bootstrap_rejects_unsupported_capabilities_transports_and_missing_secrets(self):
         original = json.loads(self.path.read_text())
         for change in ({'capabilities': ['receive', 'reply', 'attachments']},
                        {'email': {'address': 'core@example.com', 'host': 'smtp.example.com', 'security': 'plain'}},
                        {'email': {'address': 'core@example.com', 'host': 'localhost', 'adapter': 'dynamic'}},
                        {'email': {'address': 'core@example.com', 'host': 'localhost', 'security': 'tls',
-                                  'username': 'operator', 'password_secret_reference': 'missing'}}):
+                                  'username': 'operator', 'password_secret_reference': 'missing'}},
+                       {'imap': {'host': 'mail.example.com', 'username': 'operator',
+                                 'password_secret_reference': 'missing'}},
+                       {'imap': {'host': 'mail.example.com', 'username': 'operator',
+                                 'password_secret_reference': 'missing', 'security': 'plain'}},
+                       {'imap': {'host': 'mail.example.com', 'username': 'operator',
+                                 'password_secret_reference': 'missing', 'unknown': True}}):
             with self.subTest(change=change):
                 self.path.write_text(json.dumps({**original, **change}))
                 with self.assertRaises(ValueError):
