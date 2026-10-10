@@ -1,5 +1,6 @@
 """One semantic Email channel, with a statically configured SMTP transport."""
 
+import hashlib
 import imaplib
 import os
 import re
@@ -96,11 +97,16 @@ class ImapConfig:
                 or type(self.port) is not int or not 1 <= self.port <= 65535
                 or self.security not in ('starttls', 'tls')
                 or not isinstance(self.mailbox, str) or not self.mailbox.strip() or len(self.mailbox) > 256
-                or '\\r' in self.mailbox or '\\n' in self.mailbox
+                or '\r' in self.mailbox or '\n' in self.mailbox
                 or type(self.timeout_seconds) not in (float, int) or not 0 < self.timeout_seconds <= 300
                 or type(self.poll_seconds) not in (float, int) or not 0 < self.poll_seconds <= 86400
                 or type(self.batch_size) is not int or not 1 <= self.batch_size <= 100):
             raise ValueError('invalid static IMAP acquisition configuration')
+
+    @property
+    def checkpoint_key(self) -> str:
+        scope = '\\0'.join((self.host, str(self.port), self.security, self.username, self.mailbox))
+        return hashlib.sha256(scope.encode('utf-8')).hexdigest()
 
     @classmethod
     def from_dict(cls, data: Any) -> 'ImapConfig':
@@ -344,7 +350,10 @@ class ImapTransport:
                 client = imaplib.IMAP4(config.host, config.port, timeout=config.timeout_seconds)
                 client.starttls(ssl_context=ssl.create_default_context())
             client.login(config.username, self.password)
-            status, _ = client.select(config.mailbox, readonly=True)
+            mailbox = config.mailbox
+            if any(char.isspace() for char in mailbox):
+                mailbox = '"' + mailbox.replace('\\', '\\\\').replace('"', '\\"') + '"'
+            status, _ = client.select(mailbox, readonly=True)
             if status != 'OK':
                 raise OSError('IMAP mailbox is unavailable')
             validity = client.response('UIDVALIDITY')[1]
@@ -360,18 +369,23 @@ class ImapTransport:
                 if not raw_uid.isdigit():
                     raise OSError('IMAP returned an invalid UID')
                 uid = raw_uid.decode('ascii')
-                if self.acquired is not None and self.acquired(config.mailbox, uidvalidity, uid):
+                if self.acquired is not None and self.acquired(config.checkpoint_key, uidvalidity, uid):
                     continue
                 if len(messages) >= config.batch_size:
                     break
-                status, data = client.uid('fetch', raw_uid, '(BODY.PEEK[])')
-                if status != 'OK' or not data:
+                status, data = client.uid('fetch', raw_uid,
+                                          f'(UID BODY.PEEK[]<0.{MAX_EMAIL_BYTES + 1}>)')
+                if status != 'OK':
                     raise OSError('IMAP message fetch failed')
-                payload = next((item[1] for item in data if isinstance(item, tuple)
-                                and len(item) == 2 and isinstance(item[1], bytes)), None)
-                if payload is None:
-                    raise OSError('IMAP message fetch was empty')
-                messages.append((uid, payload))
+                literals = [item for item in data or () if isinstance(item, tuple) and len(item) == 2
+                            and isinstance(item[0], bytes) and isinstance(item[1], bytes)]
+                if not literals:
+                    continue  # A UID can be expunged between SEARCH and FETCH; never checkpoint it.
+                metadata = b' '.join(item[0] if isinstance(item, tuple) else item
+                                     for item in data if isinstance(item, (tuple, bytes)))
+                if len(literals) != 1 or re.findall(rb'\bUID +(\d+)\b', metadata) != [raw_uid]:
+                    raise OSError('IMAP returned inconsistent message identity')
+                messages.append((uid, literals[0][1]))
             return uidvalidity, tuple(messages)
         except (imaplib.IMAP4.error, OSError, ssl.SSLError) as error:
             raise OSError('IMAP acquisition unavailable') from error
@@ -387,9 +401,10 @@ class EmailAcquisitionWorker:
     """Poll one configured mailbox; Core persistence is the acquisition boundary."""
 
     def __init__(self, core: 'Core', channel: EmailChannel, transport: InboundEmailTransport,
-                 config: ImapConfig, sleep: Callable[[float], None] = time.sleep):
-        self.core, self.channel, self.transport, self.config, self.sleep = (
-            core, channel, transport, config, sleep)
+                 config: ImapConfig, sleep: Callable[[float], None] | None = None):
+        self.core, self.channel, self.transport, self.config = core, channel, transport, config
+        self.sleep = sleep or time.sleep
+        self.recovery_cursor = 0
 
     def poll_once(self) -> int:
         uidvalidity, messages = self.transport.fetch()
@@ -399,29 +414,34 @@ class EmailAcquisitionWorker:
         for uid, raw in messages:
             if not uid.isdigit():
                 raise OSError('IMAP returned an invalid UID')
-            if self.channel.acquired(self.config.mailbox, uidvalidity, uid):
+            if self.channel.acquired(self.config.checkpoint_key, uidvalidity, uid):
                 continue
             try:
                 result = self.core.accept_transport(raw)
             except ValueError:
                 # Unsupported normalized mail is a durable operational outcome, never a queue blocker.
-                self.channel.record_acquisition(self.config.mailbox, uidvalidity, uid,
+                self.channel.record_acquisition(self.config.checkpoint_key, uidvalidity, uid,
                                                 'unsupported', None, 'unsupported_message')
             else:
-                self.channel.record_acquisition(self.config.mailbox, uidvalidity, uid, 'acquired',
+                self.channel.record_acquisition(self.config.checkpoint_key, uidvalidity, uid, 'acquired',
                                                 result['communication_id'], result['status'])
             acquired += 1
         return acquired
 
+    def _recover_pending(self) -> None:
+        _, cursor = self.core.recover_email_pending(self.recovery_cursor)
+        self.recovery_cursor = cursor if cursor else 0
+
     def run(self) -> None:
         backoff = self.config.poll_seconds
-        self.core.recover_pending(channel='email')
+        maximum_backoff = max(self.config.poll_seconds, 300)
         while True:
             try:
+                self._recover_pending()
                 self.poll_once()
             except (OSError, sqlite3.Error):
                 self.sleep(backoff)
-                backoff = min(backoff * 2, 300)
+                backoff = min(backoff * 2, maximum_backoff)
             else:
                 backoff = self.config.poll_seconds
                 self.sleep(backoff)

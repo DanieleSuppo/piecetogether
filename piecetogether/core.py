@@ -59,6 +59,29 @@ def _load_local_env(path: Path) -> None:
         os.environ.setdefault(name, value)
 
 
+def _imap_from_environment(data: Any) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        raise ValueError('imap must be a static acquisition object')
+    configured = dict(data)
+    text = {'PT_IMAP_HOST': 'host', 'PT_IMAP_SECURITY': 'security',
+            'PT_IMAP_MAILBOX': 'mailbox', 'PT_IMAP_USERNAME': 'username'}
+    for variable, field_name in text.items():
+        if variable in os.environ:
+            configured[field_name] = os.environ[variable]
+    for variable, field_name, parser in (
+        ('PT_IMAP_PORT', 'port', int),
+        ('PT_IMAP_TIMEOUT_SECONDS', 'timeout_seconds', float),
+        ('PT_IMAP_POLL_SECONDS', 'poll_seconds', float),
+        ('PT_IMAP_BATCH_SIZE', 'batch_size', int),
+    ):
+        if variable in os.environ:
+            try:
+                configured[field_name] = parser(os.environ[variable])
+            except ValueError as error:
+                raise ValueError('invalid IMAP environment configuration') from error
+    return configured
+
+
 @dataclass(frozen=True)
 class Bootstrap:
     database: Path
@@ -177,7 +200,7 @@ class Bootstrap:
         if 'email' in data:
             data['email'] = EmailConfig.from_dict(data['email'])
         if 'imap' in data:
-            data['imap'] = ImapConfig.from_dict(data['imap'])
+            data['imap'] = ImapConfig.from_dict(_imap_from_environment(data['imap']))
         if 'projection' in data:
             if not isinstance(data['projection'], dict):
                 raise ValueError('projection must be an object')
@@ -675,15 +698,14 @@ class Core:
         self._dispatch_events_after_commit()
         return result
 
-    def recover_pending(self, channel: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
-        """Resume saved canonical ingress without requiring the source transport to retain mail."""
-        if channel is not None and channel != self.config.channel:
-            raise ValueError('channel is disabled')
-        if type(limit) is not int or not 1 <= limit <= 1000:
-            raise ValueError('limit must be a bounded integer')
+    def recover_email_pending(self, after_rowid: int = 0, limit: int = 100) -> tuple[list[dict[str, Any]], int]:
+        """Resume bounded Email-only ingress without needing source MIME or development attachments."""
+        if type(after_rowid) is not int or after_rowid < 0 or type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError('Email recovery cursor must be bounded')
         with connect(self.config.database) as db:
-            rows = db.execute("SELECT inbound FROM turns WHERE status NOT IN ('completed', 'rejected') "
-                              "ORDER BY rowid LIMIT ?", (limit,)).fetchall()
+            rows = db.execute("SELECT rowid, inbound FROM turns WHERE channel='email' "
+                              "AND status NOT IN ('completed', 'rejected') AND rowid>? "
+                              "ORDER BY rowid LIMIT ?", (after_rowid, limit)).fetchall()
         fields = {'channel', 'sender', 'idempotency_key', 'text', 'sent_at', 'thread_id', 'reply_to',
                   'transport_message_id', 'transport_reply_to', 'references', 'subject'}
         outcomes = []
@@ -691,7 +713,7 @@ class Core:
             inbound = json.loads(row['inbound'])
             outcomes.append(self.accept({name: inbound[name] for name in fields if name in inbound
                                          and inbound[name] is not None}))
-        return outcomes
+        return outcomes, rows[-1]['rowid'] if rows else 0
 
     def _accept(self, payload: Any) -> dict[str, Any]:
         required = {"channel", "sender", "idempotency_key", "text", "sent_at"}
