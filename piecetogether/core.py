@@ -20,6 +20,7 @@ from . import context, history, projections, references, view
 from .application_api import ApplicationApiConfig
 from .artifact_store import LocalArtifactStore, StagedContent
 from .contracts import DeclarativeContractProvider, DomainContractProvider
+from .email_channel import CAPABILITIES as EMAIL_CAPABILITIES, DeliveryResult, EmailChannel, EmailConfig, SmtpTransport, address, message_ids
 from .proposals import (
     CandidateClaim,
     ContextRequestOperation,
@@ -49,6 +50,7 @@ class Bootstrap:
     artifact_store: Path | None = None
     projection: projections.ProjectionConfig | None = None
     application_api: ApplicationApiConfig | None = None
+    email: EmailConfig | None = None
 
     def __post_init__(self) -> None:
         if self.projection is not None and not isinstance(self.projection, projections.ProjectionConfig):
@@ -63,12 +65,13 @@ class Bootstrap:
             raise ValueError("contract must name a declarative file")
         if self.artifact_store is not None and not isinstance(self.artifact_store, Path):
             raise ValueError("artifact_store must name a static local directory")
-        if self.channel != "development" or self.model != "deterministic":
-            raise ValueError("only static development adapters are available")
-        if set(self.capabilities) != {"receive", "reply"}:
-            raise ValueError(
-                "development channel requires receive and reply capabilities"
-            )
+        if self.channel not in ('development', 'email') or self.model != 'deterministic':
+            raise ValueError('only static configured adapters are available')
+        if (self.channel == 'email') != isinstance(self.email, EmailConfig):
+            raise ValueError('Email channel requires a static Email transport configuration')
+        expected = EMAIL_CAPABILITIES if self.channel == 'email' else ('receive', 'reply')
+        if set(self.capabilities) != set(expected):
+            raise ValueError('enabled capabilities must match the static channel declaration')
         if (
             not isinstance(self.contract_version, str)
             or not self.contract_version.strip()
@@ -81,8 +84,9 @@ class Bootstrap:
             or not self.identities
             or any(
                 not isinstance(identity, str)
-                or not identity.startswith("development:")
-                or not identity.removeprefix("development:").strip()
+                or not identity.startswith(f'{self.channel}:')
+                or not identity.removeprefix(f'{self.channel}:').strip()
+                or (self.channel == 'email' and not address(identity.removeprefix('email:')))
                 or not isinstance(actor, str)
                 or not actor.strip()
                 for identity, actor in self.identities.items()
@@ -106,6 +110,9 @@ class Bootstrap:
             for credential in self.application_api.credentials
         ):
             raise ValueError("application API credentials must use configured secret references")
+        if (self.email is not None and self.email.password_secret_reference is not None
+                and self.email.password_secret_reference not in self.secret_references):
+            raise ValueError('SMTP credentials must use configured secret references')
 
     @classmethod
     def from_file(cls, path: Path) -> "Bootstrap":
@@ -124,6 +131,7 @@ class Bootstrap:
             "artifact_store",
             "projection",
             "application_api",
+            "email",
         }
         if not isinstance(data, dict) or set(data) - allowed:
             raise ValueError("invalid bootstrap configuration")
@@ -134,6 +142,8 @@ class Bootstrap:
         ):
             raise ValueError("capabilities must be a string array")
         database = Path(data.pop("database"))
+        if 'email' in data:
+            data['email'] = EmailConfig.from_dict(data['email'])
         if 'projection' in data:
             if not isinstance(data['projection'], dict):
                 raise ValueError('projection must be an object')
@@ -190,6 +200,11 @@ class Communication:
     thread_id: str | None = None
     reply_to: str | None = None
     attachments: tuple[dict[str, Any], ...] = ()
+    recipient: str | None = None
+    transport_message_id: str | None = None
+    transport_reply_to: str | None = None
+    references: tuple[str, ...] = ()
+    subject: str | None = None
 
 
 class ModelProvider(Protocol):
@@ -199,7 +214,10 @@ class ModelProvider(Protocol):
 
 
 class ChannelPlugin(Protocol):
-    def deliver(self, outbound: Communication) -> bool: ...
+    capabilities: tuple[str, ...]
+    def normalize(self, payload: Any) -> dict[str, Any]: ...
+    def prepare(self, outbound: Communication, inbound: Communication) -> Communication: ...
+    def deliver(self, outbound: Communication) -> bool | DeliveryResult: ...
 
 
 class DeterministicModel:
@@ -218,8 +236,18 @@ class DeterministicModel:
 class DevelopmentChannel:
     """A durable development mailbox, not a real Email/Telegram transport."""
 
+    capabilities: tuple[str, ...] = ('receive', 'reply')
+
     def __init__(self, database: Path):
         self.database = database
+
+    def normalize(self, payload: Any) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise ValueError('expected a normalized Communication')
+        return payload
+
+    def prepare(self, outbound: Communication, inbound: Communication) -> Communication:
+        return outbound
 
     def deliver(self, outbound: Communication) -> bool:
         with connect(self.database) as db:
@@ -342,7 +370,12 @@ class Core:
                                                   if config.projection is not None else None)
         self.delivery_clock = delivery_clock
         self.model = model or DeterministicModel()
-        self.channel = channel or DevelopmentChannel(config.database)
+        self.channel: ChannelPlugin = channel or (
+            EmailChannel(config.database, config.email, SmtpTransport(config.email, config.secret_references))
+            if config.email is not None else DevelopmentChannel(config.database)
+        )
+        if set(getattr(self.channel, 'capabilities', config.capabilities)) != set(config.capabilities):
+            raise ValueError('ChannelPlugin capabilities do not match deployment configuration')
         self.artifact_store = artifact_store or (LocalArtifactStore(config.artifact_store)
                                                  if config.artifact_store is not None else None)
         if config.selection.adapter == 'jev':
@@ -597,6 +630,10 @@ class Core:
                     raise KeyError(artifact_id)
             return content
 
+    def accept_transport(self, payload: Any) -> dict[str, Any]:
+        """Normalize through the configured first-party channel before durable ingress."""
+        return self.accept(self.channel.normalize(payload))
+
     def accept(self, payload: Any) -> dict[str, Any]:
         result = self._accept(payload)
         self._dispatch_events_after_commit()
@@ -604,7 +641,8 @@ class Core:
 
     def _accept(self, payload: Any) -> dict[str, Any]:
         required = {"channel", "sender", "idempotency_key", "text", "sent_at"}
-        optional = {"thread_id", "reply_to", "attachments"}
+        optional = {'thread_id', 'reply_to', 'attachments', 'transport_message_id',
+                    'transport_reply_to', 'references', 'subject'}
         if (
             not isinstance(payload, dict)
             or not required <= payload.keys()
@@ -612,9 +650,29 @@ class Core:
         ):
             raise ValueError("expected a normalized Communication")
         attachments, attachment_content = _normalize_attachments(payload.get('attachments'))
-        normalized_payload = {name: payload[name] for name in required | {"thread_id", "reply_to"}
+        normalized_payload = {name: payload[name] for name in required | optional - {'attachments'}
                               if name in payload}
         normalized_payload['attachments'] = attachments
+        if self.config.channel == 'email':
+            if attachments:
+                raise ValueError('Email attachments are not enabled')
+            for name in ('transport_message_id', 'transport_reply_to'):
+                value = normalized_payload.get(name)
+                if value is not None and (not isinstance(value, str) or len(message_ids(value)) != 1):
+                    raise ValueError('invalid Email message reference')
+            if normalized_payload.get('transport_message_id') != normalized_payload.get('idempotency_key'):
+                raise ValueError('Email ingress requires its transport Message-ID')
+        elif any(name in payload for name in ('transport_message_id', 'transport_reply_to', 'references', 'subject')):
+            raise ValueError('Email metadata requires the Email channel')
+        refs = normalized_payload.get('references', ())
+        if (not isinstance(refs, (tuple, list)) or len(refs) > 32
+                or any(not isinstance(ref, str) or len(message_ids(ref)) != 1 for ref in refs)):
+            raise ValueError('invalid Communication references')
+        normalized_payload['references'] = tuple(refs)
+        subject = normalized_payload.get('subject')
+        if subject is not None and (not isinstance(subject, str) or len(subject) > 256
+                                    or '\r' in subject or '\n' in subject):
+            raise ValueError('invalid Communication subject')
         if any(
             not isinstance(normalized_payload[name], str)
             or not normalized_payload[name].strip()
@@ -674,7 +732,7 @@ class Core:
                 (inbound.channel, inbound.sender, inbound.idempotency_key),
             ).fetchone()
             assert row is not None
-            stored = json.loads(row['inbound'])
+            stored = json.loads(json.dumps(asdict(Communication(**json.loads(row['inbound'])))))
             incoming = json.loads(json.dumps(asdict(inbound)))
             if any(stored[name] != incoming[name] for name in incoming if name not in ('id', 'received_at')):
                 raise ValueError('idempotency key already belongs to a different Communication')
@@ -840,6 +898,9 @@ class Core:
                         thread_id=inbound.thread_id,
                         reply_to=inbound.id,
                     )
+                    prepare = getattr(self.channel, 'prepare', None)
+                    if callable(prepare):
+                        outbound = prepare(outbound, inbound)
             else:
                 outbound = None
                 trace["delivery_result"] = "not_attempted"
@@ -944,8 +1005,10 @@ class Core:
                 return {"communication_id": inbound.id, "reply": None, "status": status}
             if outbound is not None and not publication_pending:
                 stage = "channel"
-                accepted = self.channel.deliver(outbound) is True
-                trace["delivery_result"] = "accepted" if accepted else "retryable"
+                delivery = self.channel.deliver(outbound)
+                accepted = delivery is True or delivery == 'success'
+                trace['delivery_result'] = ('accepted' if accepted else delivery
+                                            if delivery in ('failure', 'indeterminate') else 'retryable')
         except (OSError, ValueError, TypeError, RecursionError, sqlite3.Error) as error:
             status = 'budget_exhausted' if isinstance(error, context.BudgetExhausted) else "retryable"
             if stage == "validation":

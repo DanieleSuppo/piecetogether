@@ -1,0 +1,17 @@
+{
+  "database": "../var/email.sqlite3",
+  "channel": "email",
+  "model": "deterministic",
+  "contract_version": "development-v1",
+  "contract": "development-contract.json",
+  "capabilities": ["receive", "reply", "text", "threading"],
+  "identities": {"email:alice@example.com": "actor-1"},
+  "email": {
+    "address": "core@example.com",
+    "host": "localhost",
+    "port": 2525,
+    "security": "plain",
+    "timeout_seconds": 30
+  },
+  "secret_references": {}
+}

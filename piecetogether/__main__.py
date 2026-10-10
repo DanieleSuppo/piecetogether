@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .application_api import ApplicationApiServer
 from .core import Bootstrap, Core
+from .email_channel import MAX_EMAIL_BYTES
 
 MAX_LINE = 65536
 
@@ -15,12 +16,14 @@ MAX_LINE = 65536
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path("config/development.json"))
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--inspect", metavar="COMMUNICATION_ID", help="local operator inspection"
     )
-    parser.add_argument(
+    mode.add_argument(
         "--serve-api", action="store_true", help="serve the configured application API"
     )
+    mode.add_argument('--receive-email', action='store_true', help='receive one MIME Email from stdin')
     args = parser.parse_args()
     try:
         core = Core(Bootstrap.from_file(args.config))
@@ -41,6 +44,21 @@ def main() -> int:
             print("Invalid or unavailable application API configuration/state.", file=sys.stderr)
             return 1
         return 0
+    if args.receive_email:
+        if core.config.channel != 'email':
+            print('Email channel is not configured.', file=sys.stderr)
+            return 1
+        try:
+            result = core.accept_transport(sys.stdin.buffer.read(MAX_EMAIL_BYTES + 1))
+        except (ValueError, TypeError, RecursionError):
+            result = {'error': 'invalid_communication'}
+        except (OSError, sqlite3.Error):
+            result = {'error': 'storage_unavailable'}
+        print(json.dumps(result), flush=True)
+        return 0
+    if core.config.channel == 'email':
+        print('Email acquisition requires --receive-email.', file=sys.stderr)
+        return 1
     # ponytail: one local JSONL worker; add a work scheduler for concurrent transports.
     while True:
         line = sys.stdin.readline(MAX_LINE + 1)
@@ -53,7 +71,7 @@ def main() -> int:
                     if not line:
                         break
                 raise ValueError("input line is too large")
-            result = core.accept(json.loads(line))
+            result = core.accept_transport(json.loads(line))
         except (ValueError, TypeError, RecursionError):
             result = {"error": "invalid_communication"}
         except (OSError, sqlite3.Error):
