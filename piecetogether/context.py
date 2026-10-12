@@ -126,6 +126,17 @@ class ReferenceSelector:
 
 
 @dataclass(frozen=True)
+class MediaAttachment:
+    attachment_id: str
+    media_type: str
+    artifact_type: str
+    roles: tuple[str, ...]
+    checksum: str
+    size: int
+    content: bytes
+
+
+@dataclass(frozen=True)
 class ContextPack:
     actor_id: str
     contract_version: str
@@ -139,10 +150,14 @@ class ContextPack:
     catalogue_truncated: bool = False
     input_communication_id: str = ''
     contract_json: str = ''
+    media: tuple[MediaAttachment, ...] = ()
 
     def captured(self) -> dict[str, Any]:
-        return asdict(replace(self, catalogue=tuple(replace(record, payload_json='')
-                                                   for record in self.catalogue)))
+        captured = asdict(replace(self, catalogue=tuple(replace(record, payload_json='')
+                                                        for record in self.catalogue)))
+        captured['media'] = [{name: value for name, value in asdict(item).items() if name != 'content'}
+                             for item in self.media]
+        return captured
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> 'ContextPack':
@@ -152,6 +167,7 @@ class ContextPack:
                 'reasons': tuple(record['reasons']),
                 'disclosure_purposes': tuple(record['disclosure_purposes'])}) for record in fields[name])
         fields['budget'] = SelectionConfig(**fields['budget'])
+        fields['media'] = ()
         return cls(**fields)
 
 

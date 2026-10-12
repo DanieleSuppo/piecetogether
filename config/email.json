@@ -4,7 +4,8 @@
   "model": "deterministic",
   "contract_version": "development-v1",
   "contract": "development-contract.json",
-  "capabilities": ["receive", "reply", "text", "threading"],
+  "capabilities": ["receive", "reply", "text", "threading", "attachments"],
+  "artifact_store": "../var/email-artifacts",
   "identities": {"email:alice@example.com": "actor-1"},
   "email": {
     "address": "core@example.com",

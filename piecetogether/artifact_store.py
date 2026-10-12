@@ -114,6 +114,11 @@ class LocalArtifactStore:
     def read(self, reference: str) -> bytes:
         return (self.persistent / reference).read_bytes()
 
+    def read_staged(self, reference: str) -> bytes:
+        if not re.fullmatch(r'[0-9a-f]{32}', reference):
+            raise ValueError('invalid Artifact storage reference')
+        return (self.staging / reference).read_bytes()
+
     def remove(self, reference: str) -> None:
         """Idempotently remove publication, stage and its durable staging key."""
         if not re.fullmatch(r'[0-9a-f]{32}', reference):

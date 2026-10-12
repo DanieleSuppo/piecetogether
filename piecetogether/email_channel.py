@@ -1,5 +1,6 @@
 """One semantic Email channel, with a statically configured SMTP transport."""
 
+import base64
 import hashlib
 import imaplib
 import os
@@ -21,13 +22,22 @@ if TYPE_CHECKING:
     from .core import Communication, Core
 
 DeliveryResult = Literal['success', 'failure', 'indeterminate']
-CAPABILITIES = ('receive', 'reply', 'text', 'threading')
-MAX_EMAIL_BYTES = 131072
+CAPABILITIES = ('receive', 'reply', 'text', 'threading', 'attachments')
+TEXT_CAPABILITIES = ('receive', 'reply', 'text', 'threading')
+MAX_EMAIL_BYTES = 1_572_864
+MAX_ATTACHMENTS = 32
+MAX_ATTACHMENT_BYTES = 1_048_576
 
 
 def address(value: Any) -> bool:
     return (isinstance(value, str) and len(value) <= 254
             and re.fullmatch(r'[A-Za-z0-9.!#$%&\'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+', value) is not None)
+
+
+def valid_media(media_type: str, content: bytes) -> bool:
+    return ((media_type == 'image/png' and content.startswith(b'\x89PNG\r\n\x1a\n'))
+            or (media_type == 'image/jpeg' and content.startswith(b'\xff\xd8\xff'))
+            or (media_type == 'application/pdf' and content.startswith(b'%PDF-')))
 
 
 def message_ids(value: str) -> tuple[str, ...]:
@@ -213,24 +223,43 @@ class EmailChannel:
             sent_at = timestamp.astimezone(timezone.utc).isoformat()
         except (TypeError, ValueError, OverflowError) as error:
             raise ValueError('invalid Email Date') from error
-        # shortcut: only text/plain and multipart/alternative, add attachment acquisition in #27.
-        if mail.get_content_type() not in ('text/plain', 'multipart/alternative'):
-            raise ValueError('Email text capability requires plain text')
-        parts = list(mail.walk())
-        if any(part.get_content_disposition() == 'attachment' or part.get_filename()
-               or part.get_content_type() not in ('text/plain', 'text/html', 'multipart/alternative')
-               for part in parts):
-            raise ValueError('Email attachments are not enabled')
-        plain = [part for part in parts if part.get_content_type() == 'text/plain']
-        if len(plain) != 1:
+        parts = [part for part in mail.walk() if not part.is_multipart()]
+        supported = {'image/png', 'image/jpeg', 'application/pdf'}
+        plain = [part for part in parts if part.get_content_type() == 'text/plain'
+                 and part.get_content_disposition() != 'attachment']
+        if len(plain) > 1:
             raise ValueError('Email requires one unambiguous plain text body')
-        try:
-            decoded = plain[0].get_payload(decode=True)
-            if not isinstance(decoded, bytes) or plain[0].defects:
-                raise ValueError('malformed Email text body')
-            text = decoded.decode(plain[0].get_content_charset() or 'ascii').replace('\r\n', '\n').rstrip('\n')
-        except (LookupError, UnicodeError) as error:
-            raise ValueError('invalid Email text encoding') from error
+        attachments: list[dict[str, Any]] = []
+        total = 0
+        for part in parts:
+            media_type = part.get_content_type().lower()
+            if part in plain or media_type == 'text/html':
+                continue
+            if media_type not in supported or len(attachments) >= MAX_ATTACHMENTS:
+                raise ValueError('unsupported Email attachment')
+            try:
+                content = part.get_payload(decode=True)
+            except (ValueError, TypeError) as error:
+                raise ValueError('invalid Email attachment') from error
+            if (not isinstance(content, bytes) or not content or part.defects or not valid_media(media_type, content)
+                    or len(content) > MAX_ATTACHMENT_BYTES or total + len(content) > MAX_ATTACHMENT_BYTES):
+                raise ValueError('Email attachment exceeds bounds')
+            total += len(content)
+            attachments.append({'id': f'attachment-{len(attachments) + 1}',
+                                'content_base64': base64.b64encode(content).decode('ascii'),
+                                'media_type': media_type})
+        if plain:
+            try:
+                decoded = plain[0].get_payload(decode=True)
+                if not isinstance(decoded, bytes) or plain[0].defects:
+                    raise ValueError('malformed Email text body')
+                text = decoded.decode(plain[0].get_content_charset() or 'ascii').replace('\r\n', '\n').rstrip('\n')
+            except (LookupError, UnicodeError) as error:
+                raise ValueError('invalid Email text encoding') from error
+        elif attachments:
+            text = ''
+        else:
+            raise ValueError('Email requires text or a supported attachment')
         subject = str(mail.get('Subject', ''))
         if len(subject) > 256 or '\r' in subject or '\n' in subject:
             raise ValueError('invalid Email subject')
@@ -246,7 +275,7 @@ class EmailChannel:
                 'thread_id': refs[0] if refs else replies[0] if replies else ids[0],
                 'reply_to': reply_to, 'transport_message_id': ids[0],
                 'transport_reply_to': replies[0] if replies else None,
-                'references': refs, 'subject': subject}
+                'references': refs, 'subject': subject, 'attachments': attachments}
 
     def acquired(self, mailbox: str, uidvalidity: str, uid: str) -> bool:
         from .core import connect

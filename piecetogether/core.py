@@ -21,14 +21,18 @@ from .application_api import ApplicationApiConfig
 from .artifact_store import LocalArtifactStore, StagedContent
 from .contracts import DeclarativeContractProvider, DomainContractProvider
 from .email_channel import (
-    CAPABILITIES as EMAIL_CAPABILITIES, DeliveryResult, EmailChannel, EmailConfig,
+    CAPABILITIES as EMAIL_CAPABILITIES, TEXT_CAPABILITIES as EMAIL_TEXT_CAPABILITIES, DeliveryResult, EmailChannel, EmailConfig,
     ImapConfig, SmtpTransport, address, message_ids,
 )
 from .telegram_channel import (
-    CAPABILITIES as TELEGRAM_CAPABILITIES, BotApiTransport, TelegramChannel, TelegramConfig, numeric_id,
+    CAPABILITIES as TELEGRAM_CAPABILITIES, TEXT_CAPABILITIES as TELEGRAM_TEXT_CAPABILITIES,
+    BotApiTransport, TelegramChannel, TelegramConfig, numeric_id,
 )
+from .openai_responses import OpenAIResponsesConfig, OpenAIResponsesModel
 from .proposals import (
+    ArtifactOperation,
     CandidateClaim,
+    ClaimOperation,
     ContextRequestOperation,
     GroundingResolutionOperation,
     ReferenceResolutionOperation,
@@ -86,6 +90,19 @@ def _imap_from_environment(data: Any) -> dict[str, Any]:
 
 
 @dataclass(frozen=True)
+class MediaPolicy:
+    artifact_type: str
+    roles: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.artifact_type, str) or not self.artifact_type.strip()
+                or not isinstance(self.roles, tuple) or not self.roles
+                or any(role not in ('ephemeral-evidence', 'source-evidence', 'persistent-domain-artifact')
+                       for role in self.roles)):
+            raise ValueError('invalid static media policy')
+
+
+@dataclass(frozen=True)
 class Bootstrap:
     database: Path
     identities: dict[str, str]
@@ -103,6 +120,8 @@ class Bootstrap:
     email: EmailConfig | None = None
     imap: ImapConfig | None = None
     telegram: TelegramConfig | None = None
+    openai: OpenAIResponsesConfig | None = None
+    media_policy: dict[str, MediaPolicy] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.projection is not None and not isinstance(self.projection, projections.ProjectionConfig):
@@ -117,7 +136,10 @@ class Bootstrap:
             raise ValueError("contract must name a declarative file")
         if self.artifact_store is not None and not isinstance(self.artifact_store, Path):
             raise ValueError("artifact_store must name a static local directory")
-        if self.channel not in ('development', 'email', 'telegram') or self.model != 'deterministic':
+        if (self.channel not in ('development', 'email', 'telegram')
+                or self.model not in ('deterministic', 'openai-responses')
+                or (self.model == 'openai-responses') != isinstance(self.openai, OpenAIResponsesConfig)
+                or (self.model == 'deterministic' and self.openai is not None)):
             raise ValueError('only static configured adapters are available')
         if (self.channel == 'email') != isinstance(self.email, EmailConfig):
             raise ValueError('Email channel requires a static Email transport configuration')
@@ -127,8 +149,12 @@ class Bootstrap:
             raise ValueError('Telegram channel requires static Telegram configuration')
         expected = (EMAIL_CAPABILITIES if self.channel == 'email' else TELEGRAM_CAPABILITIES
                     if self.channel == 'telegram' else ('receive', 'reply'))
-        if set(self.capabilities) != set(expected):
+        text_expected = (EMAIL_TEXT_CAPABILITIES if self.channel == 'email' else TELEGRAM_TEXT_CAPABILITIES
+                         if self.channel == 'telegram' else ('receive', 'reply'))
+        if set(self.capabilities) not in (set(expected), set(text_expected)):
             raise ValueError('enabled capabilities must match the static channel declaration')
+        if 'attachments' in self.capabilities and self.artifact_store is None:
+            raise ValueError('attachment capability requires an ArtifactStore')
         if (
             not isinstance(self.contract_version, str)
             or not self.contract_version.strip()
@@ -178,6 +204,13 @@ class Bootstrap:
         if (self.telegram is not None
                 and self.telegram.token_secret_reference not in self.secret_references):
             raise ValueError('Telegram credentials must use configured secret references')
+        if self.openai is not None and self.openai.secret_reference not in self.secret_references:
+            raise ValueError('OpenAI credentials must use configured secret references')
+        if (not isinstance(self.media_policy, dict)
+                or any(media_type not in ('image/png', 'image/jpeg', 'application/pdf')
+                       or not isinstance(policy, MediaPolicy)
+                       for media_type, policy in self.media_policy.items())):
+            raise ValueError('media_policy must declare supported media permissions')
 
     @classmethod
     def from_file(cls, path: Path) -> "Bootstrap":
@@ -200,6 +233,8 @@ class Bootstrap:
             "email",
             "imap",
             "telegram",
+            "openai",
+            "media_policy",
         }
         if not isinstance(data, dict) or set(data) - allowed:
             raise ValueError("invalid bootstrap configuration")
@@ -238,6 +273,22 @@ class Bootstrap:
             data['telegram'] = TelegramConfig.from_dict(data['telegram'])
         if 'imap' in data:
             data['imap'] = ImapConfig.from_dict(_imap_from_environment(data['imap']))
+        if 'openai' in data:
+            data['openai'] = OpenAIResponsesConfig.from_dict(data['openai'])
+        if 'media_policy' in data:
+            raw_media_policy = data['media_policy']
+            if not isinstance(raw_media_policy, dict):
+                raise ValueError('media_policy must be an object')
+            try:
+                parsed_media_policy = {media_type: MediaPolicy(
+                    artifact_type=policy['artifact_type'], roles=tuple(policy['roles']))
+                    for media_type, policy in raw_media_policy.items()
+                    if isinstance(policy, dict) and set(policy) == {'artifact_type', 'roles'}}
+            except (KeyError, TypeError):
+                raise ValueError('invalid media_policy') from None
+            if len(parsed_media_policy) != len(raw_media_policy):
+                raise ValueError('invalid media_policy')
+            data['media_policy'] = parsed_media_policy
         if 'projection' in data:
             if not isinstance(data['projection'], dict):
                 raise ValueError('projection must be an object')
@@ -365,15 +416,32 @@ def connect(database: Path) -> Iterator[sqlite3.Connection]:
         db.close()
 
 
-def _normalize_attachments(value: Any) -> tuple[tuple[dict[str, Any], ...], dict[str, bytes]]:
+def _normalize_attachments(value: Any, recovering: bool = False) -> tuple[tuple[dict[str, Any], ...], dict[str, bytes]]:
     if value is None:
         return (), {}
     if not isinstance(value, list) or len(value) > 32:
         raise ValueError('attachments must be a bounded array')
     normalized: list[dict[str, Any]] = []
     content: dict[str, bytes] = {}
+    total = 0
     for attachment in value:
-        if not isinstance(attachment, dict) or set(attachment) - {'id', 'content_base64', 'media_type'}:
+        if not isinstance(attachment, dict):
+            raise ValueError('invalid attachment')
+        if recovering and set(attachment) == {'id', 'media_type', 'size', 'checksum'}:
+            attachment_id, media_type = attachment.get('id'), attachment.get('media_type')
+            size, checksum = attachment.get('size'), attachment.get('checksum')
+            if (not isinstance(attachment_id, str) or not attachment_id.strip() or len(attachment_id) > 256
+                    or not isinstance(media_type, str) or not media_type.strip() or len(media_type) > 256
+                    or type(size) is not int or not 0 < size <= 1_048_576
+                    or not isinstance(checksum, str) or not re.fullmatch(r'[0-9a-f]{64}', checksum)
+                    or attachment_id in {item['id'] for item in normalized}):
+                raise ValueError('invalid attachment')
+            total += size
+            if total > 1_048_576:
+                raise ValueError('attachment content exceeds bounds')
+            normalized.append(dict(attachment))
+            continue
+        if set(attachment) - {'id', 'content_base64', 'media_type'}:
             raise ValueError('invalid attachment')
         attachment_id = attachment.get('id')
         encoded = attachment.get('content_base64')
@@ -387,12 +455,16 @@ def _normalize_attachments(value: Any) -> tuple[tuple[dict[str, Any], ...], dict
             raw = base64.b64decode(encoded, validate=True)
         except (ValueError, UnicodeEncodeError) as error:
             raise ValueError('invalid attachment content') from error
-        if not raw or len(raw) > 1_048_576:
+        if not raw or len(raw) > 1_048_576 or total + len(raw) > 1_048_576:
             raise ValueError('attachment content exceeds bounds')
+        total += len(raw)
         content[attachment_id] = raw
         normalized.append({'id': attachment_id, 'media_type': media_type,
                            'size': len(raw), 'checksum': hashlib.sha256(raw).hexdigest()})
     return tuple(normalized), content
+
+
+_CREDENTIAL_URL = re.compile(r'https?://[^\s/@:]+:[^\s/@]+@|[?&](?:access_?token|api[_-]?key|token|key)=', re.I)
 
 
 def _snapshot(value: Any) -> tuple[Any, str | None]:
@@ -454,10 +526,16 @@ class Core:
         delivery_clock: Callable[[], float] = time,
     ):
         self.config = config
+        self._secret_values = tuple(value for reference in config.secret_references.values()
+                                    if isinstance((value := os.environ.get(reference)), str) and value)
         provider = contract_provider or DeclarativeContractProvider(config.contract)
         self.contract = provider.get(config.contract_version)
         if self.contract.version != config.contract_version:
             raise ValueError("provider returned a different Contract version")
+        for media_type, permission in config.media_policy.items():
+            artifact = self.contract.artifact_types.get(permission.artifact_type)
+            if artifact is None or not set(permission.roles) <= set(artifact['roles']):
+                raise ValueError(f'media_policy for {media_type} is not permitted by the Domain Contract')
         if reference_provider is not None and config.reference_state is None:
             raise ValueError('Reference State Provider must be explicitly configured')
         self.reference_provider = (reference_provider or references.FileReferenceStateProvider(config.reference_state)
@@ -465,7 +543,16 @@ class Core:
         self.projection_sink = projection_sink or (projections.DevelopmentProjectionSink(config.database)
                                                   if config.projection is not None else None)
         self.delivery_clock = delivery_clock
-        self.model = model or DeterministicModel()
+        if model is not None:
+            self.model = model
+        elif config.openai is not None:
+            reference = config.secret_references.get(config.openai.secret_reference)
+            api_key = os.environ.get(reference or '')
+            if not reference or not api_key:
+                raise ValueError('OpenAI secret reference is unresolved')
+            self.model = OpenAIResponsesModel(config.openai, api_key)
+        else:
+            self.model = DeterministicModel()
         self.channel: ChannelPlugin = channel or (
             EmailChannel(config.database, config.email, SmtpTransport(config.email, config.secret_references))
             if config.email is not None else
@@ -474,7 +561,10 @@ class Core:
                             os.environ.get(config.secret_references[config.telegram.token_secret_reference], ''))
             if config.telegram is not None else DevelopmentChannel(config.database)
         )
-        if set(getattr(self.channel, 'capabilities', config.capabilities)) != set(config.capabilities):
+        if isinstance(self.channel, (EmailChannel, TelegramChannel)):
+            self.channel.capabilities = tuple(config.capabilities)
+        declared_capabilities = set(getattr(self.channel, 'capabilities', config.capabilities))
+        if not set(config.capabilities) <= declared_capabilities:
             raise ValueError('ChannelPlugin capabilities do not match deployment configuration')
         self.artifact_store = artifact_store or (LocalArtifactStore(config.artifact_store)
                                                  if config.artifact_store is not None else None)
@@ -555,6 +645,33 @@ class Core:
         self._dispatch_events_after_commit()
         return result
 
+    def _contains_secret(self, value: Any) -> bool:
+        try:
+            text = json.dumps(value, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError, RecursionError):
+            # Existing proposal validation classifies malformed/non-finite values
+            # deterministically; this boundary only rejects credential-bearing text.
+            return False
+        return bool(_CREDENTIAL_URL.search(text) or any(secret in text for secret in self._secret_values))
+
+    def _check_proposal(self, db: sqlite3.Connection, proposal: SemanticProposal,
+                        inbound: Communication) -> ValidationResult:
+        # #27 gates first-party transport perception. Existing normalized development
+        # Artifact scenarios retain their Contract-only lifecycle behavior.
+        if inbound.channel not in ('email', 'telegram'):
+            return history.check(db, proposal, asdict(inbound), self.contract)
+        media_by_attachment = {attachment['id']: attachment['media_type'] for attachment in inbound.attachments}
+        for operation in proposal.operations:
+            attachment_id = (operation.id if isinstance(operation, ArtifactOperation)
+                             else operation.artifact_id if isinstance(operation, ClaimOperation) else None)
+            if attachment_id not in media_by_attachment:
+                continue
+            permission = self.config.media_policy.get(media_by_attachment[attachment_id])
+            if permission is None or (isinstance(operation, ArtifactOperation) and (
+                    operation.artifact_type != permission.artifact_type or operation.roles != permission.roles)):
+                return ValidationResult('rejected', ('media_policy_not_allowed',))
+        return history.check(db, proposal, asdict(inbound), self.contract)
+
     def _artifact_maintenance_lock(self) -> ContextManager[None]:
         if self.artifact_store is None:
             return nullcontext()
@@ -570,7 +687,7 @@ class Core:
                        "WHERE stage_ref=artifact_stages.stage_ref)")
 
     def _stage_attachments(self, inbound: Communication, content: dict[str, bytes]) -> None:
-        if not content:
+        if not inbound.attachments:
             return
         if self.artifact_store is None:
             raise OSError('ArtifactStore is not configured')
@@ -581,6 +698,16 @@ class Core:
                     return
             for attachment in inbound.attachments:
                 attachment_id = attachment['id']
+                with connect(self.config.database) as db:
+                    existing = db.execute('SELECT * FROM artifact_stages WHERE communication_id=? AND attachment_id=?',
+                                          (inbound.id, attachment_id)).fetchone()
+                if existing is not None and existing['state'] == 'staged':
+                    if tuple(existing[name] for name in ('actor_id', 'checksum', 'size')) != (
+                            inbound.actor_id, attachment['checksum'], attachment['size']):
+                        raise ValueError('conflicting staged artifact evidence')
+                    continue
+                if attachment_id not in content:
+                    raise OSError('staged artifact content is unavailable')
                 staged = self.artifact_store.stage(content[attachment_id],
                                                    f'{inbound.id}:{attachment_id}')
                 if (not isinstance(staged.reference, str) or not re.fullmatch(r'[0-9a-f]{32}', staged.reference)
@@ -685,7 +812,8 @@ class Core:
             with connect(self.config.database) as db:
                 registered = {row['stage_ref'] for row in db.execute("SELECT stage_ref FROM artifact_stages")}
                 candidates = [row['stage_ref'] for row in db.execute(
-                    "SELECT stage_ref FROM artifact_stages WHERE state='staged' ORDER BY rowid")]
+                    "SELECT s.stage_ref FROM artifact_stages s JOIN turns t ON t.id=s.communication_id "
+                    "WHERE s.state='staged' AND t.status IN ('completed', 'rejected') ORDER BY s.rowid")]
             sweep = getattr(self.artifact_store, 'cleanup', None)
             removed = sweep(registered, minimum_age_seconds) if callable(sweep) else []
             for reference in candidates:
@@ -710,6 +838,35 @@ class Core:
                 if outcome:
                     removed.append(reference)
         return removed
+
+    def _model_media(self, inbound: Communication) -> tuple[context.MediaAttachment, ...]:
+        """Load only this Actor's staged current-turn bytes outside every DB transaction."""
+        if not getattr(self.model, 'accepts_media', False) or not inbound.attachments:
+            return ()
+        if self.artifact_store is None:
+            raise OSError('ArtifactStore is not configured')
+        reader = getattr(self.artifact_store, 'read_staged', None)
+        if not callable(reader):
+            raise OSError('ArtifactStore cannot provide staged media')
+        with connect(self.config.database) as db:
+            rows = db.execute("SELECT i.attachment_id, i.media_type, i.checksum, i.size, s.stage_ref "
+                              "FROM artifact_ingress i JOIN artifact_stages s "
+                              "ON s.communication_id=i.communication_id AND s.attachment_id=i.attachment_id "
+                              "WHERE i.communication_id=? AND i.actor_id=? AND s.state='staged' "
+                              "ORDER BY i.attachment_id", (inbound.id, inbound.actor_id)).fetchall()
+        media = []
+        for row in rows:
+            permission = self.config.media_policy.get(row['media_type'])
+            if permission is None:
+                continue
+            content = reader(row['stage_ref'])
+            if (not isinstance(content, bytes) or len(content) != row['size']
+                    or hashlib.sha256(content).hexdigest() != row['checksum']):
+                raise OSError('staged artifact content is unavailable or corrupt')
+            media.append(context.MediaAttachment(row['attachment_id'], row['media_type'],
+                                                 permission.artifact_type, permission.roles,
+                                                 row['checksum'], row['size'], content))
+        return tuple(media)
 
     def artifact_bytes(self, artifact_id: str) -> bytes:
         """Core-only accessor for finalized local bytes; sender acquisition has no byte URL."""
@@ -746,9 +903,9 @@ class Core:
         return self.recover_channel_pending(after_rowid, limit)
 
     def recover_channel_pending(self, after_rowid: int = 0, limit: int = 100) -> tuple[list[dict[str, Any]], int]:
-        """Resume bounded configured text-channel ingress without source transport payloads."""
+        """Resume bounded configured channel ingress from Core-owned staged evidence."""
         if self.config.channel not in ('email', 'telegram'):
-            raise ValueError('text channel recovery is unavailable')
+            raise ValueError('channel recovery is unavailable')
         if type(after_rowid) is not int or after_rowid < 0 or type(limit) is not int or not 1 <= limit <= 100:
             raise ValueError('channel recovery cursor must be bounded')
         bot_scope = f'{self.config.telegram.bot_id}:%' if self.config.telegram is not None else '%'
@@ -758,17 +915,19 @@ class Core:
                               "AND idempotency_key LIKE ? ORDER BY rowid LIMIT ?",
                               (self.config.channel, after_rowid, bot_scope, limit)).fetchall()
         fields = {'channel', 'sender', 'idempotency_key', 'text', 'sent_at', 'thread_id', 'reply_to',
-                  'transport_message_id', 'transport_reply_to', 'references', 'subject'}
+                  'attachments', 'transport_message_id', 'transport_reply_to', 'references', 'subject'}
         if self.config.channel == 'telegram':
             fields -= {'references', 'subject'}
         outcomes = []
         for row in rows:
             inbound = json.loads(row['inbound'])
-            outcomes.append(self.accept({name: inbound[name] for name in fields if name in inbound
-                                         and inbound[name] is not None}))
+            outcome = self._accept({name: inbound[name] for name in fields if name in inbound
+                                    and inbound[name] is not None}, recovering=True)
+            self._dispatch_events_after_commit()
+            outcomes.append(outcome)
         return outcomes, rows[-1]['rowid'] if rows else 0
 
-    def _accept(self, payload: Any) -> dict[str, Any]:
+    def _accept(self, payload: Any, recovering: bool = False) -> dict[str, Any]:
         required = {"channel", "sender", "idempotency_key", "text", "sent_at"}
         optional = {'thread_id', 'reply_to', 'attachments', 'transport_message_id',
                     'transport_reply_to', 'references', 'subject'}
@@ -778,12 +937,12 @@ class Core:
             or set(payload) - required - optional
         ):
             raise ValueError("expected a normalized Communication")
-        attachments, attachment_content = _normalize_attachments(payload.get('attachments'))
+        attachments, attachment_content = _normalize_attachments(payload.get('attachments'), recovering)
         normalized_payload = {name: payload[name] for name in required | optional - {'attachments'}
                               if name in payload}
         normalized_payload['attachments'] = attachments
         if self.config.channel == 'email':
-            if attachments:
+            if attachments and 'attachments' not in self.config.capabilities:
                 raise ValueError('Email attachments are not enabled')
             for name in ('transport_message_id', 'transport_reply_to'):
                 value = normalized_payload.get(name)
@@ -792,7 +951,8 @@ class Core:
             if normalized_payload.get('transport_message_id') != normalized_payload.get('idempotency_key'):
                 raise ValueError('Email ingress requires its transport Message-ID')
         elif self.config.channel == 'telegram':
-            if (attachments or any(name in payload for name in ('references', 'subject'))
+            if ((attachments and 'attachments' not in self.config.capabilities)
+                    or any(name in payload for name in ('references', 'subject'))
                     or not numeric_id(normalized_payload.get('sender'))
                     or normalized_payload.get('thread_id') != normalized_payload.get('sender')
                     or not numeric_id(normalized_payload.get('transport_message_id'))
@@ -815,7 +975,7 @@ class Core:
             raise ValueError('invalid Communication subject')
         if any(
             not isinstance(normalized_payload[name], str)
-            or not normalized_payload[name].strip()
+            or (not normalized_payload[name].strip() and (name != 'text' or not attachments))
             or len(normalized_payload[name]) > (32768 if name == "text" else 256)
             for name in required
         ):
@@ -843,6 +1003,8 @@ class Core:
         actor = self.config.identities.get(f"{normalized_payload['channel']}:{normalized_payload['sender']}")
         if actor is None:
             raise ValueError("unmapped channel identity")
+        if self._contains_secret(normalized_payload):
+            raise ValueError('credential-bearing evidence is not accepted')
         inbound = Communication(
             id=str(uuid4()),
             actor_id=actor,
@@ -850,9 +1012,36 @@ class Core:
             received_at=now(),
             **normalized_payload,
         )
+        # Avoid producing a fresh pre-stage for an already durable delivery. A pending
+        # turn retains its original stage and recovery never needs the transport again.
+        with connect(self.config.database) as db:
+            existing = db.execute("SELECT * FROM turns WHERE channel=? AND sender=? AND idempotency_key=?",
+                                  (inbound.channel, inbound.sender, inbound.idempotency_key)).fetchone()
+        if existing is not None:
+            stored = json.loads(json.dumps(asdict(Communication(**json.loads(existing['inbound'])))))
+            incoming = json.loads(json.dumps(asdict(inbound)))
+            if any(stored[name] != incoming[name] for name in incoming if name not in ('id', 'received_at')):
+                raise ValueError('idempotency key already belongs to a different Communication')
+            if existing['status'] in ('completed', 'rejected'):
+                return _checkpoint_result(existing)
+        # Transport attachment bytes are staged before ingress, so a checkpoint never
+        # outruns bytes needed for restart. Unregistered pre-stages are later swept.
+        pre_staged: dict[str, StagedContent] = {}
+        if (existing is None and attachments and self.config.channel in ('email', 'telegram')
+                and not recovering):
+            if self.artifact_store is None:
+                raise OSError('ArtifactStore is not configured')
+            with self._artifact_maintenance_lock():
+                for attachment in attachments:
+                    staged = self.artifact_store.stage(attachment_content[attachment['id']],
+                                                       f'{inbound.id}:{attachment["id"]}')
+                    if (staged.checksum != attachment['checksum'] or staged.size != attachment['size']
+                            or not re.fullmatch(r'[0-9a-f]{32}', staged.reference)):
+                        raise OSError('ArtifactStore returned invalid staged evidence')
+                    pre_staged[attachment['id']] = staged
         # Ingress commits before calling the model or handing off a reply.
         with connect(self.config.database) as db:
-            db.execute(
+            inserted = db.execute(
                 "INSERT INTO turns (id, channel, sender, idempotency_key, inbound, status) "
                 "VALUES (?, ?, ?, ?, ?, 'pending') "
                 "ON CONFLICT(channel, sender, idempotency_key) DO NOTHING",
@@ -863,7 +1052,17 @@ class Core:
                     inbound.idempotency_key,
                     json.dumps(asdict(inbound)),
                 ),
-            )
+            ).rowcount
+            if inserted:
+                for attachment in attachments:
+                    db.execute("INSERT INTO artifact_ingress VALUES (?, ?, ?, ?, ?, ?, ?)",
+                               (inbound.id, attachment['id'], inbound.actor_id, attachment['media_type'],
+                                attachment['checksum'], attachment['size'], now()))
+                    staged_metadata = pre_staged.get(attachment['id'])
+                    if staged_metadata is not None:
+                        db.execute("INSERT INTO artifact_stages VALUES (?, ?, ?, ?, ?, ?, 'staged')",
+                                   (inbound.id, attachment['id'], inbound.actor_id, staged_metadata.reference,
+                                    staged_metadata.checksum, staged_metadata.size))
         # Attempt-storage failure must not undo durable ingress.
         with connect(self.config.database) as db:
             db.execute('BEGIN IMMEDIATE')
@@ -962,12 +1161,21 @@ class Core:
                 for model_call in range(self.config.selection.max_model_calls):
                     trace['model_calls'] = model_call + 1
                     model_pack = context.model_view(pack)
-                    if len(context.encoded([asdict(inbound), asdict(model_pack)]).encode()) > pack.budget.max_bytes:
+                    media = self._model_media(inbound)
+                    model_pack = replace(model_pack, media=media)
+                    metadata_pack = model_pack.captured()
+                    if len(context.encoded([asdict(inbound), metadata_pack]).encode()) > pack.budget.max_bytes:
                         raise context.BudgetExhausted()
                     proposal = self.model.propose(inbound, self.config.contract_version, model_pack)
                     with connect(self.config.database) as db:
                         db.execute('BEGIN')
-                        preliminary = history.check(db, proposal, asdict(inbound), self.contract)
+                        preliminary = self._check_proposal(db, proposal, inbound)
+                    try:
+                        unsafe_model_output = self._contains_secret(asdict(proposal))
+                    except RecursionError:
+                        unsafe_model_output = False
+                    if preliminary.outcome == 'accepted' and unsafe_model_output:
+                        raise OSError('credential-bearing model output is not accepted')
                     requests = tuple(op for op in proposal.operations if isinstance(op, ContextRequestOperation))
                     if preliminary.outcome != 'accepted' or not requests:
                         break
@@ -992,7 +1200,7 @@ class Core:
                     validation = ValidationResult('stale', ('context_revision_changed',))
                 else:
                     validation = (ValidationResult('accepted') if prior_commit else
-                                  history.check(db, proposal, asdict(inbound), self.contract))
+                                  self._check_proposal(db, proposal, inbound))
                 if validation.outcome == 'accepted' and not prior_commit:
                     if outbound is None and requests and preliminary.outcome != 'accepted':
                         validation = preliminary

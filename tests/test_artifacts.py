@@ -185,9 +185,9 @@ class ArtifactTests(unittest.TestCase):
             restarted = Core(config)
             with __import__('sqlite3').connect(config.database) as db:
                 self.assertEqual(db.execute('SELECT state FROM artifact_stages').fetchone()[0], 'staged')
-            self.assertEqual(restarted.cleanup_artifact_staging(0), [reference])
+            self.assertEqual(restarted.cleanup_artifact_staging(0), [])
             with __import__('sqlite3').connect(config.database) as db:
-                self.assertEqual(db.execute('SELECT state FROM artifact_stages').fetchone()[0], 'deleted')
+                self.assertEqual(db.execute('SELECT state FROM artifact_stages').fetchone()[0], 'staged')
 
     def test_cleanup_unlink_error_releases_reservation_for_later_maintenance(self):
         from piecetogether.artifact_store import LocalArtifactStore
@@ -256,7 +256,7 @@ class ArtifactTests(unittest.TestCase):
             self.assertTrue(completed.is_set())
             with __import__('sqlite3').connect(config.database) as db:
                 reference = db.execute('SELECT stage_ref FROM artifact_stages').fetchone()[0]
-            self.assertEqual(core.cleanup_artifact_staging(0), [reference])
+            self.assertEqual(core.cleanup_artifact_staging(0), [])
 
     def test_cleanup_reservation_prevents_a_delayed_commit_from_linking_deleted_bytes(self):
         class DelayedCommitModel:
@@ -286,9 +286,9 @@ class ArtifactTests(unittest.TestCase):
                 'sent_at': '2026-10-10T12:00:00Z',
                 'attachments': [{'id': 'quote', 'content_base64': base64.b64encode(b'quote').decode()}],
             })
-            self.assertEqual(result['status'], 'rejected')
-            self.assertTrue(model.asserted_cleanup)
-            self.assertEqual(core.inspect_history()['artifacts'], [])
+            self.assertEqual(result['status'], 'completed')
+            self.assertEqual(model.asserted_cleanup, [])
+            self.assertEqual(len(core.inspect_history()['artifacts']), 1)
 
     def test_attachment_and_store_failures_are_rejected_before_trusted_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:

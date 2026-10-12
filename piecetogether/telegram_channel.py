@@ -1,5 +1,6 @@
 """First-party Telegram private text channel; Bot API adapters are static."""
 
+import base64
 import http.client
 import json
 import os
@@ -13,12 +14,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
-from .email_channel import DeliveryResult
+from .email_channel import DeliveryResult, valid_media
 
 if TYPE_CHECKING:
     from .core import Communication, Core
 
-CAPABILITIES = ('receive', 'reply', 'text', 'threading')
+CAPABILITIES = ('receive', 'reply', 'text', 'threading', 'attachments')
+TEXT_CAPABILITIES = ('receive', 'reply', 'text', 'threading')
+MAX_MEDIA_BYTES = 1_048_576
 
 
 def numeric_id(value: Any) -> bool:
@@ -34,6 +37,7 @@ class TelegramConfig:
     long_poll_seconds: int = 30
     poll_seconds: float = 1
     batch_size: int = 32
+    max_media_bytes: int = MAX_MEDIA_BYTES
 
     def __post_init__(self) -> None:
         if (not numeric_id(self.bot_id)
@@ -44,7 +48,8 @@ class TelegramConfig:
                 or not self.long_poll_seconds < self.timeout_seconds <= 300
                 or type(self.poll_seconds) not in (int, float) or not math.isfinite(self.poll_seconds)
                 or not 0 < self.poll_seconds <= 86400
-                or type(self.batch_size) is not int or not 1 <= self.batch_size <= 100):
+                or type(self.batch_size) is not int or not 1 <= self.batch_size <= 100
+                or type(self.max_media_bytes) is not int or not 1 <= self.max_media_bytes <= MAX_MEDIA_BYTES):
             raise ValueError('invalid static Telegram configuration')
 
     @classmethod
@@ -60,6 +65,11 @@ class TelegramConfig:
 class TelegramTransport(Protocol):
     def send(self, chat_id: str, text: str, reply_to: str) -> tuple[DeliveryResult, int | None]: ...
     def fetch(self, offset: int) -> list[dict[str, Any]]: ...
+    def download(self, file_id: str, maximum_size: int) -> bytes: ...
+
+
+class UnsupportedTelegramMedia(ValueError):
+    """A definite provider/media rejection that may be checkpointed and skipped."""
 
 
 class TelegramUnavailable(OSError):
@@ -110,6 +120,36 @@ class BotApiTransport:
                 connection.close()
             except OSError:
                 pass  # Cleanup cannot invalidate a captured provider acknowledgement.
+
+    def download(self, file_id: str, maximum_size: int) -> bytes:
+        if (not isinstance(file_id, str) or not file_id or len(file_id) > 256
+                or type(maximum_size) is not int or not 0 < maximum_size <= MAX_MEDIA_BYTES):
+            raise UnsupportedTelegramMedia('invalid Telegram file reference')
+        status, body = self._request('getFile', {'file_id': file_id})
+        result = body.get('result') if isinstance(body, dict) else None
+        if (status != 200 or body.get('ok') is not True or not isinstance(result, dict)
+                or result.get('file_id') != file_id or not isinstance(result.get('file_unique_id'), str)
+                or not result['file_unique_id'] or len(result['file_unique_id']) > 256
+                or type(result.get('file_size')) is not int or not 0 < result['file_size'] <= maximum_size
+                or not isinstance(result.get('file_path'), str)
+                or not re.fullmatch(r'[A-Za-z0-9._/-]{1,512}', result['file_path'])
+                or '..' in result['file_path'].split('/')):
+            raise UnsupportedTelegramMedia('invalid Telegram file response')
+        connection = http.client.HTTPSConnection('api.telegram.org', timeout=self.config.timeout_seconds)
+        try:
+            connection.request('GET', f'/file/bot{self._token}/{result["file_path"]}')
+            response = connection.getresponse()
+            content = response.read(maximum_size + 1)
+            if response.status != 200 or len(content) != result['file_size'] or not content or len(content) > maximum_size:
+                raise UnsupportedTelegramMedia('invalid Telegram file content')
+            return content
+        except (OSError, http.client.HTTPException):
+            raise TelegramUnavailable() from None
+        finally:
+            try:
+                connection.close()
+            except OSError:
+                pass
 
     def fetch(self, offset: int) -> list[dict[str, Any]]:
         status, body = self._request('getUpdates', {'offset': offset, 'limit': self.config.batch_size,
@@ -181,8 +221,7 @@ class TelegramChannel:
             return [dict(row) for row in db.execute('SELECT * FROM telegram_acquisition WHERE bot_id=? '
                                                     'ORDER BY update_id', (self.config.bot_id,))]
 
-    def normalize(self, payload: Any) -> dict[str, Any]:
-        from .core import connect
+    def sender_identity(self, payload: Any) -> str:
         if (not isinstance(payload, dict) or type(payload.get('update_id')) is not int
                 or payload['update_id'] < 0 or not isinstance(payload.get('message'), dict)):
             raise ValueError('unsupported Telegram update')
@@ -191,16 +230,57 @@ class TelegramChannel:
         if (not isinstance(sender, dict) or not isinstance(chat, dict)
                 or type(sender.get('id')) is not int or not numeric_id(str(sender['id']))
                 or sender.get('is_bot') is not False or chat.get('type') != 'private'
-                or type(chat.get('id')) is not int or chat['id'] != sender['id']
-                or any(field in message for field in ('business_connection_id', 'paid_media', 'photo',
-                    'document', 'audio', 'voice', 'video', 'video_note', 'animation', 'sticker',
-                    'contact', 'location', 'venue', 'poll', 'dice', 'game', 'invoice', 'story'))
+                or type(chat.get('id')) is not int or chat['id'] != sender['id']):
+            raise ValueError('unsupported Telegram private message')
+        return str(sender['id'])
+
+    def normalize(self, payload: Any) -> dict[str, Any]:
+        from .core import connect
+        sender_id = self.sender_identity(payload)
+        message = payload['message']
+        unsupported = ('business_connection_id', 'paid_media', 'audio', 'voice', 'video', 'video_note',
+                       'animation', 'sticker', 'contact', 'location', 'venue', 'poll', 'dice', 'game',
+                       'invoice', 'story')
+        if (any(field in message for field in unsupported)
                 or type(message.get('message_id')) is not int or not numeric_id(str(message['message_id']))
-                or not isinstance(message.get('text'), str) or not message['text'].strip()
-                or len(message['text']) > 4096 or self._token in message['text']
-                or any(0xd800 <= ord(character) <= 0xdfff for character in message['text'])
                 or type(message.get('date')) is not int or message['date'] < 0):
-            raise ValueError('unsupported Telegram private text message')
+            raise ValueError('unsupported Telegram private message')
+        text = message.get('text', message.get('caption', ''))
+        if (not isinstance(text, str) or len(text) > 4096 or self._token in text
+                or any(0xd800 <= ord(character) <= 0xdfff for character in text)):
+            raise ValueError('unsupported Telegram text')
+        attachments = []
+        media_fields = [field for field in ('photo', 'document') if field in message]
+        if len(media_fields) > 1:
+            raise ValueError('unsupported Telegram media')
+        if media_fields:
+            if 'attachments' not in self.capabilities:
+                raise ValueError('Telegram attachments are not enabled')
+            if media_fields[0] == 'photo':
+                photos = message['photo']
+                if (not isinstance(photos, list) or not photos
+                        or any(not isinstance(item, dict) or not isinstance(item.get('file_id'), str)
+                               or type(item.get('file_size')) is not int for item in photos)):
+                    raise ValueError('invalid Telegram photo')
+                source = max(photos, key=lambda item: item['file_size'])
+                media_type = 'image/jpeg'
+            else:
+                source = message['document']
+                if not isinstance(source, dict) or source.get('mime_type') not in ('image/png', 'image/jpeg', 'application/pdf'):
+                    raise ValueError('unsupported Telegram document')
+                media_type = source['mime_type']
+            file_id, size = source.get('file_id'), source.get('file_size')
+            if (not isinstance(file_id, str) or not file_id or len(file_id) > 256
+                    or type(size) is not int or not 0 < size <= self.config.max_media_bytes):
+                raise ValueError('invalid Telegram media')
+            content = self.transport.download(file_id, self.config.max_media_bytes)
+            if (not isinstance(content, bytes) or not content or len(content) != size
+                    or not valid_media(media_type, content)):
+                raise ValueError('invalid Telegram media download')
+            attachments.append({'id': 'attachment-1', 'content_base64': base64.b64encode(content).decode('ascii'),
+                                'media_type': media_type})
+        elif not text.strip():
+            raise ValueError('Telegram requires text or supported media')
         try:
             sent_at = datetime.fromtimestamp(message['date'], timezone.utc).isoformat()
         except (ValueError, OverflowError, OSError):
@@ -214,15 +294,15 @@ class TelegramChannel:
             with connect(self.database) as db:
                 row = db.execute("SELECT id FROM telegram_handoffs WHERE bot_id=? AND recipient=? "
                                  "AND message_id=? AND result='success'",
-                                 (self.config.bot_id, str(sender['id']), reply['message_id'])).fetchone()
+                                 (self.config.bot_id, sender_id, reply['message_id'])).fetchone()
             if row:
                 reply_to = row['id']
-        return {'channel': 'telegram', 'sender': str(sender['id']),
-                'idempotency_key': f"{self.config.bot_id}:{chat['id']}:{message['message_id']}",
-                'text': message['text'], 'sent_at': sent_at, 'thread_id': str(chat['id']),
+        return {'channel': 'telegram', 'sender': sender_id,
+                'idempotency_key': f"{self.config.bot_id}:{sender_id}:{message['message_id']}",
+                'text': text, 'sent_at': sent_at, 'thread_id': sender_id,
                 'transport_message_id': str(message['message_id']),
                 'transport_reply_to': str(reply['message_id']) if reply is not None else None,
-                'reply_to': reply_to}
+                'reply_to': reply_to, 'attachments': attachments}
 
     def prepare(self, outbound: 'Communication', inbound: 'Communication') -> 'Communication':
         return replace(outbound, sender=self.config.bot_id, recipient=inbound.sender,
@@ -305,16 +385,19 @@ class TelegramAcquisitionWorker:
             if item['update_id'] < offset:
                 continue
             try:
-                normalized = self.channel.normalize(item)
+                sender = self.channel.sender_identity(item)
             except (ValueError, TypeError, RecursionError):
                 self.channel.record_acquisition(item['update_id'], None, 'unsupported_message')
             else:
-                if f"telegram:{normalized['sender']}" not in self.core.config.identities:
+                if f"telegram:{sender}" not in self.core.config.identities:
                     self.channel.record_acquisition(item['update_id'], None, 'unmapped_identity')
                 else:
                     try:
+                        normalized = self.channel.normalize(item)
                         result = self.core.accept(normalized)
-                    except ValueError:
+                    except UnsupportedTelegramMedia:
+                        self.channel.record_acquisition(item['update_id'], None, 'unsupported_message')
+                    except (ValueError, TypeError, RecursionError):
                         self.channel.record_acquisition(item['update_id'], None, 'invalid_communication')
                     else:
                         self.channel.record_acquisition(item['update_id'], result['communication_id'], result['status'])
