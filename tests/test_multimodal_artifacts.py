@@ -567,18 +567,25 @@ class MultimodalArtifactTests(unittest.TestCase):
     def test_prestage_sweeper_cannot_observe_an_unregistered_stage_at_lock_exit(self):
         from piecetogether.artifact_store import LocalArtifactStore
         from piecetogether.email_channel import EmailChannel, EmailConfig
-        import sqlite3
 
         class ExitSweeperStore(LocalArtifactStore):
-            def __init__(self, root, database):
-                super().__init__(root)
-                self.database, self.stage_rows_at_exit = database, -1
+            core = None
+            staged = False
+            swept = False
+            removed = None
+
+            def stage(self, *args):
+                result = super().stage(*args)
+                self.staged = True
+                return result
+
             @contextmanager
             def maintenance_lock(self):
                 with super().maintenance_lock():
                     yield
-                    with sqlite3.connect(self.database) as db:
-                        self.stage_rows_at_exit = db.execute('SELECT count(*) FROM artifact_stages').fetchone()[0]
+                if self.staged and not self.swept:
+                    self.swept = True
+                    self.removed = self.core.cleanup_artifact_staging(0)
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -586,11 +593,13 @@ class MultimodalArtifactTests(unittest.TestCase):
                 channel='email', capabilities=EMAIL_CAPABILITIES, artifact_store=root / 'artifacts',
                 media_policy={'image/png': MediaPolicy('VisualEvidence', ('ephemeral-evidence',))},
                 email=EmailConfig('core@example.com', 'localhost', security='plain'))
-            store = ExitSweeperStore(root / 'artifacts', config.database)
-            core = Core(config, model=ByteAwareModel(), contract_provider=ContractProvider(), artifact_store=store,
+            store, model = ExitSweeperStore(root / 'artifacts'), ByteAwareModel()
+            core = Core(config, model=model, contract_provider=ContractProvider(), artifact_store=store,
                 channel=EmailChannel(config.database, config.email, CapturedTransport()))
+            store.core = core
             self.assertEqual(core.accept_transport(EMAIL)['status'], 'completed')
-            self.assertEqual(store.stage_rows_at_exit, 1)
+            self.assertEqual(store.removed, [])
+            self.assertEqual(model.media[0].content, PNG)
 
     def test_email_media_recovery_uses_staged_bytes_without_the_original_mime(self):
         from piecetogether.email_channel import EmailChannel, EmailConfig
