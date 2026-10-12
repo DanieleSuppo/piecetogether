@@ -77,6 +77,9 @@ class CapturedConnection:
         self.responses = iter(responses)
         self.requests = []
 
+    def connect(self):
+        pass
+
     def request(self, method, path, body, headers):
         self.requests.append((method, path, json.loads(body), headers))
 
@@ -396,6 +399,19 @@ class TelegramTests(unittest.TestCase):
                 return super().send(*args)
         core = self.core(UnlockedTransport(), model=UnlockedModel(), contract_provider=ContractProvider())
         self.assertEqual(core.accept_transport(update())['status'], 'completed')
+
+    def test_connection_failure_before_request_is_retryable_but_lost_acknowledgement_is_not(self):
+        from piecetogether.telegram_channel import BotApiTransport, TelegramConfig
+        transport = BotApiTransport(TelegramConfig('900', 'token'), {'token': 'PT_TELEGRAM_BOT_TOKEN'})
+        connection = CapturedConnection([])
+        with (patch('piecetogether.telegram_channel.http.client.HTTPSConnection', return_value=connection),
+              patch.object(connection, 'connect', side_effect=ConnectionRefusedError(TOKEN))):
+            self.assertEqual(transport.send('123', 'reply', '1'), ('failure', None))
+            self.assertEqual(connection.requests, [])
+        lost = CapturedConnection([OSError(TOKEN)])
+        with patch('piecetogether.telegram_channel.http.client.HTTPSConnection', return_value=lost):
+            self.assertEqual(transport.send('123', 'reply', '1'), ('indeterminate', None))
+            self.assertEqual(len(lost.requests), 1)
 
     def test_send_rate_limit_defers_network_retry_and_does_not_leak_error_body(self):
         from piecetogether.telegram_channel import BotApiTransport, TelegramConfig

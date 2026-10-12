@@ -65,9 +65,9 @@ class TelegramTransport(Protocol):
 class TelegramUnavailable(OSError):
     """Sanitized acquisition failure with only a provider-requested retry delay."""
 
-    def __init__(self, retry_after: float = 0):
+    def __init__(self, retry_after: float = 0, before_send: bool = False):
         super().__init__('Telegram acquisition unavailable')
-        self.retry_after = retry_after
+        self.retry_after, self.before_send = retry_after, before_send
 
 
 class BotApiTransport:
@@ -85,7 +85,10 @@ class BotApiTransport:
         if self.clock() < self.not_before:
             raise TelegramUnavailable(self.not_before - self.clock())
         connection = http.client.HTTPSConnection('api.telegram.org', timeout=self.config.timeout_seconds)
+        connected = False
         try:
+            connection.connect()
+            connected = True
             connection.request('POST', f'/bot{self._token}/{method}',
                                json.dumps(payload).encode('utf-8'), {'Content-Type': 'application/json'})
             response = connection.getresponse()
@@ -101,9 +104,12 @@ class BotApiTransport:
                 self.not_before = self.clock() + delay
             return response.status, body
         except (OSError, http.client.HTTPException, ValueError, TypeError, RecursionError):
-            raise TelegramUnavailable() from None
+            raise TelegramUnavailable(before_send=not connected) from None
         finally:
-            connection.close()
+            try:
+                connection.close()
+            except OSError:
+                pass  # Cleanup cannot invalidate a captured provider acknowledgement.
 
     def fetch(self, offset: int) -> list[dict[str, Any]]:
         status, body = self._request('getUpdates', {'offset': offset, 'limit': self.config.batch_size,
@@ -118,8 +124,10 @@ class BotApiTransport:
         try:
             status, body = self._request('sendMessage', {'chat_id': int(chat_id), 'text': text,
                 'reply_parameters': {'message_id': int(reply_to)}})
-        except (OSError, ValueError, TypeError):
+        except TelegramUnavailable as error:
             # No Bot API deduplication key: losing the response cannot justify a resend.
+            return ('failure' if error.before_send else 'indeterminate'), None
+        except (OSError, ValueError, TypeError):
             return 'indeterminate', None
         if body['ok'] is False and (status == 200 or 400 <= status < 500):
             return 'failure', None
