@@ -127,6 +127,8 @@ class BotApiTransport:
             raise UnsupportedTelegramMedia('invalid Telegram file reference')
         status, body = self._request('getFile', {'file_id': file_id})
         result = body.get('result') if isinstance(body, dict) else None
+        if status in (404, 408, 429) or status >= 500 or self.clock() < self.not_before:
+            raise TelegramUnavailable(max(0, self.not_before - self.clock()))
         if (status != 200 or body.get('ok') is not True or not isinstance(result, dict)
                 or result.get('file_id') != file_id or not isinstance(result.get('file_unique_id'), str)
                 or not result['file_unique_id'] or len(result['file_unique_id']) > 256
@@ -140,6 +142,8 @@ class BotApiTransport:
             connection.request('GET', f'/file/bot{self._token}/{result["file_path"]}')
             response = connection.getresponse()
             content = response.read(maximum_size + 1)
+            if response.status in (404, 408, 429) or response.status >= 500:
+                raise TelegramUnavailable()
             if response.status != 200 or len(content) != result['file_size'] or not content or len(content) > maximum_size:
                 raise UnsupportedTelegramMedia('invalid Telegram file content')
             return content

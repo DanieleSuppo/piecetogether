@@ -1027,11 +1027,15 @@ class Core:
         # Transport attachment bytes are staged before ingress, so a checkpoint never
         # outruns bytes needed for restart. Unregistered pre-stages are later swept.
         pre_staged: dict[str, StagedContent] = {}
-        if (existing is None and attachments and self.config.channel in ('email', 'telegram')
-                and not recovering):
-            if self.artifact_store is None:
-                raise OSError('ArtifactStore is not configured')
-            with self._artifact_maintenance_lock():
+        needs_prestage = (existing is None and bool(attachments)
+                          and self.config.channel in ('email', 'telegram') and not recovering)
+        if needs_prestage and self.artifact_store is None:
+            raise OSError('ArtifactStore is not configured')
+        # The store coordination spans staging and durable registration. It does not
+        # cover semantic transactions, model work, or any provider network call.
+        with (self._artifact_maintenance_lock() if needs_prestage else nullcontext()):
+            if needs_prestage:
+                assert self.artifact_store is not None
                 for attachment in attachments:
                     staged = self.artifact_store.stage(attachment_content[attachment['id']],
                                                        f'{inbound.id}:{attachment["id"]}')
@@ -1039,30 +1043,30 @@ class Core:
                             or not re.fullmatch(r'[0-9a-f]{32}', staged.reference)):
                         raise OSError('ArtifactStore returned invalid staged evidence')
                     pre_staged[attachment['id']] = staged
-        # Ingress commits before calling the model or handing off a reply.
-        with connect(self.config.database) as db:
-            inserted = db.execute(
-                "INSERT INTO turns (id, channel, sender, idempotency_key, inbound, status) "
-                "VALUES (?, ?, ?, ?, ?, 'pending') "
-                "ON CONFLICT(channel, sender, idempotency_key) DO NOTHING",
-                (
-                    inbound.id,
-                    inbound.channel,
-                    inbound.sender,
-                    inbound.idempotency_key,
-                    json.dumps(asdict(inbound)),
-                ),
-            ).rowcount
-            if inserted:
-                for attachment in attachments:
-                    db.execute("INSERT INTO artifact_ingress VALUES (?, ?, ?, ?, ?, ?, ?)",
-                               (inbound.id, attachment['id'], inbound.actor_id, attachment['media_type'],
-                                attachment['checksum'], attachment['size'], now()))
-                    staged_metadata = pre_staged.get(attachment['id'])
-                    if staged_metadata is not None:
-                        db.execute("INSERT INTO artifact_stages VALUES (?, ?, ?, ?, ?, ?, 'staged')",
-                                   (inbound.id, attachment['id'], inbound.actor_id, staged_metadata.reference,
-                                    staged_metadata.checksum, staged_metadata.size))
+            # Ingress commits before calling the model or handing off a reply.
+            with connect(self.config.database) as db:
+                inserted = db.execute(
+                    "INSERT INTO turns (id, channel, sender, idempotency_key, inbound, status) "
+                    "VALUES (?, ?, ?, ?, ?, 'pending') "
+                    "ON CONFLICT(channel, sender, idempotency_key) DO NOTHING",
+                    (
+                        inbound.id,
+                        inbound.channel,
+                        inbound.sender,
+                        inbound.idempotency_key,
+                        json.dumps(asdict(inbound)),
+                    ),
+                ).rowcount
+                if inserted:
+                    for attachment in attachments:
+                        db.execute("INSERT INTO artifact_ingress VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                   (inbound.id, attachment['id'], inbound.actor_id, attachment['media_type'],
+                                    attachment['checksum'], attachment['size'], now()))
+                        staged_metadata = pre_staged.get(attachment['id'])
+                        if staged_metadata is not None:
+                            db.execute("INSERT INTO artifact_stages VALUES (?, ?, ?, ?, ?, ?, 'staged')",
+                                       (inbound.id, attachment['id'], inbound.actor_id, staged_metadata.reference,
+                                        staged_metadata.checksum, staged_metadata.size))
         # Attempt-storage failure must not undo durable ingress.
         with connect(self.config.database) as db:
             db.execute('BEGIN IMMEDIATE')
@@ -1167,15 +1171,15 @@ class Core:
                     if len(context.encoded([asdict(inbound), metadata_pack]).encode()) > pack.budget.max_bytes:
                         raise context.BudgetExhausted()
                     proposal = self.model.propose(inbound, self.config.contract_version, model_pack)
-                    with connect(self.config.database) as db:
-                        db.execute('BEGIN')
-                        preliminary = self._check_proposal(db, proposal, inbound)
                     try:
                         unsafe_model_output = self._contains_secret(asdict(proposal))
                     except RecursionError:
                         unsafe_model_output = False
-                    if preliminary.outcome == 'accepted' and unsafe_model_output:
+                    if unsafe_model_output:
                         raise OSError('credential-bearing model output is not accepted')
+                    with connect(self.config.database) as db:
+                        db.execute('BEGIN')
+                        preliminary = self._check_proposal(db, proposal, inbound)
                     requests = tuple(op for op in proposal.operations if isinstance(op, ContextRequestOperation))
                     if preliminary.outcome != 'accepted' or not requests:
                         break

@@ -65,7 +65,7 @@ class OpenAIResponsesModel:
             'schema_version': 1, 'contract_version': contract_version,
             'communication_id': inbound.id, 'candidate_claims': [
                 {'source_communication_id': inbound.id, 'interpretation': 'string', 'status': 'candidate'}],
-            'draft_response': 'string', 'intent': 'candidate', 'operations': [
+            'draft_response': 'string', 'intent': 'candidate', 'semantic_revision': None, 'operations': [
                 {'kind': 'entity', 'id': 'local-id', 'entity_type': 'Contract type',
                  'attributes': {}, 'action': 'create'},
                 {'kind': 'claim', 'id': 'local-id', 'target_id': 'entity local-id',
@@ -75,14 +75,31 @@ class OpenAIResponsesModel:
                  'resolution_ids': [], 'acceptance_mode': 'explicit'},
                 {'kind': 'artifact', 'id': 'attachment-1', 'artifact_type': 'permitted media artifact type',
                  'roles': ['permitted role'], 'action': 'classify'},
+                {'kind': 'grounding_resolution', 'item_id': 'pending Grounding item ID from context.records',
+                 'policy': 'Contract policy', 'evidence_communication_id': inbound.id,
+                 'acceptance_mode': 'explicit', 'outcome': 'accepted', 'rationale': None,
+                 'evidence_span': None, 'successor_ids': []},
             ],
+        }
+        semantic_commit_example = {
+            'schema_version': 1, 'contract_version': contract_version,
+            'communication_id': inbound.id, 'candidate_claims': [], 'draft_response': 'string',
+            'intent': 'semantic_commit', 'semantic_revision': context_pack.semantic_revision,
+            'operations': [{'kind': 'grounding_resolution', 'item_id': 'pending item ID',
+                'policy': 'Contract policy', 'evidence_communication_id': inbound.id,
+                'acceptance_mode': 'explicit', 'outcome': 'accepted', 'rationale': None,
+                'evidence_span': None, 'successor_ids': []}],
         }
         instruction = {
             'instruction': ('Return exactly one JSON SemanticProposal matching proposal_schema. Do not invent '
                             'missing or ambiguous values. Use only Contract names and attachment IDs supplied in '
                             'context.media. Artifact observations are candidate ClaimOperations with artifact_id and '
-                            'a GroundingPlanOperation; they are never grounded, authoritative, or persisted by you.'),
+                            'a GroundingPlanOperation; initial observations are never grounded, authoritative, or persisted by you. '
+                            'On a later sender contribution, you may propose a semantic_commit only with pending '
+                            'Grounding item IDs from context.records, the current context semantic_revision, and '
+                            'that contribution as evidence; Core validates Actor, policy, chronology and commits.'),
             'proposal_schema': proposal_schema,
+            'semantic_commit_example': semantic_commit_example,
             'communication': {'id': inbound.id, 'text': inbound.text},
             'contract_version': contract_version,
             'context': context_pack.captured(),
