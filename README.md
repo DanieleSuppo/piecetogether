@@ -798,6 +798,61 @@ Manual real-mailbox procedure (**not executed by automated tests**): configure t
 
 A short persistent handoff reservation precedes SMTP I/O, outside semantic locks. Acceptance after DATA is `success`; explicit refusal or failure before DATA is `failure`; lost acknowledgement during DATA or interruption with a started reservation is `indeterminate`. Only success opens the exposure gate. Determinate failure can retry the same saved MIME/Message-ID without another model call. Accepted handoff survives a crash before Core completion and is recovered without resending or duplicate exposure. SMTP cannot resolve a lost DATA acknowledgement idempotently: an indeterminate reservation remains unexposed on redelivery/restart and **is not resent blindly**. It requires upstream/operator reconciliation; this ticket adds no recovery/admin API. SMTP success means accepted provider handoff, not a read receipt or guaranteed final delivery. Transport MIME and reservations are private operational bookkeeping, never application state/events.
 
+### Telegram private text service (#26)
+
+The first-party Telegram ChannelPlugin provides **automatic HTTPS long polling and replies** through the Telegram Bot API, not a local-payload reader. Python 3.10+ and the existing stdlib/SQLite Core are sufficient; no runtime dependencies were added. Email JSON, SMTP configuration, `--receive-email`, `--serve-email`, development stdin, and the separate API/inspection commands are unchanged.
+
+1. Create a dedicated bot with Telegram's **BotFather**. Keep its token outside JSON and version control. Use its numeric prefix as `bot_id`; map the sender's **numeric Telegram User ID**, not a username, to an Actor.
+2. Configure `config/telegram.json` and a local `config/.env`. If no `.env` exists, copy `.env.example` there; **if it already exists, add only the Telegram variables without overwriting it**. Replace the bot/token/identity placeholders. Explicit process environment values override `.env`; supported environment variables override JSON defaults. `.env` is ignored by Git.
+3. Make sure this bot has **no webhook** and run **one acquisition worker per bot**. Disable an existing webhook through Telegram's operator tooling without dropping pending updates; the service deliberately does not delete webhooks or discard a queue.
+4. Start:
+
+```bash
+python3 -m piecetogether --config config/telegram.json --serve-telegram
+```
+
+Write a private text message to the bot from an explicitly mapped account. The worker acquires it automatically, resolves the Actor, persists canonical Communication before inference, processes it through the existing validation/recovery flow, and sends the reply to the **same private chat**, replying to the original message. The sample uses the deterministic ModelProvider and empty development Contract: expect an acquisition interpretation, not a generative assistant or automatically trusted domain assertion. Telegram cannot grant State API/event access, link identities, or configure providers.
+
+Configuration is frozen at bootstrap; editing environment or `.env` has no runtime effect. Shared fields (`database`, `contract`, `contract_version`, model, capabilities, and secret-reference names) keep the existing static JSON format/path rules. Telegram's supported overrides are:
+
+| Environment | Static JSON/default | Constraints |
+| --- | --- | --- |
+| `PT_TELEGRAM_BOT_TOKEN` | `secret_references[telegram.token_secret_reference]` | Required secret; sample maps this environment variable. Token prefix must match `bot_id`. A deployment may map another environment variable. |
+| `PT_TELEGRAM_BOT_ID` | `telegram.bot_id` | Positive canonical numeric bot ID, represented as a string; no leading zeros. |
+| `PT_TELEGRAM_IDENTITIES` | `identities` | JSON object of exact `telegram:<numeric User ID>` → nonempty Actor; replaces the whole map. Unmapped identities are rejected before inference. |
+| `PT_TELEGRAM_TIMEOUT_SECONDS` | `telegram.timeout_seconds`, 40 | Finite socket timeout greater than long polling, at most 300 seconds. |
+| `PT_TELEGRAM_LONG_POLL_SECONDS` | `telegram.long_poll_seconds`, 30 | Integer 1–50 seconds. |
+| `PT_TELEGRAM_POLL_SECONDS` | `telegram.poll_seconds`, 1 | Finite positive cycle delay, at most 86,400 seconds. |
+| `PT_TELEGRAM_BATCH_SIZE` | `telegram.batch_size`, 32 | Integer 1–100 updates. |
+
+Capabilities must be exactly `receive`, `reply`, `text`, `threading`. Only private human-authored text messages are supported (at most 4,096 Unicode characters); groups, edited messages, media/attachments, business messages, callbacks and channel posts are unsupported. Unwanted queued update types can still arrive despite `allowed_updates=["message"]`; they receive sanitized durable operational outcomes and cannot block later valid updates. No raw update, usernames/profile data, provider description, credential or token-bearing diagnostic URL is stored or printed. Token-containing input is refused. HTTPS uses system certificate/hostname validation, a fixed `api.telegram.org` endpoint and bounded response bodies; redirects are not followed.
+
+Canonical Communications retain numeric technical sender, resolved Actor, chat/thread, transport message/reply IDs, provider timestamp and Core receipt timestamp. Inbound idempotency is scoped to bot/chat/message. A known provider reply ID resolves to the Core outbound ID only within the originating bot and recipient. Outbound sender is the configured bot ID; recipient/thread are the originating private chat. Replies are plain text (no provider markup); longer Core responses are split at a conservative 4,096 UTF-16-unit budget without breaking Unicode characters. Each part has a durable handoff; the Core exposure gate opens only when **all** parts have accepted handoff. Success is provider acceptance, not a read receipt; it never automatically grounds a candidate.
+
+The `(bot_id, update_id)` acquisition checkpoint advances only after Core ingress is durable or a rejected/unsupported update has a durable sanitized outcome. Telegram confirms earlier updates on the **next** `getUpdates(offset)` request. Crash before checkpoint replays the same canonical ingress; restart resumes incomplete turns from Core without needing Telegram to retain the source. A bounded cursor recovers up to 100 pending turns each cycle. Completed turns and accepted handoffs are not resent. Empty polling does not advance the checkpoint. Acquisition/storage outages back off exponentially, capped at `max(poll_seconds, 300)`; provider `retry_after` can require a longer wait. Pending model work and determinate reply failures retry through existing saved-turn recovery at the cycle interval; HTTP flood-control waits suppress new requests until due. Rate-limit timing is process-local, so restart may receive a fresh provider rate-limit response.
+
+Explicit provider refusal is `failure` and can retry the identical saved part without another model call. A lost/malformed/mismatched acknowledgement, server error, or interrupted started handoff is **indeterminate**: Telegram `sendMessage` has no idempotency key. It stays unexposed and **is never resent blindly**, including after restart. If some parts were accepted, only definitively failed parts retry. An indeterminate part requires provider/operator reconciliation; this change adds no resend/reconciliation API. Network/model work holds no semantic database lock. Operational acquisition and handoff state, candidates and traces never enter Current Trusted View, the authenticated State API or grounded events. Sender disclosure remains Core-controlled default-deny.
+
+The service is quiet; Ctrl-C stops it. Operators with deployment filesystem access can inspect checkpoints and the latest Core status:
+
+```bash
+python3 - <<'PY'
+import json
+from pathlib import Path
+from piecetogether.core import Bootstrap, Core
+core = Core(Bootstrap.from_file(Path("config/telegram.json")))
+for outcome in core.inspect_telegram_acquisition():
+    print(json.dumps(outcome))
+PY
+python3 -m piecetogether --config config/telegram.json --inspect <communication_id>
+```
+
+An `acquired` row points to the durable Communication; its `outcome` is the **initial** processing result, so inspect the turn for subsequent recovery/delivery status. `unsupported` rows have no Communication and classify `unsupported_message`, `unmapped_identity`, or `invalid_communication`, never raw content or exception text. `--inspect` and `--serve-api` remain distinct local/application modes, not sender-accessible routes. Do not enable HTTP debug tracing of the token-bearing Telegram request path.
+
+**Manual real-bot check — documented, not executed:** configure BotFather token and exact sender mapping; start the command above; send two different private texts; expect two replies in that chat referencing their original messages. Inspect two acquired/completed Communications with the expected Actor and no automatic trusted mutation. Reply to an assistant message and check canonical `reply_to`; restart and verify no duplicate replies; leave polling idle; send from an unmapped account or send an attachment, then another valid text—expect a private operational rejection followed by normal acquisition. Temporarily disconnect the network, reconnect, and expect delayed recovery without a tight loop. Inspect only locally, keeping the token out of terminal/history/logs. This procedure needs real credentials and internet and was **not run** by automated tests.
+
+Limits: Telegram retains unreceived updates for at most **24 hours**, so a longer acquisition outage can lose messages that never reached Core. One worker owns each bot's update queue; a competing consumer can confirm/drop updates. A pre-existing webhook causes retrying acquisition errors and must be removed by the operator. Keep a deployment database/configuration per bot and preserve identity mappings across restart; no automatic remapping or cross-channel continuity (#28) is added. An ambiguous send may have reached Telegram even though Core cannot expose it; manual reconciliation is necessary. Protocol reference: [Telegram Bot API](https://core.telegram.org/bots/api#getupdates).
+
 ### Local Artifact bytes and lifecycle
 
 Set static `"artifact_store": "artifacts"` in bootstrap to enable persistent attachments. A normalized Communication may include at most 32 bounded attachments, each with an opaque sender-local `id`, base64 `content_base64`, and optional `media_type`; paths and provider/channel URLs are not accepted. The Core computes the checksum, stages immutable bytes under a Core-owned reference, and exposes only attachment metadata to model context. A `semantic_commit` `ArtifactOperation(..., action="persist")` must name that attachment ID and is accepted only when Contract policy and Core-owned staged evidence agree. The commit links metadata and a pending publication atomically; local finalization happens afterward. `core.artifact_bytes(artifact_id)` is the local Core-only accessor for finalized bytes. Pending content is marked unavailable in `current_view()`; redelivery or restart retries finalization without another model call. A failed publication stays pending and records its latest operational failure through `inspect_history()`; it neither blocks startup nor unrelated turns/publications. Operators may run `core.cleanup_artifact_staging()` to remove old registered or unregistered staging files (default minimum age: one hour); the local store lock spans Core staging registration and orphan sweeping, cleanup reserves a stage before unlinking, and restart, redelivery, or a later maintenance run releases an interrupted or failed unlink reservation. Linked pending and available content is preserved. Injected stores that support maintenance should provide the same `maintenance_lock`, `cleanup`, and `remove_staged` capability.

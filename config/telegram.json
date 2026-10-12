@@ -1,0 +1,18 @@
+{
+  "database": "../var/telegram.sqlite3",
+  "channel": "telegram",
+  "model": "deterministic",
+  "contract_version": "development-v1",
+  "contract": "development-contract.json",
+  "capabilities": ["receive", "reply", "text", "threading"],
+  "identities": {"telegram:987654321": "actor-1"},
+  "telegram": {
+    "bot_id": "123456789",
+    "token_secret_reference": "telegram-token",
+    "timeout_seconds": 40,
+    "long_poll_seconds": 30,
+    "poll_seconds": 1,
+    "batch_size": 32
+  },
+  "secret_references": {"telegram-token": "PT_TELEGRAM_BOT_TOKEN"}
+}

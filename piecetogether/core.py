@@ -24,6 +24,9 @@ from .email_channel import (
     CAPABILITIES as EMAIL_CAPABILITIES, DeliveryResult, EmailChannel, EmailConfig,
     ImapConfig, SmtpTransport, address, message_ids,
 )
+from .telegram_channel import (
+    CAPABILITIES as TELEGRAM_CAPABILITIES, BotApiTransport, TelegramChannel, TelegramConfig, numeric_id,
+)
 from .proposals import (
     CandidateClaim,
     ContextRequestOperation,
@@ -99,6 +102,7 @@ class Bootstrap:
     application_api: ApplicationApiConfig | None = None
     email: EmailConfig | None = None
     imap: ImapConfig | None = None
+    telegram: TelegramConfig | None = None
 
     def __post_init__(self) -> None:
         if self.projection is not None and not isinstance(self.projection, projections.ProjectionConfig):
@@ -113,13 +117,16 @@ class Bootstrap:
             raise ValueError("contract must name a declarative file")
         if self.artifact_store is not None and not isinstance(self.artifact_store, Path):
             raise ValueError("artifact_store must name a static local directory")
-        if self.channel not in ('development', 'email') or self.model != 'deterministic':
+        if self.channel not in ('development', 'email', 'telegram') or self.model != 'deterministic':
             raise ValueError('only static configured adapters are available')
         if (self.channel == 'email') != isinstance(self.email, EmailConfig):
             raise ValueError('Email channel requires a static Email transport configuration')
         if self.imap is not None and self.channel != 'email':
             raise ValueError('IMAP acquisition requires the Email channel')
-        expected = EMAIL_CAPABILITIES if self.channel == 'email' else ('receive', 'reply')
+        if (self.channel == 'telegram') != isinstance(self.telegram, TelegramConfig):
+            raise ValueError('Telegram channel requires static Telegram configuration')
+        expected = (EMAIL_CAPABILITIES if self.channel == 'email' else TELEGRAM_CAPABILITIES
+                    if self.channel == 'telegram' else ('receive', 'reply'))
         if set(self.capabilities) != set(expected):
             raise ValueError('enabled capabilities must match the static channel declaration')
         if (
@@ -137,6 +144,7 @@ class Bootstrap:
                 or not identity.startswith(f'{self.channel}:')
                 or not identity.removeprefix(f'{self.channel}:').strip()
                 or (self.channel == 'email' and not address(identity.removeprefix('email:')))
+                or (self.channel == 'telegram' and not numeric_id(identity.removeprefix('telegram:')))
                 or not isinstance(actor, str)
                 or not actor.strip()
                 for identity, actor in self.identities.items()
@@ -167,6 +175,10 @@ class Bootstrap:
                 and self.imap.password_secret_reference not in self.secret_references):
             raise ValueError('IMAP credentials must use configured secret references')
 
+        if (self.telegram is not None
+                and self.telegram.token_secret_reference not in self.secret_references):
+            raise ValueError('Telegram credentials must use configured secret references')
+
     @classmethod
     def from_file(cls, path: Path) -> "Bootstrap":
         _load_local_env(path.parent / '.env')
@@ -187,6 +199,7 @@ class Bootstrap:
             "application_api",
             "email",
             "imap",
+            "telegram",
         }
         if not isinstance(data, dict) or set(data) - allowed:
             raise ValueError("invalid bootstrap configuration")
@@ -199,6 +212,30 @@ class Bootstrap:
         database = Path(data.pop("database"))
         if 'email' in data:
             data['email'] = EmailConfig.from_dict(data['email'])
+        if data.get('channel') == 'telegram':
+            configured = data.get('telegram', {})
+            if not isinstance(configured, dict):
+                raise ValueError('telegram must be a static transport object')
+            configured = dict(configured)
+            for variable, field_name in (('PT_TELEGRAM_BOT_ID', 'bot_id'),):
+                if variable in os.environ:
+                    configured[field_name] = os.environ[variable]
+            for variable, field_name, parser in (
+                ('PT_TELEGRAM_TIMEOUT_SECONDS', 'timeout_seconds', float),
+                ('PT_TELEGRAM_LONG_POLL_SECONDS', 'long_poll_seconds', int),
+                ('PT_TELEGRAM_POLL_SECONDS', 'poll_seconds', float),
+                ('PT_TELEGRAM_BATCH_SIZE', 'batch_size', int),
+            ):
+                if variable in os.environ:
+                    try:
+                        configured[field_name] = parser(os.environ[variable])
+                    except ValueError:
+                        raise ValueError('invalid Telegram environment configuration') from None
+            data['telegram'] = TelegramConfig.from_dict(configured)
+            if 'PT_TELEGRAM_IDENTITIES' in os.environ:
+                data['identities'] = json.loads(os.environ['PT_TELEGRAM_IDENTITIES'])
+        elif 'telegram' in data:
+            data['telegram'] = TelegramConfig.from_dict(data['telegram'])
         if 'imap' in data:
             data['imap'] = ImapConfig.from_dict(_imap_from_environment(data['imap']))
         if 'projection' in data:
@@ -431,7 +468,11 @@ class Core:
         self.model = model or DeterministicModel()
         self.channel: ChannelPlugin = channel or (
             EmailChannel(config.database, config.email, SmtpTransport(config.email, config.secret_references))
-            if config.email is not None else DevelopmentChannel(config.database)
+            if config.email is not None else
+            TelegramChannel(config.database, config.telegram,
+                            BotApiTransport(config.telegram, config.secret_references),
+                            os.environ.get(config.secret_references[config.telegram.token_secret_reference], ''))
+            if config.telegram is not None else DevelopmentChannel(config.database)
         )
         if set(getattr(self.channel, 'capabilities', config.capabilities)) != set(config.capabilities):
             raise ValueError('ChannelPlugin capabilities do not match deployment configuration')
@@ -699,15 +740,27 @@ class Core:
         return result
 
     def recover_email_pending(self, after_rowid: int = 0, limit: int = 100) -> tuple[list[dict[str, Any]], int]:
-        """Resume bounded Email-only ingress without needing source MIME or development attachments."""
+        """Compatibility entry point for the delivered Email worker."""
+        if self.config.channel != 'email':
+            raise ValueError('Email recovery is unavailable')
+        return self.recover_channel_pending(after_rowid, limit)
+
+    def recover_channel_pending(self, after_rowid: int = 0, limit: int = 100) -> tuple[list[dict[str, Any]], int]:
+        """Resume bounded configured text-channel ingress without source transport payloads."""
+        if self.config.channel not in ('email', 'telegram'):
+            raise ValueError('text channel recovery is unavailable')
         if type(after_rowid) is not int or after_rowid < 0 or type(limit) is not int or not 1 <= limit <= 100:
-            raise ValueError('Email recovery cursor must be bounded')
+            raise ValueError('channel recovery cursor must be bounded')
+        bot_scope = f'{self.config.telegram.bot_id}:%' if self.config.telegram is not None else '%'
         with connect(self.config.database) as db:
-            rows = db.execute("SELECT rowid, inbound FROM turns WHERE channel='email' "
+            rows = db.execute("SELECT rowid, inbound FROM turns WHERE channel=? "
                               "AND status NOT IN ('completed', 'rejected') AND rowid>? "
-                              "ORDER BY rowid LIMIT ?", (after_rowid, limit)).fetchall()
+                              "AND idempotency_key LIKE ? ORDER BY rowid LIMIT ?",
+                              (self.config.channel, after_rowid, bot_scope, limit)).fetchall()
         fields = {'channel', 'sender', 'idempotency_key', 'text', 'sent_at', 'thread_id', 'reply_to',
                   'transport_message_id', 'transport_reply_to', 'references', 'subject'}
+        if self.config.channel == 'telegram':
+            fields -= {'references', 'subject'}
         outcomes = []
         for row in rows:
             inbound = json.loads(row['inbound'])
@@ -738,8 +791,19 @@ class Core:
                     raise ValueError('invalid Email message reference')
             if normalized_payload.get('transport_message_id') != normalized_payload.get('idempotency_key'):
                 raise ValueError('Email ingress requires its transport Message-ID')
+        elif self.config.channel == 'telegram':
+            if (attachments or any(name in payload for name in ('references', 'subject'))
+                    or not numeric_id(normalized_payload.get('sender'))
+                    or normalized_payload.get('thread_id') != normalized_payload.get('sender')
+                    or not numeric_id(normalized_payload.get('transport_message_id'))
+                    or (normalized_payload.get('transport_reply_to') is not None
+                        and not numeric_id(normalized_payload['transport_reply_to']))
+                    or self.config.telegram is None
+                    or normalized_payload.get('idempotency_key') != ':'.join((self.config.telegram.bot_id,
+                        normalized_payload['sender'], normalized_payload['transport_message_id']))):
+                raise ValueError('invalid canonical Telegram metadata')
         elif any(name in payload for name in ('transport_message_id', 'transport_reply_to', 'references', 'subject')):
-            raise ValueError('Email metadata requires the Email channel')
+            raise ValueError('transport metadata requires its configured channel')
         refs = normalized_payload.get('references', ())
         if (not isinstance(refs, (tuple, list)) or len(refs) > 32
                 or any(not isinstance(ref, str) or len(message_ids(ref)) != 1 for ref in refs)):
@@ -1168,6 +1232,12 @@ class Core:
         if not callable(inspect):
             raise ValueError('Email acquisition is unavailable')
         return cast(list[dict[str, str | None]], inspect())
+
+    def inspect_telegram_acquisition(self) -> list[dict[str, Any]]:
+        """Operator-only Telegram checkpoints, separate from trusted state/events."""
+        if not isinstance(self.channel, TelegramChannel):
+            raise ValueError('Telegram acquisition is unavailable')
+        return self.channel.acquisition_outcomes()
 
     def current_view(self) -> dict[str, Any]:
         """Trusted projection for local consumers; never a sender retrieval path."""

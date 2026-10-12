@@ -9,6 +9,7 @@ from pathlib import Path
 from .application_api import ApplicationApiServer
 from .core import Bootstrap, Core
 from .email_channel import EmailAcquisitionWorker, EmailChannel, ImapTransport, MAX_EMAIL_BYTES
+from .telegram_channel import TelegramAcquisitionWorker, TelegramChannel
 
 MAX_LINE = 65536
 
@@ -25,6 +26,7 @@ def main() -> int:
     )
     mode.add_argument('--receive-email', action='store_true', help='receive one MIME Email from stdin')
     mode.add_argument('--serve-email', action='store_true', help='poll the configured IMAP mailbox')
+    mode.add_argument('--serve-telegram', action='store_true', help='poll the configured Telegram bot')
     args = parser.parse_args()
     try:
         core = Core(Bootstrap.from_file(args.config))
@@ -44,6 +46,18 @@ def main() -> int:
         except (ValueError, OSError, sqlite3.Error):
             print("Invalid or unavailable application API configuration/state.", file=sys.stderr)
             return 1
+        return 0
+    if args.serve_telegram:
+        if core.config.telegram is None or not isinstance(core.channel, TelegramChannel):
+            print('Telegram acquisition is not configured.', file=sys.stderr)
+            return 1
+        try:
+            TelegramAcquisitionWorker(core, core.channel, core.channel.transport, core.config.telegram).run()
+        except (ValueError, TypeError, RecursionError, OSError, sqlite3.Error):
+            print('Invalid or unavailable Telegram acquisition configuration/state.', file=sys.stderr)
+            return 1
+        except KeyboardInterrupt:
+            return 0
         return 0
     if args.serve_email:
         if core.config.channel != 'email' or core.config.imap is None or not isinstance(core.channel, EmailChannel):
@@ -74,6 +88,9 @@ def main() -> int:
         return 0
     if core.config.channel == 'email':
         print('Email acquisition requires --receive-email.', file=sys.stderr)
+        return 1
+    if core.config.channel == 'telegram':
+        print('Telegram acquisition requires --serve-telegram.', file=sys.stderr)
         return 1
     # ponytail: one local JSONL worker; add a work scheduler for concurrent transports.
     while True:
