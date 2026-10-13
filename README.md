@@ -884,6 +884,26 @@ Each `media_policy` entry must map to an active Contract `artifact_types` entry 
 
 Manual checks (**NOT RUN**): configure an exact Email sender or Telegram numeric user mapping, ArtifactStore, Contract/media policy, and OpenAI secret; run `--serve-email` and `--serve-telegram` separately. Send each a clear small PNG and PDF with a caption. Inspect each acquired turn: expect only Candidate Claims/interpretation (not trusted state), canonical checksum/provenance but no filename/path/token/provider file identifier; then send the Contract-permitted explicit confirmation and inspect the resulting Grounded Claim/provenance. Restart before processing completes and verify it recovers without duplicate acquisition or download; send unsupported/oversized input followed by valid text and verify normal processing. Live mailbox, bot and OpenAI checks require real credentials/internet and were **NOT RUN**.
 
+### Email ↔ Telegram pending Grounding continuity (#28)
+
+The existing `--serve-email` and `--serve-telegram` workers can share one Core database,
+ArtifactStore, Domain Contract/version and configured ModelProvider. Their separate static
+identity maps must explicitly assign the Email address and Telegram numeric User ID to the
+same Actor. The supplied channel examples use **different databases**; identical Actor names
+alone do not link those deployments. See [configuration and manual procedure](docs/cross-channel-grounding.md)
+(**real mailbox/bot/model checks NOT RUN**).
+
+A later sender contribution on either linked channel can address older exposed/pending
+Grounding Items, without a cross-channel transport reply reference. Independent clauses may
+address different items; a clause matching multiple pending items remains ambiguous. Existing
+policy, exact evidence, chronology, exposure, dependency and revision checks still decide the
+outcome. Unaddressed siblings stay pending. The reply uses only the new Communication's
+configured channel and recipient; continuity never starts proactive outreach, automatic channel
+switching, inferred identity linking or general historical retrieval. The default deterministic
+model does not extract or resolve structured Grounding. Captured operational scenarios in
+`tests/test_cross_channel.py` keep the same configured OpenAI adapter throughout each dialog;
+they validate Core/transport behavior, not live provider semantic quality.
+
 ### Local Artifact bytes and lifecycle
 
 Set static `"artifact_store": "artifacts"` in bootstrap to enable persistent attachments. A normalized Communication may include at most 32 bounded attachments, each with an opaque sender-local `id`, base64 `content_base64`, and optional `media_type`; paths and provider/channel URLs are not accepted. The Core computes the checksum and stages immutable bytes under a Core-owned reference. Model context exposes only attachment metadata by default; policy-permitted byte-aware providers receive current-turn staged bytes only, never URLs, historical/unrelated artifacts, or Jev selector input. A `semantic_commit` `ArtifactOperation(..., action="persist")` must name that attachment ID and is accepted only when Contract policy and Core-owned staged evidence agree. The commit links metadata and a pending publication atomically; local finalization happens afterward. `core.artifact_bytes(artifact_id)` is the local Core-only accessor for finalized bytes. Pending content is marked unavailable in `current_view()`; redelivery or restart retries finalization without another model call. A failed publication stays pending and records its latest operational failure through `inspect_history()`; it neither blocks startup nor unrelated turns/publications. Operators may run `core.cleanup_artifact_staging()` to remove old registered or unregistered staging files (default minimum age: one hour); the local store lock spans Core staging registration and orphan sweeping, cleanup reserves a stage before unlinking, preserves stages for pending/retryable turns so recovery never needs the original transport, and restart, redelivery, or a later maintenance run releases an interrupted or failed unlink reservation. Linked pending and available content is preserved. Injected stores that support maintenance should provide the same `maintenance_lock`, `cleanup`, and `remove_staged` capability.

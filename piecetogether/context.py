@@ -341,15 +341,20 @@ def assemble(db: sqlite3.Connection, inbound: dict[str, Any], contract_version: 
         source = SemanticProposal.from_dict(json.loads(row['proposal']))
         targets.append(source_candidate(source, row['candidate_id']))
 
-    target_matches = {index for index, target in enumerate(targets)
-                      if _candidate_supported(target, inbound['text'])}
+    target_matches: set[int] = set()
+    # Independent clauses may target different items; a shared antecedent stays undisclosable.
+    for clause in re.split(r'[;.!?]', inbound['text']):
+        matches = {index for index, target in enumerate(targets)
+                   if _candidate_supported(target, clause)}
+        if len(matches) == 1:
+            target_matches.update(matches)
 
     for index, (row, target) in enumerate(zip(pending, targets)):
         payload = asdict(target)
         add(row['id'], 'pending_grounding', {'id': row['id'], 'grounding_id': row['grounding_id'],
             'policy': row['policy'], 'candidate': payload, 'source_communication_id': row['communication_id']},
             encoded(payload), mandatory=True, purposes=('grounding',) if inbound.get('reply_to') == row['grounding_id']
-            or target_matches == {index} else ())
+            or index in target_matches else ())
 
     for name, policy in contract.claim_concepts.items():
         explicit = phrase_boundary(inbound['text'], name)
