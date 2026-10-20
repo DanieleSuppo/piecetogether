@@ -356,6 +356,8 @@ class ContextTests(unittest.TestCase):
         trace = core.inspect(result['communication_id'])['trace']
         self.assertEqual(trace['selection'][0]['response']['model'], 'jev-1.13.0')
         self.assertEqual(trace['selection'][0]['response']['input_tokens'], 1200)
+        self.assertEqual(trace['selection'][0]['provider'], 'typesafe')
+        self.assertEqual(trace['selection'][0]['response']['raw_decisions']['model'], 'jev-1.13.0')
         self.assertIsNone(trace['selection'][0]['fallback_reason'])
         self.assertTrue(all(question['type'] == 'noul' for question in requests[0]['questions'].values()))
         self.assertNotIn('fixture-only', json.dumps(trace))
@@ -407,6 +409,10 @@ class ContextTests(unittest.TestCase):
                 result = core.accept(self.message(text='cucina'))
                 trace = core.inspect(result['communication_id'])['trace']
                 self.assertEqual(result['status'], 'budget_exhausted' if mode == 'usage' else 'completed')
+                if mode == 'unknown':
+                    self.assertIn('invented', trace['selection'][0]['raw_response']['answers'])
+                if mode == 'duplicate':
+                    self.assertIn('raw_json', trace['selection'][0]['raw_response'])
                 if mode != 'usage':
                     self.assertIsNotNone(trace['selection'][0]['fallback_reason'])
                     self.assertIn('fallback_response', trace['selection'][0])

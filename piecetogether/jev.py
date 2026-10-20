@@ -6,7 +6,7 @@ from time import monotonic
 from typing import Any
 
 from .context import (
-    Assessment, BudgetExhausted, SelectionConfig, SelectionRequest, SelectionResult,
+    Assessment, BudgetExhausted, SelectionConfig, SelectionFailure, SelectionRequest, SelectionResult,
     encoded, validate_selection,
 )
 from .contracts import unique_record
@@ -23,10 +23,12 @@ QUESTION = ('Is the specified candidate necessary for continuity, disambiguation
 
 
 class JevSelector:
+    provider_id = 'typesafe'
     def __init__(self, config: SelectionConfig, api_key: str):
         if config.model_id != 'jev-1.13.0':
             raise ValueError('Jev limits are verified only for pinned jev-1.13.0')
         self.config = config
+        self.model_id = config.model_id
         self.api_key = api_key
 
     def select(self, request: SelectionRequest) -> SelectionResult:
@@ -89,7 +91,11 @@ class JevSelector:
                 if size > MAX_RESPONSE_BYTES:
                     raise ValueError('Jev response too large')
                 chunks.append(chunk)
-            data = json.loads(b''.join(chunks), object_pairs_hook=unique_record)
+            raw = b''.join(chunks)
+            try:
+                data = json.loads(raw, object_pairs_hook=unique_record)
+            except (ValueError, UnicodeError):
+                raise SelectionFailure({'raw_json': raw.decode('utf-8', errors='replace')}) from None
         except http.client.HTTPException as error:
             raise OSError('Jev transport failure') from error
         finally:
@@ -99,19 +105,22 @@ class JevSelector:
                 or set(data['answers']) != set(questions) or not isinstance(data['usage'], dict)
                 or set(data['usage']) != {'input_tokens', 'output_tokens'}
                 or any(type(value) is not int or value < 0 for value in data['usage'].values())):
-            raise ValueError('invalid Jev response')
+            raise SelectionFailure(data)
         assessments = []
         if data['usage']['input_tokens'] > min(TOTAL_TOKENS, request.remaining_tokens):
             raise BudgetExhausted({'model': data['model'], 'usage': data['usage']})
         for record_id, answer in data['answers'].items():
             if not isinstance(answer, dict) or set(answer) != {'type', 'noul'} or answer['type'] != 'noul':
-                raise ValueError('invalid Jev primitive')
+                raise SelectionFailure(data)
             assessments.append(Assessment(record_id, 'noul', answer['noul']))
         # Core validates primitive values before it accepts these rankings.
         result = SelectionResult('completed', (), tuple(assessments), 'typesafe', data['model'],
                                  request.rubric_version, data['usage']['input_tokens'],
                                  data['usage']['output_tokens'], (monotonic() - started) * 1000)
-        validate_selection(result, request)
+        try:
+            validate_selection(result, request)
+        except ValueError:
+            raise SelectionFailure(data) from None
         minimum = self.config.minimum_relevance
         assert minimum is not None
         ranked = tuple(item.record_id for item in sorted(assessments, key=lambda item: -item.value)
@@ -120,4 +129,4 @@ class JevSelector:
         abstained = not ranked and any(0 < item.value < minimum for item in assessments)
         return SelectionResult('abstained' if abstained else 'completed', ranked, tuple(assessments),
                                'typesafe', data['model'], request.rubric_version,
-                               result.input_tokens, result.output_tokens, result.latency_ms)
+                               result.input_tokens, result.output_tokens, result.latency_ms, data)

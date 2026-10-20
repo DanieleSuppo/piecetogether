@@ -924,6 +924,10 @@ python3 -m piecetogether --config config/development.json --inspect <communicati
 
 Inspection returns the latest turn fields and an ordered `attempts` collection containing each attempt's number, status, proposal, outbound and trace. Reprocessing preserves earlier stale decisions and captured proposals. Startup imports the last available checkpoint from older deployments once; earlier attempts that those deployments already overwrote cannot be reconstructed.
 
+### Offline semantic replay
+
+`piecetogether.evaluation.capture(fixture_core, scenario)` explicitly captures an operator fixture with a consistent SQLite snapshot, versioned decisions, original Proposals, Artifact metadata and outcomes. `replay(case)` recomputes selection, validation, Grounding, commits and events in an isolated database with no inference or external delivery. Missing required evidence raises `ReplayUnavailable`; optional diagnostics are not required. Normal turns never snapshot the database. Fixtures are sensitive Working State, not sender or State API resources. See [Evaluation Trace and replay](docs/evaluation-replay.md) for the interface, evidence contract and limits.
+
 ### Application State API
 
 The versioned, authenticated application transport is separate from this sender acquisition worker. Configure loopback deployment credentials through `secret_references` and start it with `python3 -m piecetogether --config deployment.json --serve-api`. It exposes scoped Current Trusted View queries and trusted event consumption only; it never exposes candidates, traces, acquisition data or secret values. See [Application State API](docs/application-api.md) for the static configuration, scopes, endpoints, and cursor semantics.

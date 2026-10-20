@@ -93,6 +93,38 @@ class ApplicationApiTests(unittest.TestCase):
         self.assertNotIn("trace", json.dumps(body))
         self.assertNotIn("proposal", json.dumps(body))
 
+    def test_decision_evidence_never_enters_state_events_or_sender_replies(self):
+        from piecetogether.proposals import GroundingResolutionOperation
+        metadata = {'decision_provider': 'fixture', 'decision_model': 'pinned-v1',
+                    'decision_question_version': 'question-v1',
+                    'decision_raw': {'noul': .999, 'prompt': 'private-evaluation-diagnostic'}}
+        operations = (EntityOperation('new', 'Subject'),
+                      ClaimOperation('count', 'new', 'count', 4, 'p'),
+                      GroundingPlanOperation('p', ('count',), 'explicit', ('new',)))
+        core = Core(self.flow.config, model=fixtures.ProposalModel(operations, **metadata),
+                    contract_provider=fixtures.ContractProvider(self.flow.contract))
+        candidate = core.accept(self.flow.message(text='There are four'))
+        exposed = core.inspect(candidate['communication_id'])
+        self.assertIn('private-evaluation-diagnostic', json.dumps(exposed['trace']))
+        def resolutions(inbound):
+            return tuple(GroundingResolutionOperation(item['id'], 'p', inbound.id, 'explicit', 'accepted')
+                         for item in exposed['grounding_items'])
+        core.model = fixtures.ProposalModel(resolutions, intent='semantic_commit', semantic_revision=1, **metadata)
+        accepted = core.accept(self.flow.message(reply_to=exposed['outbound']['id']))
+        self.assertEqual(accepted['status'], 'completed')
+        new_id = core.inspect_history()['entities'][-1]['id']
+        with patch.dict(os.environ, {'PT_API_READER': 'reader-secret', 'PT_API_CONSUMER': 'consumer-secret',
+                                    'PT_API_BOTH': 'both-secret'}, clear=True):
+            server = self.server()
+            state_status, state = self.request(server, f'/v1/state?entity_id={new_id}', 'reader-secret')
+            event_status, events = self.request(server, '/v1/events', 'consumer-secret')
+            trace_status, _ = self.request(server, '/v1/traces', 'both-secret')
+        self.assertEqual((state_status, event_status, trace_status), (200, 200, 404))
+        visible = json.dumps([core.inspect_history(), core.current_view(), state, events,
+                              candidate['reply'], accepted['reply']])
+        for forbidden in ('private-evaluation-diagnostic', 'decision_raw', 'noul', 'generative_attempts'):
+            self.assertNotIn(forbidden, visible)
+
     def test_scopes_default_deny_and_events_require_their_own_scope(self):
         with patch.dict(os.environ, {
             "PT_API_READER": "reader-secret", "PT_API_CONSUMER": "consumer-secret",

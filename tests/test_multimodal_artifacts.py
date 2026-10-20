@@ -292,11 +292,11 @@ class MultimodalArtifactTests(unittest.TestCase):
                 media_policy={'image/png': MediaPolicy('VisualEvidence', ('ephemeral-evidence',))},
                 email=EmailConfig('core@example.com', 'localhost', security='plain'))
             model = OpenAIResponsesModel(OpenAIResponsesConfig('gpt-4.1-2025-04-14', 'key'), 'fake-key')
-            original = model.propose
+            original = model.propose_with_evidence
             def propose(inbound, version, pack):
                 Response.communication_id = inbound.id
                 return original(inbound, version, pack)
-            model.propose = propose
+            model.propose_with_evidence = propose
             with patch('piecetogether.openai_responses.http.client.HTTPSConnection', return_value=Connection()):
                 first = Core(config, model=model, contract_provider=PerceptionContractProvider(),
                     channel=EmailChannel(config.database, config.email, CapturedTransport()))
@@ -388,9 +388,11 @@ class MultimodalArtifactTests(unittest.TestCase):
 
         class Response:
             status = 200
+            usage = None
             def read(self, limit):
                 return json.dumps({'output': [{'content': [{'type': 'output_text',
-                                                             'text': json.dumps(proposal)}]}]}).encode()
+                                                             'text': json.dumps(proposal)}]}],
+                                   'usage': self.usage}).encode()
 
         class Connection:
             def __init__(self): self.requested = None
@@ -403,6 +405,17 @@ class MultimodalArtifactTests(unittest.TestCase):
         with patch('piecetogether.openai_responses.http.client.HTTPSConnection', return_value=connection):
             result = model.propose(communication, 'development-v1', pack)
         self.assertEqual(result.communication_id, 'turn')
+        with patch('piecetogether.openai_responses.http.client.HTTPSConnection', return_value=connection):
+            evidence = model.propose_with_evidence(communication, 'development-v1', pack)
+        self.assertIsNone(evidence.usage)
+        Response.usage = {'input_tokens': 17, 'output_tokens': 4, 'total_tokens': 21,
+                          'ignored_diagnostic': 'not replay evidence'}
+        with patch('piecetogether.openai_responses.http.client.HTTPSConnection', return_value=connection):
+            measured = model.propose_with_evidence(communication, 'development-v1', pack)
+        self.assertEqual(measured.usage, {'input_tokens': 17, 'output_tokens': 4, 'total_tokens': 21})
+        self.assertIsNone(evidence.usage)
+        self.assertEqual(evidence.model, 'gpt-4.1-2025-04-14')
+        self.assertEqual(evidence.instruction_version, 'semantic-proposal-v1')
         self.assertEqual(connection.requested[0:2], ('POST', '/v1/responses'))
         content = connection.requested[2]['input'][0]['content']
         self.assertEqual(content[1]['type'], 'input_image')

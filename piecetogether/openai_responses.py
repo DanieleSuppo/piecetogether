@@ -43,10 +43,22 @@ class OpenAIResponsesConfig:
             raise ValueError('invalid static OpenAI Responses configuration') from error
 
 
+@dataclass(frozen=True)
+class GenerationResult:
+    """Per-call metadata, detached from the Proposal and trusted records."""
+    proposal: SemanticProposal
+    provider: str
+    model: str
+    instruction_version: str
+    usage: dict[str, int] | None = None
+
+
 class OpenAIResponsesModel:
     """One opt-in model; operational failures raise OSError and never select another model."""
 
     accepts_media = True
+    provider_id = 'openai'
+    instruction_version = 'semantic-proposal-v1'
 
     def __init__(self, config: OpenAIResponsesConfig, api_key: str):
         if not isinstance(api_key, str) or not api_key:
@@ -55,6 +67,10 @@ class OpenAIResponsesModel:
 
     def propose(self, inbound: 'Communication', contract_version: str,
                 context_pack: 'ContextPack') -> SemanticProposal:
+        return self.propose_with_evidence(inbound, contract_version, context_pack).proposal
+
+    def propose_with_evidence(self, inbound: 'Communication', contract_version: str,
+                              context_pack: 'ContextPack') -> GenerationResult:
         media = context_pack.media
         if (len(media) > self.config.max_media_items
                 or sum(item.size for item in media) > self.config.max_media_bytes
@@ -139,7 +155,12 @@ class OpenAIResponsesModel:
             proposal = SemanticProposal.from_dict(json.loads(text))
             if proposal.communication_id != inbound.id or proposal.contract_version != contract_version:
                 raise OSError('OpenAI Responses proposal provenance is invalid')
-            return proposal
+            usage = decoded.get('usage')
+            usage = ({key: usage[key] for key in ('input_tokens', 'output_tokens', 'total_tokens')
+                      if key in usage and type(usage[key]) is int and usage[key] >= 0}
+                     if isinstance(usage, dict) else None)
+            return GenerationResult(proposal, 'openai', self.config.model_id,
+                                    self.instruction_version, usage or None)
         except (OSError, http.client.HTTPException, ValueError, TypeError, KeyError, UnicodeError):
             raise OSError('OpenAI Responses unavailable') from None
         finally:

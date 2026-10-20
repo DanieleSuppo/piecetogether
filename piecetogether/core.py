@@ -28,7 +28,7 @@ from .telegram_channel import (
     CAPABILITIES as TELEGRAM_CAPABILITIES, TEXT_CAPABILITIES as TELEGRAM_TEXT_CAPABILITIES,
     BotApiTransport, TelegramChannel, TelegramConfig, numeric_id,
 )
-from .openai_responses import OpenAIResponsesConfig, OpenAIResponsesModel
+from .openai_responses import GenerationResult, OpenAIResponsesConfig, OpenAIResponsesModel
 from .proposals import (
     ArtifactOperation,
     CandidateClaim,
@@ -367,7 +367,19 @@ class ChannelPlugin(Protocol):
     def deliver(self, outbound: Communication) -> bool | DeliveryResult: ...
 
 
+class IdentitySource:
+    """Instance-scoped identity/time seam; replay never changes production globals."""
+    def id(self) -> str:
+        return str(uuid4())
+
+    def now(self) -> str:
+        return now()
+
+
 class DeterministicModel:
+    provider_id = 'deterministic'
+    model_id = 'deterministic-v1'
+    instruction_version = 'echo-v1'
     def propose(
         self, inbound: Communication, contract_version: str, context_pack: context.ContextPack
     ) -> SemanticProposal:
@@ -493,16 +505,25 @@ def _decision_trace(proposal: SemanticProposal | None, fallback: str | None = No
     return snapshot
 
 
+def _trace_json(db: sqlite3.Connection, trace: dict[str, Any], status: str) -> str:
+    trace['processing_outcome'] = status
+    trace['event_ids'] = ([row['id'] for row in db.execute(
+        "SELECT id FROM semantic_outbox WHERE json_extract(record, '$.semantic_commit_id')=? ORDER BY rowid",
+        (trace['semantic_commit_id'],))] if trace.get('semantic_commit_id') else [])
+    return json.dumps(trace)
+
+
 def _record_attempt(
     db: sqlite3.Connection, communication_id: str, proposal: str | None,
     outbound: str | None, trace: dict[str, Any], status: str,
 ) -> None:
+    encoded_trace = _trace_json(db, trace, status)
     db.execute(
         "INSERT INTO processing_attempts VALUES (?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(communication_id, attempt) DO UPDATE SET "
         "proposal=excluded.proposal, outbound=excluded.outbound, "
         "trace=excluded.trace, status=excluded.status",
-        (communication_id, trace.get("attempt", 0), proposal, outbound, json.dumps(trace), status),
+        (communication_id, trace.get("attempt", 0), proposal, outbound, encoded_trace, status),
     )
 
 
@@ -524,8 +545,10 @@ class Core:
         artifact_store: LocalArtifactStore | None = None,
         projection_sink: projections.ProjectionSink | None = None,
         delivery_clock: Callable[[], float] = time,
+        identity_source: IdentitySource | None = None,
     ):
         self.config = config
+        self.identity_source = identity_source or IdentitySource()
         self._secret_values = tuple(value for reference in config.secret_references.values()
                                     if isinstance((value := os.environ.get(reference)), str) and value)
         provider = contract_provider or DeclarativeContractProvider(config.contract)
@@ -568,15 +591,17 @@ class Core:
             raise ValueError('ChannelPlugin capabilities do not match deployment configuration')
         self.artifact_store = artifact_store or (LocalArtifactStore(config.artifact_store)
                                                  if config.artifact_store is not None else None)
-        if config.selection.adapter == 'jev':
+        if selector is not None:
+            self.selector = selector
+        elif config.selection.adapter == 'jev':
             from .jev import JevSelector
             reference = config.secret_references.get(config.selection.secret_reference or '')
             api_key = os.environ.get(reference or '')
             if not reference or not api_key:
                 raise ValueError('Jev secret reference is unresolved')
-            self.selector: context.SemanticSelector = selector or JevSelector(config.selection, api_key)
+            self.selector = JevSelector(config.selection, api_key)
         else:
-            self.selector = selector or context.ReferenceSelector()
+            self.selector = context.ReferenceSelector()
         config.database.parent.mkdir(parents=True, exist_ok=True)
         with connect(config.database) as db:
             db.executescript("""
@@ -1006,10 +1031,10 @@ class Core:
         if self._contains_secret(normalized_payload):
             raise ValueError('credential-bearing evidence is not accepted')
         inbound = Communication(
-            id=str(uuid4()),
+            id=self.identity_source.id(),
             actor_id=actor,
             direction="inbound",
-            received_at=now(),
+            received_at=self.identity_source.now(),
             **normalized_payload,
         )
         # Avoid producing a fresh pre-stage for an already durable delivery. A pending
@@ -1061,7 +1086,7 @@ class Core:
                     for attachment in attachments:
                         db.execute("INSERT INTO artifact_ingress VALUES (?, ?, ?, ?, ?, ?, ?)",
                                    (inbound.id, attachment['id'], inbound.actor_id, attachment['media_type'],
-                                    attachment['checksum'], attachment['size'], now()))
+                                    attachment['checksum'], attachment['size'], self.identity_source.now()))
                         staged_metadata = pre_staged.get(attachment['id'])
                         if staged_metadata is not None:
                             db.execute("INSERT INTO artifact_stages VALUES (?, ?, ?, ?, ?, ?, 'staged')",
@@ -1084,7 +1109,7 @@ class Core:
             # Reserve a unique attempt without holding the transaction during I/O.
             attempt = db.execute('SELECT COALESCE(MAX(attempt), 0) + 1 FROM processing_attempts '
                                  'WHERE communication_id=?', (row['id'],)).fetchone()[0]
-            _record_attempt(db, row['id'], None, None, {'attempt': attempt, 'started_at': now()}, 'processing')
+            _record_attempt(db, row['id'], None, None, {'attempt': attempt, 'started_at': self.identity_source.now()}, 'processing')
             # The turn checkpoint and its commit must come from the same transaction.
             prior_commit = history.committed(db, row['id'])
         inbound = Communication(**stored)
@@ -1093,7 +1118,7 @@ class Core:
                 for attachment in attachments:
                     db.execute("INSERT OR IGNORE INTO artifact_ingress VALUES (?, ?, ?, ?, ?, ?, ?)",
                                (inbound.id, attachment['id'], inbound.actor_id, attachment['media_type'],
-                                attachment['checksum'], attachment['size'], now()))
+                                attachment['checksum'], attachment['size'], self.identity_source.now()))
         if row["status"] == "completed":
             return {
                 "communication_id": inbound.id,
@@ -1121,11 +1146,14 @@ class Core:
             Communication(**json.loads(row["outbound"])) if row["outbound"] else None
         )
         trace: dict[str, Any] = {
+            "schema_version": context.TRACE_SCHEMA_VERSION,
+            "policy_versions": dict(context.POLICY_VERSIONS),
+            "generative_attempts": [],
             "input_communication_id": inbound.id,
             "contract_version": self.config.contract_version,
             "model_provider": self.config.model,
             "attempt": attempt,
-            "started_at": now(),
+            "started_at": self.identity_source.now(),
             "commit_result": "not_requested",
             "delivery_result": "pending",
             "model_usage": None,
@@ -1158,6 +1186,10 @@ class Core:
                     pack = replace(pack, contract_json=context.encoded(asdict(self.contract)))
                 trace['selection'] = []
                 pack = context.select(pack, asdict(inbound), self.selector, trace['selection'])
+                for entry in trace['selection']:
+                    if self._contains_secret(entry):
+                        entry.clear()
+                        entry['capture'] = 'redacted'
                 trace['context_pack'] = pack.captured()
                 if pack.outcome == 'budget_exhausted':
                     raise context.BudgetExhausted()
@@ -1170,13 +1202,7 @@ class Core:
                     metadata_pack = model_pack.captured()
                     if len(context.encoded([asdict(inbound), metadata_pack]).encode()) > pack.budget.max_bytes:
                         raise context.BudgetExhausted()
-                    proposal = self.model.propose(inbound, self.config.contract_version, model_pack)
-                    try:
-                        unsafe_model_output = self._contains_secret(asdict(proposal))
-                    except RecursionError:
-                        unsafe_model_output = False
-                    if unsafe_model_output:
-                        raise OSError('credential-bearing model output is not accepted')
+                    proposal = self._generate(inbound, model_pack, trace)
                     with connect(self.config.database) as db:
                         db.execute('BEGIN')
                         preliminary = self._check_proposal(db, proposal, inbound)
@@ -1194,6 +1220,7 @@ class Core:
                 proposal = SemanticProposal.from_dict(json.loads(row["proposal"]))
                 if previous_trace.get('context_pack'):
                     pack = context.ContextPack.from_dict(previous_trace['context_pack'])
+                    trace['restored_from_attempt'] = previous_trace.get('attempt')
                     for name in ('context_pack', 'selection', 'retrieval', 'model_calls'):
                         if name in previous_trace:
                             trace[name] = previous_trace[name]
@@ -1238,15 +1265,15 @@ class Core:
                 proposal = SemanticProposal.from_dict(json.loads(captured))
                 if outbound is None:
                     outbound = Communication(
-                        id=str(uuid4()),
+                        id=self.identity_source.id(),
                         channel=inbound.channel,
                         sender=inbound.sender,
                         actor_id=inbound.actor_id,
                         direction="outbound",
                         idempotency_key=inbound.id,
                         text=context.response(proposal, asdict(inbound), pack),
-                        sent_at=now(),
-                        received_at=now(),
+                        sent_at=self.identity_source.now(),
+                        received_at=self.identity_source.now(),
                         thread_id=inbound.thread_id,
                         reply_to=inbound.id,
                     )
@@ -1256,7 +1283,7 @@ class Core:
             else:
                 outbound = None
                 trace["delivery_result"] = "not_attempted"
-                trace["finished_at"] = now()
+                trace["finished_at"] = self.identity_source.now()
                 trace["duration_ms"] = round((monotonic() - started) * 1000, 3)
             stage = "storage"
             with connect(self.config.database) as db:
@@ -1293,7 +1320,7 @@ class Core:
                         trace['delivery_result'] = 'accepted'
                         trace['finished_at'] = now()
                         trace['duration_ms'] = round((monotonic() - started) * 1000, 3)
-                        db.execute("UPDATE turns SET trace=? WHERE id=?", (json.dumps(trace), inbound.id))
+                        db.execute("UPDATE turns SET trace=? WHERE id=?", (_trace_json(db, trace, 'completed'), inbound.id))
                         _record_attempt(db, inbound.id, captured, checkpoint['outbound'], trace, 'completed')
                         return {"communication_id": inbound.id, "reply": outbound.text, "status": "completed"}
                 if not prior_commit and validation.outcome == "accepted":
@@ -1304,7 +1331,8 @@ class Core:
                         trace['commit_result'] = 'pending'
                     else:
                         validation, semantic_commit = history.commit(
-                            db, proposal, asdict(inbound), self.contract, now(),
+                            db, proposal, asdict(inbound), self.contract, self.identity_source.now(),
+                            new_id=self.identity_source.id,
                         )
                     trace["validation_result"] = validation.outcome
                     trace["validation_reasons"] = list(validation.reasons)
@@ -1321,14 +1349,14 @@ class Core:
                         status = "rejected" if validation.outcome == "rejected" else "reprocess_required"
                         outbound = None
                         trace["delivery_result"] = "not_attempted"
-                        trace["finished_at"] = now()
+                        trace["finished_at"] = self.identity_source.now()
                         trace["duration_ms"] = round((monotonic() - started) * 1000, 3)
                 if validation.outcome == "accepted" and not prior_commit:
                     history.remember_concepts(db, proposal, inbound.actor_id)
                 encoded_outbound = json.dumps(asdict(outbound)) if outbound else None
                 db.execute(
                     "UPDATE turns SET proposal=?, outbound=?, trace=?, status=? WHERE id=?",
-                    (captured, encoded_outbound, json.dumps(trace), status, inbound.id),
+                    (captured, encoded_outbound, _trace_json(db, trace, status), status, inbound.id),
                 )
                 _record_attempt(db, inbound.id, captured, encoded_outbound, trace, status)
             saved_outbound = encoded_outbound
@@ -1376,7 +1404,7 @@ class Core:
             trace["delivery_result"] = (
                 "indeterminate" if stage == "channel" else "not_attempted"
             )
-        trace["finished_at"] = now()
+        trace["finished_at"] = self.identity_source.now()
         trace["duration_ms"] = round((monotonic() - started) * 1000, 3)
         status = "completed" if accepted else status
         with connect(self.config.database) as db:
@@ -1395,16 +1423,74 @@ class Core:
                 return _checkpoint_result(checkpoint)
             db.execute(
                 "UPDATE turns SET status=?, trace=?, outbound=? WHERE id=?",
-                (status, json.dumps(trace), saved_outbound, inbound.id),
+                (status, _trace_json(db, trace, status), saved_outbound, inbound.id),
             )
             _record_attempt(db, inbound.id, captured, saved_outbound, trace, status)
             if accepted and outbound is not None:
-                history.expose(db, proposal, outbound.id, inbound.actor_id, trace['finished_at'])
+                history.expose(db, proposal, outbound.id, inbound.actor_id, trace['finished_at'],
+                               new_id=self.identity_source.id)
         return {
             "communication_id": inbound.id,
             "reply": outbound.text if accepted and outbound else None,
             "status": status,
         }
+
+    def _generate(self, inbound: Communication, pack: context.ContextPack,
+                  trace: dict[str, Any]) -> SemanticProposal:
+        model_config = getattr(self.model, 'config', None)
+        entry: dict[str, Any] = {
+            'provider': getattr(self.model, 'provider_id', type(self.model).__name__),
+            'model': getattr(self.model, 'model_id', getattr(model_config, 'model_id', None)),
+            'instruction_version': getattr(self.model, 'instruction_version', None),
+            'task_version': 'semantic-proposal-v1', 'input_communication_id': inbound.id,
+            'context_pack': pack.captured(), 'context_pack_ref': context.digest(context.encoded(pack.captured())),
+            'candidate_revisions': {record.id: record.revision for record in pack.catalogue},
+            'usage': None, 'proposal': None, 'outcome': 'provider_failure',
+        }
+        trace['generative_attempts'].append(entry)
+        started = monotonic()
+        try:
+            method = getattr(self.model, 'propose_with_evidence', self.model.propose
+                             if hasattr(self.model, 'propose') else None)
+            result = method(inbound, self.config.contract_version, pack)
+            proposal = result.proposal if isinstance(result, GenerationResult) else result
+            if isinstance(result, GenerationResult):
+                entry.update(provider=result.provider, model=result.model,
+                             instruction_version=result.instruction_version, usage=result.usage)
+            raw_unavailable = None
+            try:
+                raw = asdict(proposal)
+            except RecursionError:
+                # Capture failure must not replace deterministic policy rejection.
+                raw, raw_unavailable = None, 'unserializable'
+            if self._contains_secret(raw) or self._contains_secret(entry):
+                entry.update(provider=None, model=None, instruction_version=None, usage=None, capture='redacted')
+                raise OSError('credential-bearing model output is not accepted')
+            metadata, unavailable = _snapshot({key: entry[key] for key in
+                                               ('provider', 'model', 'instruction_version', 'usage')})
+            if unavailable:
+                entry.update(provider=None, model=None, instruction_version=None, usage=None,
+                             capture='unserializable')
+            else:
+                entry.update(metadata)
+            entry['proposal'], marker = _snapshot(raw)
+            if marker or raw_unavailable:
+                entry['capture'] = marker or raw_unavailable
+            entry['outcome'] = 'completed'
+            entry['proposal_ref'] = (context.digest(context.encoded(entry['proposal']))
+                                     if entry['proposal'] is not None else None)
+            return proposal
+        except (OSError, ValueError, TypeError, RecursionError) as error:
+            entry['outcome'] = 'provider_failure' if isinstance(error, OSError) else 'invalid_proposal'
+            raise
+        finally:
+            _, marker = _snapshot(entry)
+            redacted = self._contains_secret(entry)
+            if marker or redacted:
+                outcome = entry['outcome']
+                entry.clear()
+                entry.update(outcome=outcome, capture='redacted' if redacted else marker)
+            entry['latency_ms'] = round((monotonic() - started) * 1000, 3)
 
     def inspect(self, communication_id: str) -> dict[str, Any]:
         """Operator-only in-process inspection; never part of sender replies."""

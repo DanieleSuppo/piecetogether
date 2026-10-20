@@ -25,6 +25,23 @@ from .proposals import (
 )
 
 
+TRACE_SCHEMA_VERSION = 1
+SELECTION_POLICY_VERSION = 'context-selection-v1'
+POLICY_VERSIONS = {'selection': SELECTION_POLICY_VERSION, 'disclosure': 'disclosure-v1',
+                   'validation': 'semantic-validation-v1'}
+
+
+class ReplayUnavailable(RuntimeError):
+    """Required replay evidence is missing or incompatible; never a provider failure."""
+
+
+class SelectionFailure(ValueError):
+    """Safe structured adapter evidence, excluding transport and exception text."""
+    def __init__(self, raw: Any):
+        super().__init__('invalid_selection')
+        self.raw = raw
+
+
 class BudgetExhausted(ValueError):
     """Operational exhaustion, never semantic rejection."""
 
@@ -89,6 +106,7 @@ class SelectionRequest:
     remaining_calls: int
     remaining_tokens: int
     timeout_ms: int
+    minimum_relevance: float | None = None
 
 
 @dataclass(frozen=True)
@@ -106,9 +124,10 @@ class SelectionResult:
     provider: str
     model: str
     rubric_version: str
-    input_tokens: int = 0
-    output_tokens: int = 0
+    input_tokens: int | None = None
+    output_tokens: int | None = None
     latency_ms: float = 0
+    raw_decisions: Any = None
 
 
 class SemanticSelector(Protocol):
@@ -116,6 +135,8 @@ class SemanticSelector(Protocol):
 
 
 class ReferenceSelector:
+    provider_id = 'deterministic'
+    model_id = 'lexical-v1'
     def select(self, request: SelectionRequest) -> SelectionResult:
         text = json.loads(request.communication_json)['text'].casefold()
         words = set(re.findall(r'\w+', text))
@@ -452,7 +473,8 @@ def validate_selection(result: SelectionResult, request: SelectionRequest) -> No
             or not isinstance(result.provider, str) or not result.provider
             or not isinstance(result.model, str) or not result.model
             or not finite_number(result.latency_ms) or result.latency_ms < 0
-            or any(type(value) is not int or value < 0 for value in (result.input_tokens, result.output_tokens))):
+            or any(value is not None and (type(value) is not int or value < 0)
+                   for value in (result.input_tokens, result.output_tokens))):
         raise ValueError('invalid_selection')
     seen: set[str] = set()
     for item in result.assessments:
@@ -475,7 +497,8 @@ def select(pack: ContextPack, inbound: dict[str, Any], selector: SemanticSelecto
                        for record in pack.catalogue if not record.mandatory)
     request = SelectionRequest(encoded(inbound), candidates,
                                tuple(replace(record, payload_json='') for record in mandatory),
-                               config.rubric_version, config.max_calls, config.max_tokens, config.timeout_ms)
+                               config.rubric_version, config.max_calls, config.max_tokens, config.timeout_ms,
+                               config.minimum_relevance)
     input_size = len(encoded(asdict(request)).encode())
     mandatory_size = sum(len(record.payload_json.encode()) for record in mandatory)
     if (input_size > config.max_tokens or len(mandatory) > config.max_records
@@ -485,49 +508,91 @@ def select(pack: ContextPack, inbound: dict[str, Any], selector: SemanticSelecto
         return replace(pack, outcome='budget_exhausted')
     started = monotonic()
     result: SelectionResult | None = None
+    raw_response: Any = None
+    response_types: dict[str, Any] | None = None
+    capture_unavailable: str | None = None
+    failure: str | None = None
     fallback: str | None = None
     try:
         result = selector.select(request)
+        if isinstance(result, SelectionResult):
+            response_types = {
+                'ranked_ids_tuple': isinstance(result.ranked_ids, tuple),
+                'assessments_tuple': isinstance(result.assessments, tuple),
+                'assessment_items': [isinstance(item, Assessment) for item in result.assessments]
+                                    if isinstance(result.assessments, (tuple, list)) else None,
+            }
+            raw_response = asdict(result)
+        else:
+            raw_response = result
         validate_selection(result, request)
         if result.outcome != 'completed':
             fallback = result.outcome
-    except (OSError, ValueError, TypeError, KeyError, OverflowError) as error:
+    except (OSError, ValueError, TypeError, KeyError, OverflowError, RecursionError) as error:
+        failure = ('budget_exhausted' if isinstance(error, BudgetExhausted) else
+                   'provider_failure' if isinstance(error, OSError) else 'invalid_selection')
+        raw_response = error.raw if isinstance(error, SelectionFailure) else raw_response
+        if isinstance(error, RecursionError):
+            capture_unavailable = 'unserializable'
+        fallback = failure
         if isinstance(error, BudgetExhausted):
-            evidence.append({'rubric_version': config.rubric_version, 'outcome': 'budget_exhausted',
-                             'latency_ms': round((monotonic() - started) * 1000, 3),
-                             'provider_metadata': error.args[0] if error.args and isinstance(error.args[0], dict) else None,
-                             'candidate_revisions': {record.id: record.revision for record in candidates}})
-            return replace(pack, outcome='budget_exhausted')
-        fallback = 'invalid_selection' if not isinstance(error, OSError) else 'provider_failure'
+            raw_response = error.args[0] if error.args and isinstance(error.args[0], dict) else None
     elapsed = round((monotonic() - started) * 1000, 3)
-    entry: dict[str, Any] = {'input_communication_id': inbound['id'], 'rubric_version': config.rubric_version,
-                            'provider': config.adapter, 'model': config.model_id or 'lexical-v1',
+    # Captured adapters supply recorded elapsed time, not the speed of offline execution.
+    replay_timing = getattr(selector, 'replay_timing', None)
+    if replay_timing is not None:
+        elapsed = replay_timing['latency_ms']
+    entry: dict[str, Any] = {'request': asdict(request),
+                            'request_id': digest(encoded(asdict(request))),
+                            'selection_policy_version': SELECTION_POLICY_VERSION,
+                            'task_version': 'context-relevance-v1',
+                            'operating_point': config.minimum_relevance,
+                            'raw_response': raw_response, 'failure': failure,
+                            'provider_metadata': raw_response if failure == 'budget_exhausted' else None,
+                            'input_communication_id': inbound['id'], 'rubric_version': config.rubric_version,
+                            'provider': (result.provider if isinstance(result, SelectionResult) else
+                                         getattr(selector, 'provider_id', type(selector).__name__)),
+                            'model': (result.model if isinstance(result, SelectionResult) else
+                                      getattr(selector, 'model_id', config.model_id)),
                             'input_token_upper_bound': input_size, 'calls_used': 1,
                             'mandatory_revisions': {record.id: record.revision for record in mandatory},
                             'candidate_revisions': {record.id: record.revision for record in candidates},
                             'latency_ms': elapsed, 'fallback_reason': fallback,
-                            'response': asdict(result) if isinstance(result, SelectionResult) else None}
+                            'response': raw_response if isinstance(result, SelectionResult) else None,
+                            'response_types': response_types}
+    if capture_unavailable:
+        entry['response_capture'] = capture_unavailable
     # Malformed provider values must not poison durable trace serialization.
     try:
         encoded(entry)
     except (TypeError, ValueError, RecursionError):
         entry['response'] = None
+        entry['raw_response'] = None
+        entry['provider_metadata'] = None
+        entry['provider'] = entry['provider'] if isinstance(entry['provider'], str) else None
+        entry['model'] = entry['model'] if isinstance(entry['model'], str) else None
         entry['response_capture'] = 'unserializable'
     evidence.append(entry)
     reported_tokens = (result.input_tokens if isinstance(result, SelectionResult)
                        and type(result.input_tokens) is int and result.input_tokens >= 0 else 0)
-    if elapsed >= config.timeout_ms or reported_tokens > config.max_tokens:
+    if failure == 'budget_exhausted' or elapsed >= config.timeout_ms or reported_tokens > config.max_tokens:
+        entry['outcome'] = 'budget_exhausted'
         return replace(pack, outcome='budget_exhausted')
     if fallback:
         charged = max(input_size, reported_tokens)
         if config.max_calls < 2 or charged + input_size > config.max_tokens:
+            entry['outcome'] = 'budget_exhausted'
             return replace(pack, outcome='budget_exhausted')
         result = ReferenceSelector().select(replace(request, remaining_calls=config.max_calls - 1,
                                                    remaining_tokens=config.max_tokens - charged,
                                                    timeout_ms=max(1, config.timeout_ms - int(elapsed))))
         entry['fallback_response'] = asdict(result)
         entry['calls_used'] = 2
-        if (monotonic() - started) * 1000 >= config.timeout_ms:
+        total_elapsed = (replay_timing['total_latency_ms'] if replay_timing is not None
+                         else (monotonic() - started) * 1000)
+        entry['total_latency_ms'] = total_elapsed
+        if total_elapsed >= config.timeout_ms:
+            entry['outcome'] = 'budget_exhausted'
             return replace(pack, outcome='budget_exhausted')
     assert result is not None
     selected = list(mandatory)
@@ -541,7 +606,11 @@ def select(pack: ContextPack, inbound: dict[str, Any], selector: SemanticSelecto
         if len(selected) < config.max_records and size + cost <= config.max_bytes:
             selected.append(replace(record, reasons=('fallback' if fallback else 'ranking',)))
             size += cost
-    return replace(pack, records=tuple(selected), used_bytes=size)
+    selected_pack = replace(pack, records=tuple(selected), used_bytes=size)
+    entry['outcome'] = result.outcome
+    entry['selected_ids'] = [record.id for record in selected]
+    entry['context_pack_ref'] = digest(encoded(selected_pack.captured()))
+    return selected_pack
 
 
 def current(db: sqlite3.Connection, pack: ContextPack) -> bool:

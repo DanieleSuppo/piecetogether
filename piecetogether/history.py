@@ -3,6 +3,7 @@
 import json
 import re
 import sqlite3
+from collections.abc import Callable
 from dataclasses import asdict, replace
 from datetime import datetime
 from typing import Any
@@ -23,6 +24,10 @@ from .proposals import (
     ValidationResult,
     validate,
 )
+
+
+def _new_id() -> str:
+    return str(uuid4())
 
 
 def initialize(db: sqlite3.Connection, contract: DomainContract) -> None:
@@ -202,7 +207,7 @@ def grounding_response(proposal: SemanticProposal) -> str:
 
 def expose(
     db: sqlite3.Connection, proposal: SemanticProposal, outbound_id: str,
-    actor_id: str, exposed_at: str,
+    actor_id: str, exposed_at: str, *, new_id: Callable[[], str] = _new_id,
 ) -> None:
     plans = [op for op in proposal.operations if isinstance(op, GroundingPlanOperation)]
     if proposal.intent not in ('candidate', 'semantic_commit'):
@@ -215,7 +220,7 @@ def expose(
     for plan in plans:
         for candidate_id in plan.claim_ids + plan.resolution_ids:
             db.execute("INSERT OR IGNORE INTO pending_items VALUES (?, ?, ?, ?)",
-                       (str(uuid4()), outbound_id, candidate_id, plan.policy))
+                       (new_id(), outbound_id, candidate_id, plan.policy))
     for resolution in proposal.operations:
         if not isinstance(resolution, GroundingResolutionOperation) or resolution.outcome != 'corrected':
             continue
@@ -585,7 +590,7 @@ def normalized_successors(proposal: SemanticProposal, summary: dict[str, Any]) -
 
 def delete_artifact(
     db: sqlite3.Connection, operation: ArtifactOperation, inbound: dict[str, Any],
-    contract: DomainContract, metadata: dict[str, Any],
+    contract: DomainContract, metadata: dict[str, Any], *, new_id: Callable[[], str] = _new_id,
 ) -> None:
     """Explicit retention is the only exception to immutable Artifact history."""
     row = db.execute('SELECT * FROM trusted_artifacts WHERE id=?', (operation.id,)).fetchone()
@@ -593,7 +598,7 @@ def delete_artifact(
     retention = contract.artifact_types[operation.artifact_type]['retention']
     keep_metadata = retention['metadata'] == 'retain'
     keep_provenance = retention['provenance'] == 'retain'
-    transition = {'id': str(uuid4()), 'kind': 'artifact_transition', 'artifact_id': operation.id,
+    transition = {'id': new_id(), 'kind': 'artifact_transition', 'artifact_id': operation.id,
                   'action': 'delete', 'reason': operation.reason, 'retention': retention, **metadata}
     if keep_provenance:
         transition['provenance'] = {'source_communication_id': inbound['id'], 'actor_id': inbound['actor_id']}
@@ -642,7 +647,7 @@ def has_effect(proposal: SemanticProposal) -> bool:
 
 def commit(
     db: sqlite3.Connection, proposal: SemanticProposal, inbound: dict[str, Any],
-    contract: DomainContract, timestamp: str,
+    contract: DomainContract, timestamp: str, *, new_id: Callable[[], str] = _new_id,
 ) -> tuple[ValidationResult, dict[str, Any] | None]:
     result = check(db, proposal, inbound, contract)
     if result.outcome != 'accepted' or proposal.intent != 'semantic_commit':
@@ -654,7 +659,7 @@ def commit(
     artifact_records: list[dict[str, Any]] = []
     publications: list[dict[str, Any]] = []
     artifact_relationships: list[dict[str, Any]] = []
-    commit_id = str(uuid4())
+    commit_id = new_id()
     revision = proposal.semantic_revision
     assert revision is not None
     metadata = {'semantic_commit_id': commit_id, 'semantic_revision': revision + 1,
@@ -695,7 +700,7 @@ def commit(
             provenance.update(artifact_provenance)
         if parent:
             provenance['corrected_grounding_item_id'] = parent.item_id
-        record = {**asdict(candidate), **metadata, 'id': str(uuid4()),
+        record = {**asdict(candidate), **metadata, 'id': new_id(),
                   'provenance': provenance, 'provenance_class': 'grounded'}
         is_resolution = isinstance(candidate, (EntityOperation, ContextOperation)) and candidate.action == 'resolve'
         is_transition = isinstance(candidate, ContextOperation) and candidate.action in ('suspend', 'resume')
@@ -723,7 +728,7 @@ def commit(
                              "AND actor_id=?", (inbound['id'], artifact_operation.id, inbound['actor_id'])).fetchone()
         if ingress is None:
             return ValidationResult('rejected', ('invalid_artifact_provenance',)), None
-        artifact_id = str(uuid4())
+        artifact_id = new_id()
         provenance = {'source_communication_id': inbound['id'], 'actor_id': inbound['actor_id'],
                       'attachment_checksum': ingress['checksum'], 'attachment_size': ingress['size']}
         record = {'id': artifact_id, 'kind': 'artifact', 'attachment_id': artifact_operation.id,
@@ -732,7 +737,7 @@ def commit(
                   'media_type': ingress['media_type'], **metadata, 'provenance': provenance}
         artifact_records.append(record)
         if artifact_operation.action == 'supersede':
-            artifact_relationships.append({'id': str(uuid4()), 'kind': 'relationship',
+            artifact_relationships.append({'id': new_id(), 'kind': 'relationship',
                                           'relationship_type': 'supersedes', 'source_id': artifact_id,
                                           'target_id': artifact_operation.predecessor_id,
                                           **metadata, 'provenance': provenance})
@@ -796,7 +801,7 @@ def commit(
                         or origin['concept'] != predecessor['concept'] or source_id == target_id
                         or op.relationship_type in ('corrects', 'supersedes') and previous is None):
                     return ValidationResult('rejected', ('invalid_claim_history_relationship',)), None
-            relationships.append({**asdict(op), **metadata, 'id': str(uuid4()),
+            relationships.append({**asdict(op), **metadata, 'id': new_id(),
                                   'source_id': source_id, 'target_id': target_id,
                                   'provenance': records[grounding_id, op.source_id]['provenance']})
     # ponytail: scan lineage history; index semantic keys when ledger size matters.
@@ -825,7 +830,7 @@ def commit(
             raise sqlite3.IntegrityError('artifact staging changed inside semantic transaction')
     for deletion_operation in proposal.operations:
         if isinstance(deletion_operation, ArtifactOperation) and deletion_operation.action == 'delete':
-            delete_artifact(db, deletion_operation, inbound, contract, metadata)
+            delete_artifact(db, deletion_operation, inbound, contract, metadata, new_id=new_id)
     for (grounding_id, candidate_id), record in records.items():
         db.execute("INSERT INTO trusted_records VALUES (?, ?, ?, ?, ?)",
                    (record['id'], record['kind'], json.dumps(record), grounding_id, candidate_id))
@@ -858,7 +863,7 @@ def commit(
     db.execute("INSERT INTO semantic_commits VALUES (?, ?, ?)",
                (commit_id, inbound['id'], json.dumps(summary)))
     db.execute("UPDATE semantic_state SET revision=?", (revision + 1,))
-    event = {'id': str(uuid4()), **metadata, 'event_type': 'semantic_committed',
+    event = {'id': new_id(), **metadata, 'event_type': 'semantic_committed',
              'timestamp': timestamp, 'entity_ids': [r['id'] for r in records.values() if r['kind'] == 'entity'],
              'context_ids': list(dict.fromkeys(r['context_id'] if r['kind'] == 'context_transition' else r['id']
                                               for r in records.values() if r['kind'] in ('context', 'context_transition'))),

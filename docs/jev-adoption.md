@@ -46,9 +46,14 @@ and [Confidence](https://docs.typesafe.ai/confidence).
    mandatory items, truncation, retrieval steps and final semantic outcomes.
 4. With deployment-approved credentials and permitted text, run Jev with the
    pinned model and `context-relevance-v1` rubric. Save responses, usage and
-   fallback evidence. Captured responses can implement `SemanticSelector` for
-   subsequent offline replay; replay must preserve IDs/revisions and never make
-   another inference call.
+   fallback evidence. `piecetogether.evaluation.CapturedSelector` consumes ordered,
+   request-bound selector evidence through the same validation and bounded fallback
+   path. Use explicit `capture(fixture_core, scenario)` and `replay(case)` fixtures
+   to recompute downstream Packs, Grounding, commits and events without inference.
+   Recorded timing preserves budget exhaustion. Missing/redacted evidence or
+   incompatible policy/question/revision evidence raises `ReplayUnavailable`;
+   optional diagnostics are not required. See [operator replay](evaluation-replay.md)
+   for sensitive-fixture handling and the concrete interface.
 5. Evaluate candidate operating points on a tuning subset, then validate the
    chosen point on separate scenarios. No universal confidence threshold is
    assumed. Measure:
