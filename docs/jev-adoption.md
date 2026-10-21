@@ -78,3 +78,14 @@ and [Confidence](https://docs.typesafe.ai/confidence).
 
 Missing live credentials do not block deterministic operation or CI. They leave
 the deployment's adoption decision pending evidence.
+
+## #31 audit decision
+
+The [Core scenario coverage audit](core-scenario-coverage.md) adds deterministic
+captured-decision proofs, not measured deployment results. There is still no
+measured required-record recall, wrong-selection/false-accept rate, fallback
+rate, end-to-end latency or total-cost evidence. Jev remains unenabled; the
+deterministic selector remains the default. #17 uses captured optional decision
+metadata through ordinary proposals, not a separate live per-item Jev adapter;
+#27 does not adopt Jev for Artifact perception/classification. Enabling any path
+still requires the independent task-specific evidence above.
