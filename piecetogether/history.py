@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
-from . import view
+from . import retention, view
 from .contracts import DomainContract
 from .proposals import (
     ArtifactOperation,
@@ -114,6 +114,8 @@ def initialize(db: sqlite3.Connection, contract: DomainContract) -> None:
             record TEXT NOT NULL
         );
     """)
+    if retention.availability(db)['semantic_history'] != 'retain':
+        return
     db.execute("INSERT INTO semantic_state VALUES (1, 0, ?) "
                "ON CONFLICT(singleton) DO UPDATE SET contract_version=excluded.contract_version",
                (contract.version,))
@@ -891,6 +893,7 @@ def commit(
 
 
 def inspect_history(db: sqlite3.Connection) -> dict[str, Any]:
+    retention.require(db, 'semantic_history')
     state = db.execute("SELECT revision FROM semantic_state").fetchone()
     records = [json.loads(row['record']) for row in db.execute("SELECT record FROM trusted_records ORDER BY rowid")]
     artifacts = view.artifacts(db)

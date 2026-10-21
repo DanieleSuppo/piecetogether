@@ -10,6 +10,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, urlparse
 
+from .retention import RetentionBusy, RetentionUnavailable
+
 if TYPE_CHECKING:
     from .core import Core
 
@@ -334,6 +336,8 @@ class ApplicationApiServer:
                 raise _ApiError(HTTPStatus.NOT_FOUND, "not_found")
         except _ApiError as error:
             self._respond(handler, error.status, {"error": error.code})
+        except (RetentionUnavailable, RetentionBusy):
+            self._respond(handler, HTTPStatus.SERVICE_UNAVAILABLE, {"error": "retention_unavailable"})
         except Exception:
             self._respond(handler, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "unavailable"})
         else:

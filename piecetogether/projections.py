@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from . import retention
+
 
 @dataclass(frozen=True)
 class ProjectionConfig:
@@ -41,7 +43,8 @@ class DevelopmentProjectionSink:
         self.database = database
 
     def deliver(self, event: dict[str, Any]) -> bool:
-        with sqlite3.connect(self.database) as db:
+        with retention.operation(self.database), sqlite3.connect(self.database) as db:
+            retention.require_processing(db)
             record = json.dumps(event)
             db.execute('INSERT OR IGNORE INTO projection_deliveries VALUES (?, ?, ?)',
                        (event['id'], event['semantic_commit_id'], record))

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from .email_channel import DeliveryResult, valid_media
+from .retention import channel_processing
 
 if TYPE_CHECKING:
     from .core import Communication, Core
@@ -212,6 +213,7 @@ class TelegramChannel:
             return int(db.execute('SELECT COALESCE(MAX(update_id) + 1, 0) FROM telegram_acquisition '
                                   'WHERE bot_id=?', (self.config.bot_id,)).fetchone()[0])
 
+    @channel_processing
     def record_acquisition(self, update_id: int, communication_id: str | None, outcome: str) -> None:
         from .core import connect
         with connect(self.database) as db:
@@ -238,6 +240,7 @@ class TelegramChannel:
             raise ValueError('unsupported Telegram private message')
         return str(sender['id'])
 
+    @channel_processing
     def normalize(self, payload: Any) -> dict[str, Any]:
         from .core import connect
         sender_id = self.sender_identity(payload)
@@ -312,6 +315,7 @@ class TelegramChannel:
         return replace(outbound, sender=self.config.bot_id, recipient=inbound.sender,
                        transport_reply_to=inbound.transport_message_id)
 
+    @channel_processing
     def deliver(self, outbound: 'Communication') -> DeliveryResult:
         from .core import connect
         if (outbound.channel != 'telegram' or outbound.sender != self.config.bot_id

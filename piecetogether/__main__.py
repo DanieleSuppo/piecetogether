@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .application_api import ApplicationApiServer
 from .core import Bootstrap, Core
+from .retention import RetentionBusy, RetentionUnavailable
 from .email_channel import EmailAcquisitionWorker, EmailChannel, ImapTransport, MAX_EMAIL_BYTES
 from .telegram_channel import TelegramAcquisitionWorker, TelegramChannel
 
@@ -30,13 +31,13 @@ def main() -> int:
     args = parser.parse_args()
     try:
         core = Core(Bootstrap.from_file(args.config))
-    except (ValueError, TypeError, RecursionError, OSError, sqlite3.Error):
+    except (ValueError, TypeError, RecursionError, OSError, sqlite3.Error, RetentionBusy, RetentionUnavailable):
         print("Invalid or unavailable deployment configuration/state.", file=sys.stderr)
         return 1
     if args.inspect:
         try:
             print(json.dumps(core.inspect(args.inspect)))
-        except (KeyError, sqlite3.Error):
+        except (KeyError, sqlite3.Error, RetentionBusy, RetentionUnavailable):
             print("Communication unavailable.", file=sys.stderr)
             return 1
         return 0
@@ -53,7 +54,7 @@ def main() -> int:
             return 1
         try:
             TelegramAcquisitionWorker(core, core.channel, core.channel.transport, core.config.telegram).run()
-        except (ValueError, TypeError, RecursionError, OSError, sqlite3.Error):
+        except (ValueError, TypeError, RecursionError, OSError, sqlite3.Error, RetentionBusy, RetentionUnavailable):
             print('Invalid or unavailable Telegram acquisition configuration/state.', file=sys.stderr)
             return 1
         except KeyboardInterrupt:
@@ -68,7 +69,7 @@ def main() -> int:
                                    ImapTransport(core.config.imap, core.config.secret_references,
                                                  core.channel.acquired),
                                    core.config.imap).run()
-        except (ValueError, TypeError, RecursionError, OSError, sqlite3.Error):
+        except (ValueError, TypeError, RecursionError, OSError, sqlite3.Error, RetentionBusy, RetentionUnavailable):
             print('Invalid or unavailable Email acquisition configuration/state.', file=sys.stderr)
             return 1
         except KeyboardInterrupt:
@@ -82,6 +83,8 @@ def main() -> int:
             result = core.accept_transport(sys.stdin.buffer.read(MAX_EMAIL_BYTES + 1))
         except (ValueError, TypeError, RecursionError):
             result = {'error': 'invalid_communication'}
+        except (RetentionBusy, RetentionUnavailable):
+            result = {'error': 'retention_unavailable'}
         except (OSError, sqlite3.Error):
             result = {'error': 'storage_unavailable'}
         print(json.dumps(result), flush=True)
@@ -107,6 +110,8 @@ def main() -> int:
             result = core.accept_transport(json.loads(line))
         except (ValueError, TypeError, RecursionError):
             result = {"error": "invalid_communication"}
+        except (RetentionBusy, RetentionUnavailable):
+            result = {"error": "retention_unavailable"}
         except (OSError, sqlite3.Error):
             result = {"error": "storage_unavailable"}
         print(json.dumps(result), flush=True)

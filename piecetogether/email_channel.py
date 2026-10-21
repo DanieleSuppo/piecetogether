@@ -18,6 +18,8 @@ from email.utils import format_datetime, parsedate_to_datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal, Protocol
 
+from .retention import channel_processing
+
 if TYPE_CHECKING:
     from .core import Communication, Core
 
@@ -195,6 +197,7 @@ class EmailChannel:
                 PRIMARY KEY(mailbox, uidvalidity, uid)
             )''')
 
+    @channel_processing
     def normalize(self, payload: Any) -> dict[str, Any]:
         from .core import connect
         if not isinstance(payload, bytes) or not 0 < len(payload) <= MAX_EMAIL_BYTES:
@@ -283,6 +286,7 @@ class EmailChannel:
             return db.execute('SELECT 1 FROM email_acquisition WHERE mailbox=? AND uidvalidity=? AND uid=?',
                               (mailbox, uidvalidity, uid)).fetchone() is not None
 
+    @channel_processing
     def record_acquisition(self, mailbox: str, uidvalidity: str, uid: str, status: str,
                            communication_id: str | None, outcome: str) -> None:
         from .core import connect
@@ -312,6 +316,7 @@ class EmailChannel:
                        transport_reply_to=inbound.transport_message_id,
                        references=tuple(ref for ref in refs if ref is not None))
 
+    @channel_processing
     def deliver(self, outbound: 'Communication') -> DeliveryResult:
         from .core import connect
         if (outbound.channel != 'email' or outbound.sender != self.config.address

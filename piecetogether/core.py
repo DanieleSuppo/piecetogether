@@ -16,8 +16,9 @@ from time import monotonic, time
 from typing import Any, ContextManager, Protocol, cast
 from uuid import uuid4
 
-from . import context, history, projections, references, view
+from . import context, history, projections, references, retention, view
 from .application_api import ApplicationApiConfig
+from .retention import RetentionPolicy
 from .artifact_store import LocalArtifactStore, StagedContent
 from .contracts import DeclarativeContractProvider, DomainContractProvider
 from .email_channel import (
@@ -122,8 +123,11 @@ class Bootstrap:
     telegram: TelegramConfig | None = None
     openai: OpenAIResponsesConfig | None = None
     media_policy: dict[str, MediaPolicy] = field(default_factory=dict)
+    retention: RetentionPolicy = field(default_factory=RetentionPolicy)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.retention, retention.RetentionPolicy):
+            raise ValueError('retention must be a static RetentionPolicy')
         if self.projection is not None and not isinstance(self.projection, projections.ProjectionConfig):
             raise ValueError('projection must be a static ProjectionConfig')
         if self.application_api is not None and not isinstance(self.application_api, ApplicationApiConfig):
@@ -235,6 +239,7 @@ class Bootstrap:
             "telegram",
             "openai",
             "media_policy",
+            "retention",
         }
         if not isinstance(data, dict) or set(data) - allowed:
             raise ValueError("invalid bootstrap configuration")
@@ -245,6 +250,8 @@ class Bootstrap:
         ):
             raise ValueError("capabilities must be a string array")
         database = Path(data.pop("database"))
+        if 'retention' in data:
+            data['retention'] = retention.RetentionPolicy.from_dict(data['retention'])
         if 'email' in data:
             data['email'] = EmailConfig.from_dict(data['email'])
         if data.get('channel') == 'telegram':
@@ -408,6 +415,7 @@ class DevelopmentChannel:
     def prepare(self, outbound: Communication, inbound: Communication) -> Communication:
         return outbound
 
+    @retention.channel_processing
     def deliver(self, outbound: Communication) -> bool:
         with connect(self.database) as db:
             db.execute(
@@ -603,7 +611,12 @@ class Core:
         else:
             self.selector = context.ReferenceSelector()
         config.database.parent.mkdir(parents=True, exist_ok=True)
-        with connect(config.database) as db:
+        self._initialize_state()
+
+    @retention.coordinated
+    def _initialize_state(self) -> None:
+        with connect(self.config.database) as db:
+            retention.initialize(db)
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS turns (
                     id TEXT PRIMARY KEY,
@@ -630,6 +643,14 @@ class Core:
                     PRIMARY KEY(communication_id, attempt)
                 );
             """)
+            history.initialize(db, self.contract)
+            projections.initialize(db)
+            if (self.config.retention != RetentionPolicy()
+                    or any(value != 'retain' for value in retention.availability(db).values())):
+                # Initialize schema only for maintenance: never recover checkpoints,
+                # refresh references, publish bytes or dispatch before a sweep,
+                # or after durable unavailability, even with a retain configuration.
+                return
             # Import the last available checkpoint from pre-history deployments once.
             legacy_rows = db.execute(
                 "SELECT * FROM turns WHERE trace IS NOT NULL AND NOT EXISTS "
@@ -640,8 +661,6 @@ class Core:
                     db, row["id"], row["proposal"], row["outbound"],
                     json.loads(row["trace"]), row["status"],
                 )
-            history.initialize(db, self.contract)
-            projections.initialize(db)
         if self.artifact_store is not None:
             with self._artifact_maintenance_lock():
                 self._release_abandoned_artifact_cleanup()
@@ -651,6 +670,15 @@ class Core:
             self.refresh_references()
         self._dispatch_events_after_commit()
 
+    def apply_retention(self) -> dict[str, str]:
+        """Operator-only deployment sweep; rejects active local Core operations."""
+        with retention.operation(self.config.database, exclusive=True):
+            with connect(self.config.database) as db:
+                db.execute('PRAGMA secure_delete=ON')
+                db.execute('BEGIN IMMEDIATE')
+                return retention.apply(db, self.config.retention)
+
+    @retention.processing
     def refresh_references(self) -> dict[str, Any]:
         """Read the configured provider outside locks, then atomically append its assertions."""
         provider = self.reference_provider
@@ -755,6 +783,7 @@ class Core:
                     elif row['state'] == 'cleaning':
                         raise OSError('artifact staging cleanup is in progress')
 
+    @retention.processing
     def retry_artifact_deletion(self) -> dict[str, str]:
         """Recover committed byte deletion outside semantic transactions."""
         if self.artifact_store is None:
@@ -777,6 +806,7 @@ class Core:
                     outcomes[job['artifact_id']] = 'pending'
         return outcomes
 
+    @retention.processing
     def retry_artifact_finalization(self) -> dict[str, str]:
         """Serialize publication with local byte removal; never resurrect deleted content."""
         with self._artifact_maintenance_lock():
@@ -823,6 +853,7 @@ class Core:
                 outcomes[publication['artifact_id']] = 'pending'
         return outcomes
 
+    @retention.processing
     def cleanup_artifact_staging(self, minimum_age_seconds: float = 3600) -> list[str]:
         """Sweep old unlinked stages; abandoned reservations are released before each run."""
         if self.artifact_store is None:
@@ -893,6 +924,7 @@ class Core:
                                                  row['checksum'], row['size'], content))
         return tuple(media)
 
+    @retention.processing
     def artifact_bytes(self, artifact_id: str) -> bytes:
         """Core-only accessor for finalized local bytes; sender acquisition has no byte URL."""
         if self.artifact_store is None:
@@ -912,10 +944,12 @@ class Core:
                     raise KeyError(artifact_id)
             return content
 
+    @retention.processing
     def accept_transport(self, payload: Any) -> dict[str, Any]:
         """Normalize through the configured first-party channel before durable ingress."""
         return self.accept(self.channel.normalize(payload))
 
+    @retention.processing
     def accept(self, payload: Any) -> dict[str, Any]:
         result = self._accept(payload)
         self._dispatch_events_after_commit()
@@ -927,6 +961,7 @@ class Core:
             raise ValueError('Email recovery is unavailable')
         return self.recover_channel_pending(after_rowid, limit)
 
+    @retention.processing
     def recover_channel_pending(self, after_rowid: int = 0, limit: int = 100) -> tuple[list[dict[str, Any]], int]:
         """Resume bounded configured channel ingress from Core-owned staged evidence."""
         if self.config.channel not in ('email', 'telegram'):
@@ -1492,9 +1527,13 @@ class Core:
                 entry.update(outcome=outcome, capture='redacted' if redacted else marker)
             entry['latency_ms'] = round((monotonic() - started) * 1000, 3)
 
+    @retention.coordinated
     def inspect(self, communication_id: str) -> dict[str, Any]:
         """Operator-only in-process inspection; never part of sender replies."""
         with connect(self.config.database) as db:
+            db.execute('BEGIN')
+            retention.require(db, 'communications')
+            availability = retention.availability(db)
             row = db.execute(
                 "SELECT * FROM turns WHERE id=?", (communication_id,)
             ).fetchone()
@@ -1519,11 +1558,14 @@ class Core:
                 for item in attempts
             ],
             **{
-                name: json.loads(row[name]) if row[name] else None
+                name: ({'availability': availability['evaluation_traces']}
+                       if name == 'trace' and availability['evaluation_traces'] != 'retain'
+                       else json.loads(row[name]) if row[name] else None)
                 for name in ("inbound", "proposal", "outbound", "trace")
             },
         }
 
+    @retention.processing
     def inspect_email_acquisition(self) -> list[dict[str, str | None]]:
         """Operator-only Email acquisition checkpoints; never sender or State API data."""
         inspect = getattr(self.channel, 'acquisition_outcomes', None)
@@ -1531,18 +1573,21 @@ class Core:
             raise ValueError('Email acquisition is unavailable')
         return cast(list[dict[str, str | None]], inspect())
 
+    @retention.processing
     def inspect_telegram_acquisition(self) -> list[dict[str, Any]]:
         """Operator-only Telegram checkpoints, separate from trusted state/events."""
         if not isinstance(self.channel, TelegramChannel):
             raise ValueError('Telegram acquisition is unavailable')
         return self.channel.acquisition_outcomes()
 
+    @retention.coordinated
     def current_view(self) -> dict[str, Any]:
         """Trusted projection for local consumers; never a sender retrieval path."""
         with connect(self.config.database) as db:
             db.execute("BEGIN")
             return view.current_view(db)
 
+    @retention.coordinated
     def inspect_history(self) -> dict[str, Any]:
         """Operator-only ledger inspection, separate from sender acquisition."""
         with connect(self.config.database) as db:
@@ -1557,6 +1602,7 @@ class Core:
             # Explicit maintenance surfaces the storage error; acquisition keeps its outcome.
             pass
 
+    @retention.processing
     def dispatch_events(self) -> dict[str, str]:
         """Publish durable trusted events without semantic locks or model work."""
         if self.projection_sink is None:
@@ -1591,6 +1637,7 @@ class Core:
                     db, row['id'], attempt, self.delivery_clock(), config, accepted, error_type)
         return outcomes
 
+    @retention.processing
     def recover_event_delivery(self, event_id: str) -> bool:
         """Operator resumes an exhausted delivery budget, keeping payload and attempt history."""
         with connect(self.config.database) as db:
@@ -1598,21 +1645,28 @@ class Core:
                                    "next_attempt_at=?, lease_until=NULL WHERE event_id=? AND state='failed'",
                                    (self.delivery_clock(), event_id)).rowcount)
 
+    @retention.coordinated
     def inspect_event_delivery(self) -> list[dict[str, Any]]:
         """Operational delivery evidence, never trusted knowledge or sender replies."""
         with connect(self.config.database) as db:
             db.execute('BEGIN')
+            retention.require(db, 'semantic_history')
             return projections.inspect(db)
 
+    @retention.coordinated
     def trusted_events(self) -> list[dict[str, Any]]:
         """Immutable public-event payloads, excluding delivery and processing internals."""
         with connect(self.config.database) as db:
             db.execute('BEGIN')
+            retention.require(db, 'semantic_history')
             return [json.loads(row['record']) for row in db.execute(
                 'SELECT record FROM semantic_outbox ORDER BY rowid')]
 
+    @retention.coordinated
     def inspect_concepts(self) -> list[dict[str, Any]]:
         """Non-authoritative vocabulary for later Core-owned reconciliation."""
         with connect(self.config.database) as db:
+            db.execute('BEGIN')
+            retention.require(db, 'semantic_history')
             return [json.loads(row['record']) for row in db.execute(
                 "SELECT record FROM emergent_concepts ORDER BY rowid")]

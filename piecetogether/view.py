@@ -5,6 +5,8 @@ import sqlite3
 from itertools import combinations
 from typing import Any
 
+from . import retention
+
 
 REPLACEMENT_RELATIONS = ('corrects', 'supersedes')
 
@@ -41,6 +43,8 @@ def artifacts(db: sqlite3.Connection) -> list[dict[str, Any]]:
 
 def current_view(db: sqlite3.Connection) -> dict[str, Any]:
     """Derive the view inside the caller's read transaction; no stale cache."""
+    retention.require(db, 'current_view')
+    retention.require(db, 'semantic_history')
     revision = db.execute('SELECT revision FROM semantic_state').fetchone()['revision']
     records = [json.loads(row['record']) for row in db.execute(
         'SELECT record FROM trusted_records ORDER BY rowid')]

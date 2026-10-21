@@ -18,7 +18,7 @@ from .openai_responses import GenerationResult
 from .proposals import SemanticProposal
 from .telegram_channel import TelegramConfig
 
-from . import context
+from . import context, retention
 
 ReplayUnavailable = context.ReplayUnavailable
 
@@ -360,7 +360,7 @@ class _CapturedStore:
 # Only deterministic Core state belongs in a fixture. Transport queues, delivery logs
 # and optional prompt diagnostics do not.
 _STATE_TABLES = {
-    'turns', 'processing_attempts', 'semantic_state', 'semantic_commits', 'trusted_records',
+    'retention_state', 'turns', 'processing_attempts', 'semantic_state', 'semantic_commits', 'trusted_records',
     'reference_assertions', 'reference_commits', 'trusted_relationships', 'trusted_groundings',
     'trusted_grounding_items', 'exposed_groundings', 'pending_items', 'candidate_target_bindings',
     'semantic_outbox', 'emergent_concepts', 'artifact_ingress', 'artifact_stages', 'trusted_artifacts',
@@ -427,9 +427,27 @@ def _restore(state: bytes, database: Path) -> None:
     database.write_bytes(state)
 
 
+def _initial_revision(database: Path) -> int:
+    """Check retained evidence before Core startup can initialize missing state."""
+    try:
+        with closing(sqlite3.connect(database)) as db:
+            retention.require_processing(db)
+            tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            # A missing retention table means legacy retain, not erased evidence.
+            if _STATE_TABLES - {'retention_state'} - tables:
+                raise ReplayUnavailable('missing initial-state evidence tables')
+            rows = db.execute('SELECT revision FROM semantic_state WHERE singleton=1').fetchall()
+            if len(rows) != 1 or type(rows[0][0]) is not int or rows[0][0] < 0:
+                raise ReplayUnavailable('missing initial semantic revision')
+            return int(rows[0][0])
+    except (retention.RetentionUnavailable, sqlite3.Error) as error:
+        raise ReplayUnavailable('initial-state evidence unavailable') from error
+
+
 def _configuration(core: Core) -> dict[str, Any]:
     return {'identities': dict(core.config.identities), 'channel': core.config.channel,
             'capabilities': list(core.config.capabilities), 'contract_version': core.contract.version,
+            'retention': asdict(core.config.retention),
             'selection': asdict(core.config.selection), 'media_policy': {
                 key: asdict(value) for key, value in core.config.media_policy.items()},
             'telegram_bot_id': core.config.telegram.bot_id if core.config.telegram else None,
@@ -440,6 +458,7 @@ def _bootstrap(configuration: dict[str, Any], root: Path) -> Bootstrap:
     channel = configuration['channel']
     return Bootstrap(root / 'core.sqlite3', configuration['identities'], channel=channel,
         capabilities=tuple(configuration['capabilities']), contract_version=configuration['contract_version'],
+        retention=retention.RetentionPolicy.from_dict(configuration['retention']),
         selection=context.SelectionConfig(**configuration['selection']),
         media_policy={key: MediaPolicy(value['artifact_type'], tuple(value['roles']))
                       for key, value in configuration['media_policy'].items()},
@@ -518,7 +537,9 @@ def capture(core: Core, scenario: Callable[[ReplayRecorder], None], *, channel: 
     Only supplied fixture adapters execute during capture. The default channel is local.
     Provider objects are reused for capture, never serialized or constructed during replay.
     """
-    initial = _snapshot(core.config.database)
+    with retention.operation(core.config.database):
+        _initial_revision(core.config.database)
+        initial = _snapshot(core.config.database)
     identities = _RecordingIdentity()
     with tempfile.TemporaryDirectory(prefix='piecetogether-capture-') as directory:
         root = Path(directory)
@@ -526,12 +547,12 @@ def capture(core: Core, scenario: Callable[[ReplayRecorder], None], *, channel: 
                          artifact_store=root / 'artifacts' if core.artifact_store is not None else None,
                          reference_state=None, projection=None, application_api=None, imap=None)
         _restore(initial, config.database)
+        revision = _initial_revision(config.database)
         recording_channel = _RecordingChannel(channel or DevelopmentChannel(config.database))
         store = _RecordingStore(config.artifact_store) if config.artifact_store is not None else None
         fixture = Core(config, model=core.model, selector=core.selector, channel=recording_channel,
                        contract_provider=_ContractProvider(core.contract), identity_source=identities,
                        artifact_store=store)
-        revision = fixture.inspect_history()['revision']
         recorder = ReplayRecorder(fixture, recording_channel)
         scenario(recorder)
         expected = _semantic_state(recorder.core, recorder.outcomes)
@@ -553,6 +574,8 @@ def replay(case: ReplayCase) -> ReplayResult:
             root = Path(directory)
             config = _bootstrap(case.configuration, root)
             _restore(case.initial_state, config.database)
+            if _initial_revision(config.database) != case.initial_revision:
+                raise ReplayUnavailable('initial revision differs')
             model, selector, channel = _CapturedModel([]), CapturedSelector([]), _CapturedChannel([])
             store = _CapturedStore(case.artifact_operations) if config.artifact_store is not None else None
             if store is None and case.artifact_operations:
@@ -609,5 +632,5 @@ def replay(case: ReplayCase) -> ReplayResult:
             mismatches = tuple(key for key in ('steps', 'history', 'view', 'events')
                                if context.encoded(actual[key]) != context.encoded(case.expected.get(key)))
             return ReplayResult(actual, mismatches)
-    except (KeyError, TypeError, ValueError, sqlite3.Error) as error:
+    except (KeyError, TypeError, ValueError, sqlite3.Error, retention.RetentionUnavailable) as error:
         raise ReplayUnavailable('incomplete or unsupported replay evidence') from error

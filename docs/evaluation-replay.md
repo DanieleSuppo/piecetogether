@@ -68,14 +68,22 @@ API is started for fixture execution.
 
 Capture uses SQLite backup, then removes unrelated transport tables and optional
 trace diagnostics from the snapshot. It runs the scenario against a temporary
-copy; it does not mutate the source database or export deployment configuration,
-credentials or environment values. Expected results are a baseline for comparison,
+copy; it does not mutate the source database or export credentials, secret
+references or environment values. Fixtures preserve the replay-relevant static
+configuration, including the four-field retention policy, and the SQLite
+`retention_state(category, availability)` schema and rows. Configuration is not
+proof that a sweep ran: a configured but unapplied policy remains distinct from
+durable availability. Expected results are a baseline for comparison,
 not an independent judgment of model quality: a consumer may edit them to state
 its own expected semantics.
 
 Fixtures preserve Artifact publication and pending-deletion failure records visible
 in trusted history and the Current Trusted View; capture does not silently discard
-these fields. Startup recovery still runs normally in the isolated Core.
+these fields. Startup recovery follows the source configuration in the isolated
+Core: default retain permits normal recovery; configured maintenance suppresses
+recovery before the sweep. Capture does not copy source Artifact bytes. A pending
+publication that requires absent bytes makes capture unavailable, not a repaired
+or silently empty fixture.
 
 Fixtures contain sensitive normalized Communications, internal context, trusted
 state and Artifact lifecycle failure messages. Keep them operator-only, outside
@@ -105,6 +113,38 @@ versions, unavailable Artifact metadata or extra decision calls raise
 `ReplayUnavailable`. This error bypasses ordinary provider fallback. Retention
 that removes required evidence makes replay unavailable; replay never substitutes
 current state, another provider call or an invented answer.
+
+### Local retention and fixture copies
+
+[Local Core retention](core-retention.md) is an explicit, deployment-wide,
+terminal maintenance sweep, not expiry or selective subject erasure. Its four
+categories are Communications, trusted semantic history, Evaluation Traces and
+Current Trusted View. Defaults retain; `redact` and `delete` both erase category
+content, preserving only non-identifying category/availability markers. Source
+category sweeps also erase dependent working evidence and the semantic revision.
+Trace-only sweeps retain source Communications and trusted history but remove
+attempts, Proposal checkpoints and pending exposure evidence. View-only sweeps
+retain source history but explicitly disable projection derivation.
+
+Any applied non-retain category makes both capture and replay raise
+`ReplayUnavailable`, even for an empty scenario or a later retain configuration.
+The check runs before isolated Core startup can initialize missing evidence or
+recover old work. Missing initial-state tables or the semantic revision also fail
+explicitly; an erased source is never treated as a valid empty history. A missing
+retention table alone means legacy retain, consistent with Core availability.
+Fixtures must include retention configuration; older exports lacking it cannot
+be replayed by guessing defaults. Recapture only from complete retained evidence.
+Removing optional prompt/transport diagnostics or `ReplayCase.diagnostics` does
+not erase required evidence and remains replayable.
+
+The local sweep does not reach exported fixtures, caller-held copies, external
+projections/provider messages, logs, snapshots or backups. Operators must track
+and apply approved retention to every fixture copy separately. Do not restore a
+pre-erasure fixture into an erased deployment or use replay to resume that
+deployment. ArtifactStore still owns bytes and storage keys; this mechanism adds
+no byte-deletion path. SQLite logical erasure and `secure_delete` do not guarantee
+physical sanitization of WAL/journals, filesystem remnants, backups or storage
+media. External-copy cleanup and physical-media sanitization are unsupported.
 
 Artifact staging and successful publication/removal use captured metadata and
 outcomes, not external bytes. Capture uses a local fixture ArtifactStore when one

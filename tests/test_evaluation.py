@@ -347,6 +347,200 @@ class SemanticReplayTests(unittest.TestCase):
         self.assertTrue(result.matched, result.mismatches)
         self.assertEqual(self.config.database.read_bytes(), before)
 
+    def test_configured_unapplied_retention_survives_snapshot_capture_and_replay(self):
+        import sqlite3
+        from piecetogether.evaluation import capture, replay, _restore
+        from piecetogether.retention import RetentionPolicy, availability
+        self.core.accept(self.message)
+        policy = RetentionPolicy(current_view='redact', evaluation_traces='delete')
+        self.core.config = replace(self.core.config, retention=policy)
+        history, view = self.core.inspect_history(), self.core.current_view()
+        def scenario(recorder):
+            self.assertEqual(recorder.core.config.retention, policy)
+            self.assertEqual(recorder.core.inspect_history(), history)
+            self.assertEqual(recorder.core.current_view(), view)
+            with sqlite3.connect(recorder.core.config.database) as db:
+                self.assertEqual(availability(db), dict.fromkeys(asdict(policy), 'retain'))
+        case = capture(self.core, scenario)
+        snapshot = self.config.database.with_name('restored.sqlite3')
+        _restore(case.initial_state, snapshot)
+        with sqlite3.connect(snapshot) as db:
+            self.assertEqual([row[1] for row in db.execute('PRAGMA table_info(retention_state)')],
+                             ['category', 'availability'])
+            self.assertEqual(availability(db), dict.fromkeys(asdict(policy), 'retain'))
+        self.assertEqual(case.configuration['retention'], asdict(policy))
+        self.assertEqual(case.expected['history'], history)
+        self.assertEqual(case.expected['view'], view)
+        self.assertTrue(replay(case).matched)
+
+    def test_applied_retention_snapshots_keep_source_state_but_capture_and_replay_fail_closed(self):
+        import copy
+        import hashlib
+        import sqlite3
+        from unittest.mock import patch
+        from test_history import ContractProvider, ProposalModel
+        from piecetogether.core import connect
+        from piecetogether.evaluation import capture, replay, ReplayUnavailable, _snapshot, _restore
+        from piecetogether.proposals import EntityOperation, GroundingPlanOperation
+        from piecetogether.retention import RetentionPolicy, RetentionUnavailable, availability
+        original = capture(self.core, lambda recorder: recorder.accept(self.message))
+        for category in asdict(RetentionPolicy()):
+            for action in ('redact', 'delete'):
+                with self.subTest(category=category, action=action):
+                    config = replace(self.config, database=self.config.database.with_name(f'{category}-{action}.sqlite3'),
+                                     retention=RetentionPolicy(**{category: action}))
+                    source = Core(config, contract_provider=ContractProvider(self.contract), model=ProposalModel((
+                        EntityOperation('subject', 'Subject'), GroundingPlanOperation('p', (), 'explicit', ('subject',)))))
+                    result = source.accept(self.message)
+                    self.assertTrue(source.inspect(result['communication_id'])['grounding_items'])
+                    source.apply_retention()
+                    def state(core):
+                        observed = {}
+                        for name in ('inspect_history', 'current_view', 'trusted_events'):
+                            try:
+                                observed[name] = getattr(core, name)()
+                            except RetentionUnavailable:
+                                observed[name] = 'unavailable'
+                        with connect(core.config.database) as db:
+                            observed['availability'] = availability(db)
+                            for table in ('semantic_state', 'exposed_groundings', 'pending_items',
+                                          'candidate_target_bindings', 'trusted_records', 'semantic_outbox'):
+                                observed[table] = [tuple(row) for row in db.execute(f'SELECT * FROM {table} ORDER BY rowid')]
+                            observed['turns'] = [tuple(row) for row in db.execute(
+                                'SELECT id, inbound, proposal, outbound, status FROM turns ORDER BY rowid')]
+                            observed['attempts'] = [tuple(row) for row in db.execute(
+                                'SELECT communication_id, attempt, proposal, outbound, status FROM processing_attempts')]
+                        return observed
+                    source_state = state(source)
+                    snapshot = _snapshot(config.database)
+                    restored_config = replace(config, database=config.database.with_name('restored.sqlite3'),
+                                              retention=RetentionPolicy())
+                    _restore(snapshot, restored_config.database)
+                    restored = Core(restored_config, contract_provider=ContractProvider(self.contract))
+                    self.assertEqual(state(restored), source_state)
+                    if category in ('communications', 'semantic_history'):
+                        self.assertEqual(source_state['semantic_state'], [])
+                        self.assertEqual(source_state['turns'], [])
+                    else:
+                        self.assertEqual(len(source_state['turns']), 1)
+                        self.assertEqual(source_state['current_view'] == 'unavailable', category == 'current_view')
+                    if category == 'evaluation_traces':
+                        self.assertEqual(source_state['attempts'], [])
+                        self.assertEqual(source_state['pending_items'], [])
+                    case = copy.deepcopy(original)
+                    case.initial_state, case.state_digest = snapshot, hashlib.sha256(snapshot).hexdigest()
+                    # Even an empty scenario cannot make erased evidence a valid empty replay.
+                    case.steps = []
+                    before = config.database.read_bytes()
+                    with patch('http.client.HTTPSConnection', side_effect=AssertionError('network forbidden')), \
+                         patch('piecetogether.core.DeterministicModel.propose', side_effect=AssertionError('inference forbidden')):
+                        with self.assertRaises(ReplayUnavailable):
+                            capture(source, lambda recorder: self.fail('unavailable scenario ran'))
+                        with self.assertRaises(ReplayUnavailable):
+                            replay(case)
+                    self.assertEqual(config.database.read_bytes(), before)
+
+    def test_initial_snapshot_and_capture_match_source_pending_grounding_and_artifact_lifecycle(self):
+        from unittest.mock import patch
+        from test_artifact_lifecycle import LifecycleTests, Provider
+        from test_history import ProposalModel
+        from piecetogether.artifact_store import LocalArtifactStore
+        from piecetogether.core import connect
+        from piecetogether.evaluation import capture, replay, _restore
+        from piecetogether.proposals import EntityOperation, GroundingPlanOperation
+        from piecetogether.retention import RetentionPolicy, availability
+        for configured in (False, True):
+            with self.subTest(configured=configured):
+                flow = LifecycleTests()
+                flow.setUp()
+                self.addCleanup(flow.doCleanups)
+                flow.domain = dict(entity_types=self.contract.entity_types,
+                                   grounding_policies=self.contract.grounding_policies)
+                original = flow.persist()
+                flow.rule['retention']['bytes'] = 'delete'
+                class FailingStore(LocalArtifactStore):
+                    def remove(self, reference):
+                        raise OSError('fixture lifecycle failure')
+                source = flow.deletion(original['id'], store=FailingStore(flow.config.artifact_store))
+                self.assertEqual(flow.send(source, key='failed-deletion')['status'], 'retryable')
+                # Without a store, default startup cannot retry this real pending job.
+                # A configured maintenance Core must suppress recovery even with a store.
+                config = replace(flow.config,
+                    artifact_store=flow.config.artifact_store if configured else None,
+                    retention=RetentionPolicy(current_view='redact') if configured else RetentionPolicy())
+                source = Core(config, contract_provider=Provider(source.contract), model=ProposalModel((
+                    EntityOperation('subject', 'Subject'), GroundingPlanOperation('p', (), 'explicit', ('subject',)))))
+                pending = source.accept({**self.message, 'sender': 's1', 'idempotency_key': 'pending'})
+                communication_id = pending['communication_id']
+                self.assertTrue(source.inspect(communication_id)['grounding_items'])
+                self.assertEqual(len(source.inspect_history()['artifact_lifecycle']), 1)
+                self.assertEqual(source.inspect_history()['artifact_deletions'][0]['failure']['message'],
+                                 'fixture lifecycle failure')
+                def state(core):
+                    inspected = core.inspect(communication_id)
+                    with connect(core.config.database) as db:
+                        rows = {table: [tuple(row) for row in db.execute(f'SELECT * FROM {table} ORDER BY rowid')]
+                                for table in ('semantic_state', 'exposed_groundings', 'pending_items',
+                                              'candidate_target_bindings', 'artifact_ingress', 'artifact_stages',
+                                              'trusted_artifacts', 'artifact_publications', 'artifact_publication_failures',
+                                              'artifact_lifecycle', 'artifact_deletions')}
+                        rows['availability'] = availability(db)
+                    return dict(history=core.inspect_history(), view=core.current_view(), events=core.trusted_events(),
+                                policy=asdict(core.config.retention), rows=rows,
+                                pending={key: inspected[key] for key in
+                                         ('inbound', 'outbound', 'proposal', 'grounding_items', 'status')})
+                source_state = state(source)
+                before = config.database.read_bytes()
+                def scenario(recorder):
+                    self.assertEqual(state(recorder.core), source_state)
+                case = capture(source, scenario)
+                restored_config = replace(config, database=config.database.with_name('snapshot.sqlite3'))
+                _restore(case.initial_state, restored_config.database)
+                restored = Core(restored_config, contract_provider=Provider(source.contract))
+                self.assertEqual(state(restored), source_state)
+                self.assertEqual(case.initial_revision, source_state['history']['revision'])
+                self.assertEqual(case.expected['history'], source_state['history'])
+                self.assertEqual(case.expected['view'], source_state['view'])
+                self.assertEqual(case.configuration['retention'], source_state['policy'])
+                with patch('piecetogether.core.DeterministicModel.propose', side_effect=AssertionError('inference forbidden')):
+                    result = replay(case)
+                self.assertTrue(result.matched, result.mismatches)
+                self.assertEqual(result.actual['history'], source_state['history'])
+                self.assertEqual(result.actual['view'], source_state['view'])
+                self.assertEqual(config.database.read_bytes(), before)
+
+    def test_missing_initial_fixture_evidence_cannot_be_reinitialized_as_valid_empty_state(self):
+        import copy
+        import hashlib
+        import sqlite3
+        from unittest.mock import patch
+        from piecetogether.evaluation import capture, replay, ReplayUnavailable
+        original = capture(self.core, lambda recorder: None)
+        for missing in ('revision', 'history_table', 'attempt_table', 'retention_configuration'):
+            with self.subTest(missing=missing):
+                case = copy.deepcopy(original)
+                if missing == 'retention_configuration':
+                    del case.configuration['retention']
+                else:
+                    database = self.config.database.with_name('broken.sqlite3')
+                    database.write_bytes(case.initial_state)
+                    with sqlite3.connect(database) as db:
+                        if missing == 'revision':
+                            db.execute('DELETE FROM semantic_state')
+                        elif missing == 'history_table':
+                            db.execute('DROP TABLE trusted_records')
+                        else:
+                            db.execute('DROP TABLE processing_attempts')
+                    case.initial_state = database.read_bytes()
+                    case.state_digest = hashlib.sha256(case.initial_state).hexdigest()
+                with patch('piecetogether.core.DeterministicModel.propose', side_effect=AssertionError('inference forbidden')), \
+                     self.assertRaises(ReplayUnavailable):
+                    replay(case)
+        with sqlite3.connect(self.config.database) as db:
+            db.execute('DELETE FROM semantic_state')
+        with self.assertRaises(ReplayUnavailable):
+            capture(self.core, lambda recorder: self.fail('missing source revision was recreated'))
+
     def test_channel_capture_cannot_replace_the_computed_semantic_reply(self):
         from piecetogether.evaluation import replay, ReplayUnavailable
         case = self.capture_case()
