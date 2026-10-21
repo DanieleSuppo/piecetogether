@@ -19,7 +19,7 @@ from uuid import uuid4
 from . import context, history, projections, references, retention, view
 from .application_api import ApplicationApiConfig
 from .retention import RetentionPolicy
-from .artifact_store import LocalArtifactStore, StagedContent
+from .artifact_store import ArtifactStore, LocalArtifactStore, StagedContent
 from .contracts import DeclarativeContractProvider, DomainContractProvider
 from .email_channel import (
     CAPABILITIES as EMAIL_CAPABILITIES, TEXT_CAPABILITIES as EMAIL_TEXT_CAPABILITIES, DeliveryResult, EmailChannel, EmailConfig,
@@ -550,7 +550,7 @@ class Core:
         contract_provider: DomainContractProvider | None = None,
         selector: context.SemanticSelector | None = None,
         reference_provider: references.ReferenceStateProvider | None = None,
-        artifact_store: LocalArtifactStore | None = None,
+        artifact_store: ArtifactStore | None = None,
         projection_sink: projections.ProjectionSink | None = None,
         delivery_clock: Callable[[], float] = time,
         identity_source: IdentitySource | None = None,
@@ -1487,6 +1487,8 @@ class Core:
         try:
             method = getattr(self.model, 'propose_with_evidence', self.model.propose
                              if hasattr(self.model, 'propose') else None)
+            if not callable(method):
+                raise TypeError('ModelProvider must supply a callable proposal method')
             result = method(inbound, self.config.contract_version, pack)
             proposal = result.proposal if isinstance(result, GenerationResult) else result
             if isinstance(result, GenerationResult):

@@ -8,7 +8,7 @@ from collections.abc import Callable
 from contextlib import closing, nullcontext
 from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, ContextManager
 
 from .core import Bootstrap, Communication, Core, DevelopmentChannel, IdentitySource, MediaPolicy, connect
 from .artifact_store import FinalizedContent, LocalArtifactStore, StagedContent
@@ -198,6 +198,10 @@ class _CapturedModel:
     def instruction_version(self) -> Any:
         return self._metadata('instruction_version')
 
+    def propose(self, inbound: Communication, contract_version: str,
+                context_pack: context.ContextPack) -> SemanticProposal:
+        return self.propose_with_evidence(inbound, contract_version, context_pack).proposal
+
     def propose_with_evidence(self, inbound: Communication, version: str,
                               pack: context.ContextPack) -> GenerationResult:
         if self.index >= len(self.attempts):
@@ -240,8 +244,19 @@ class _CapturedModel:
 
 
 class _RecordingChannel:
-    def __init__(self, delegate: Any):
-        self.delegate, self.operations = delegate, []
+    def __init__(self, delegate: Any, capabilities: tuple[str, ...]):
+        self.delegate = delegate
+        self.capabilities: tuple[str, ...] = getattr(delegate, 'capabilities', capabilities)
+        self.operations: list[dict[str, Any]] = []
+
+    def normalize(self, payload: Any) -> dict[str, Any]:
+        method = getattr(self.delegate, 'normalize', None)
+        if not callable(method):
+            raise ReplayUnavailable('fixture channel cannot normalize transport input')
+        normalized = method(payload)
+        if not isinstance(normalized, dict):
+            raise ReplayUnavailable('fixture channel returned invalid normalized input')
+        return normalized
 
     def prepare(self, outbound: Communication, inbound: Communication) -> Communication:
         method = getattr(self.delegate, 'prepare', None)
@@ -264,8 +279,12 @@ class _RecordingChannel:
 
 
 class _CapturedChannel:
-    def __init__(self, operations: list[dict[str, Any]]):
+    def __init__(self, operations: list[dict[str, Any]], capabilities: tuple[str, ...]):
         self.operations, self.index = operations, 0
+        self.capabilities = capabilities
+
+    def normalize(self, payload: Any) -> dict[str, Any]:
+        raise ReplayUnavailable('replay requires captured normalized input')
 
     def _next(self, operation: str, outbound: Communication) -> dict[str, Any]:
         if self.index >= len(self.operations):
@@ -307,8 +326,23 @@ class _RecordingStore:
         self.delegate = LocalArtifactStore(root)
         self.operations: list[dict[str, Any]] = []
 
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self.delegate, name)
+    def maintenance_lock(self) -> ContextManager[None]:
+        return self.delegate.maintenance_lock()
+
+    def stage(self, content: bytes, idempotency_key: str) -> StagedContent:
+        return self.delegate.stage(content, idempotency_key)
+
+    def read(self, reference: str) -> bytes:
+        return self.delegate.read(reference)
+
+    def read_staged(self, reference: str) -> bytes:
+        return self.delegate.read_staged(reference)
+
+    def remove_staged(self, reference: str, minimum_age_seconds: float) -> bool | None:
+        return self.delegate.remove_staged(reference, minimum_age_seconds)
+
+    def cleanup(self, preserved: set[str], minimum_age_seconds: float) -> list[str]:
+        return self.delegate.cleanup(preserved, minimum_age_seconds)
 
     def finalize(self, staged: StagedContent) -> FinalizedContent:
         try:
@@ -327,8 +361,23 @@ class _CapturedStore:
     def __init__(self, operations: list[dict[str, Any]]):
         self.operations, self.index = operations, 0
 
-    def maintenance_lock(self) -> Any:
+    def maintenance_lock(self) -> ContextManager[None]:
         return nullcontext()
+
+    def stage(self, content: bytes, idempotency_key: str) -> StagedContent:
+        raise ReplayUnavailable('replay cannot stage uncaptured Artifact bytes')
+
+    def read(self, reference: str) -> bytes:
+        raise ReplayUnavailable('replay has no captured Artifact bytes')
+
+    def read_staged(self, reference: str) -> bytes:
+        raise ReplayUnavailable('replay has no captured staged Artifact bytes')
+
+    def remove_staged(self, reference: str, minimum_age_seconds: float) -> bool | None:
+        raise ReplayUnavailable('replay has no captured staging cleanup outcome')
+
+    def cleanup(self, preserved: set[str], minimum_age_seconds: float) -> list[str]:
+        raise ReplayUnavailable('replay has no captured staging cleanup outcome')
 
     def _next(self, operation: str, value: Any) -> dict[str, Any]:
         if self.index >= len(self.operations):
@@ -548,7 +597,10 @@ def capture(core: Core, scenario: Callable[[ReplayRecorder], None], *, channel: 
                          reference_state=None, projection=None, application_api=None, imap=None)
         _restore(initial, config.database)
         revision = _initial_revision(config.database)
-        recording_channel = _RecordingChannel(channel or DevelopmentChannel(config.database))
+        if channel is None:
+            channel = DevelopmentChannel(config.database)
+            channel.capabilities = config.capabilities
+        recording_channel = _RecordingChannel(channel, config.capabilities)
         store = _RecordingStore(config.artifact_store) if config.artifact_store is not None else None
         fixture = Core(config, model=core.model, selector=core.selector, channel=recording_channel,
                        contract_provider=_ContractProvider(core.contract), identity_source=identities,
@@ -576,7 +628,8 @@ def replay(case: ReplayCase) -> ReplayResult:
             _restore(case.initial_state, config.database)
             if _initial_revision(config.database) != case.initial_revision:
                 raise ReplayUnavailable('initial revision differs')
-            model, selector, channel = _CapturedModel([]), CapturedSelector([]), _CapturedChannel([])
+            model, selector, channel = (_CapturedModel([]), CapturedSelector([]),
+                                        _CapturedChannel([], config.capabilities))
             store = _CapturedStore(case.artifact_operations) if config.artifact_store is not None else None
             if store is None and case.artifact_operations:
                 raise ReplayUnavailable('ArtifactStore configuration differs')
@@ -592,7 +645,7 @@ def replay(case: ReplayCase) -> ReplayResult:
                 model = _CapturedModel(step['generative_attempts'])
                 # Pre-call budget exhaustion has no selector call to consume.
                 selector = CapturedSelector([entry for entry in step['selection'] if 'request' in entry])
-                channel = _CapturedChannel(step['channel'])
+                channel = _CapturedChannel(step['channel'], config.capabilities)
                 core.model, core.selector, core.channel = model, selector, channel
                 inbound = step['inbound']
                 if inbound['attachments'] and store is not None:

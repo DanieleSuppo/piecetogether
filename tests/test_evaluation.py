@@ -57,6 +57,49 @@ class TraceTests(unittest.TestCase):
         self.assertIsNone(trace['generative_attempts'][0]['usage'])
         self.assertNotIn('password', json.dumps(trace))
 
+    def test_missing_or_noncallable_model_dispatch_fails_explicitly(self):
+        from piecetogether.core import Communication
+        inbound = Communication('in', 'development', 's', 'actor', 'inbound', 'one',
+                                'note', '2026-10-20T12:00:00Z', '2026-10-20T12:00:00Z')
+        class NoncallableEvidence:
+            propose_with_evidence = None
+            def propose(self, *args):
+                raise AssertionError('invalid evidence method must not silently fall back')
+        class NoncallableProposal:
+            propose = None
+        for model in (object(), NoncallableEvidence(), NoncallableProposal()):
+            with self.subTest(model=type(model).__name__):
+                core = Core(self.config, model=model)
+                trace = {'generative_attempts': []}
+                with self.assertRaises(TypeError):
+                    core._generate(inbound, context.ContextPack('actor', self.config.contract_version, 0), trace)
+                self.assertEqual(trace['generative_attempts'][0]['outcome'], 'invalid_proposal')
+                result = core.accept(self.message)
+                self.assertEqual(result['status'], 'retryable')
+                self.assertEqual(core.inspect(result['communication_id'])['trace']['failure_stage'], 'model')
+
+    def test_captured_model_propose_consumes_evidence_without_inference(self):
+        from unittest.mock import patch
+        from piecetogether.core import Communication
+        from piecetogether.evaluation import _CapturedModel, ReplayUnavailable
+        core = Core(self.config)
+        result = core.accept(self.message)
+        inspected = core.inspect(result['communication_id'])
+        entry = inspected['trace']['generative_attempts'][0]
+        inbound = Communication(**inspected['inbound'])
+        pack = context.ContextPack.from_dict(entry['context_pack'])
+        with patch('piecetogether.core.DeterministicModel.propose', side_effect=AssertionError('no inference')):
+            model = _CapturedModel([entry])
+            proposal = model.propose(inbound, self.config.contract_version, pack)
+            self.assertEqual(proposal.communication_id, inbound.id)
+            self.assertEqual(proposal.draft_response, 'I understood: First note')
+            model.assert_consumed()
+            with self.assertRaises(ReplayUnavailable):
+                model.propose(inbound, self.config.contract_version, pack)
+            with self.assertRaises(OSError):
+                _CapturedModel([{**entry, 'outcome': 'provider_failure'}]).propose(
+                    inbound, self.config.contract_version, pack)
+
     def test_credential_bearing_provider_metadata_is_not_persisted(self):
         from piecetogether.openai_responses import GenerationResult
         class Model:
@@ -102,6 +145,80 @@ class TraceTests(unittest.TestCase):
         self.assertEqual(selection['context_pack_ref'], context.digest(context.encoded(trace['context_pack'])))
         self.assertEqual(selection['selection_policy_version'], context.SELECTION_POLICY_VERSION)
         self.assertNotIn('raw_response', result)
+
+
+class ReplayContractTests(unittest.TestCase):
+    def test_captured_channel_refuses_transport_normalization(self):
+        from piecetogether.evaluation import _CapturedChannel, ReplayUnavailable
+        with self.assertRaises(ReplayUnavailable):
+            _CapturedChannel([], ('receive', 'reply')).normalize({'text': 'not captured normalized input'})
+
+    def test_recording_channel_delegates_normalization_or_fails_explicitly(self):
+        from piecetogether.evaluation import _RecordingChannel, ReplayUnavailable
+        class Normalizer:
+            capabilities = ('receive', 'reply')
+            def normalize(self, payload):
+                return {'text': payload.decode('ascii')}
+        channel = _RecordingChannel(Normalizer(), ('receive', 'reply'))
+        self.assertEqual(channel.normalize(b'normalized text'), {'text': 'normalized text'})
+        with self.assertRaises(ReplayUnavailable):
+            _RecordingChannel(object(), ('receive', 'reply')).normalize(b'unsupported')
+
+    def test_capture_preserves_configured_capabilities_and_delivery_only_fixtures(self):
+        from piecetogether.email_channel import CAPABILITIES, EmailConfig
+        from piecetogether.evaluation import capture, replay
+        class DeliveryOnly:
+            def deliver(self, outbound):
+                return True
+        class DeclaredChannel(DeliveryOnly):
+            capabilities = CAPABILITIES
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = Bootstrap(root / 'core.sqlite3', {'email:alice@example.com': 'actor'},
+                               channel='email', capabilities=CAPABILITIES, artifact_store=root / 'artifacts',
+                               email=EmailConfig('core@example.com', 'localhost', security='plain'))
+            source = Core(config, channel=DeclaredChannel())
+            payload = dict(channel='email', sender='alice@example.com', idempotency_key='<one@example.com>',
+                           transport_message_id='<one@example.com>', text='fixture', sent_at='2026-10-20T12:00:00Z')
+            def scenario(recorder):
+                self.assertEqual(recorder.core.channel.capabilities, CAPABILITIES)
+                self.assertEqual(recorder.accept(payload)['status'], 'completed')
+            for channel in (None, DeliveryOnly(), DeclaredChannel()):
+                with self.subTest(channel=type(channel).__name__):
+                    case = capture(source, scenario, channel=channel)
+                    self.assertEqual(tuple(case.configuration['capabilities']), CAPABILITIES)
+                    self.assertTrue(replay(case).matched)
+
+    def test_captured_store_refuses_uncaptured_byte_and_maintenance_operations(self):
+        from unittest.mock import patch
+        from piecetogether.evaluation import _CapturedStore, ReplayUnavailable
+        store = _CapturedStore([])
+        operations = (
+            lambda: store.stage(b'uncaptured', 'key'),
+            lambda: store.read('a' * 32),
+            lambda: store.read_staged('a' * 32),
+            lambda: store.remove_staged('a' * 32, 0),
+            lambda: store.cleanup(set(), 0),
+        )
+        with patch('piecetogether.evaluation.LocalArtifactStore', side_effect=AssertionError('no byte store')):
+            for index, operation in enumerate(operations):
+                with self.subTest(operation=index), self.assertRaises(ReplayUnavailable):
+                    operation()
+        store.assert_consumed()
+
+    def test_recording_store_preserves_local_byte_lifecycle(self):
+        from piecetogether.evaluation import _RecordingStore
+        with tempfile.TemporaryDirectory() as directory:
+            store = _RecordingStore(Path(directory))
+            with store.maintenance_lock():
+                staged = store.stage(b'fixture bytes', 'key')
+                self.assertEqual(store.read_staged(staged.reference), b'fixture bytes')
+                finalized = store.finalize(staged)
+                self.assertEqual(store.read(finalized.reference), b'fixture bytes')
+                store.remove(finalized.reference)
+                self.assertFalse(store.remove_staged(staged.reference, 0))
+                self.assertEqual(store.cleanup(set(), 0), [])
+            self.assertEqual([entry['operation'] for entry in store.operations], ['finalize', 'remove'])
 
 
 class SelectorReplayTests(unittest.TestCase):

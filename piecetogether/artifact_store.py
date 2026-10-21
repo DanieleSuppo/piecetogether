@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Iterator
+from typing import ContextManager, Protocol
 from uuid import uuid4
 
 
@@ -26,6 +27,19 @@ class StagedContent:
 class FinalizedContent:
     reference: str
     checksum: str
+
+
+class ArtifactStore(Protocol):
+    """Core-owned byte lifecycle; semantic state retains only storage metadata."""
+
+    def maintenance_lock(self) -> ContextManager[None]: ...
+    def stage(self, content: bytes, idempotency_key: str) -> StagedContent: ...
+    def finalize(self, staged: StagedContent) -> FinalizedContent: ...
+    def read(self, reference: str) -> bytes: ...
+    def read_staged(self, reference: str) -> bytes: ...
+    def remove(self, reference: str) -> None: ...
+    def remove_staged(self, reference: str, minimum_age_seconds: float) -> bool | None: ...
+    def cleanup(self, preserved: set[str], minimum_age_seconds: float) -> list[str]: ...
 
 
 class LocalArtifactStore:
