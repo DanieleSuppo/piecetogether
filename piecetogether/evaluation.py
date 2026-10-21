@@ -409,7 +409,7 @@ class _CapturedStore:
 # Only deterministic Core state belongs in a fixture. Transport queues, delivery logs
 # and optional prompt diagnostics do not.
 _STATE_TABLES = {
-    'retention_state', 'turns', 'processing_attempts', 'semantic_state', 'semantic_commits', 'trusted_records',
+    'retention_state', 'record_expiry', 'view_access', 'turns', 'processing_attempts', 'semantic_state', 'semantic_commits', 'trusted_records',
     'reference_assertions', 'reference_commits', 'trusted_relationships', 'trusted_groundings',
     'trusted_grounding_items', 'exposed_groundings', 'pending_items', 'candidate_target_bindings',
     'semantic_outbox', 'emergent_concepts', 'artifact_ingress', 'artifact_stages', 'trusted_artifacts',
@@ -483,7 +483,7 @@ def _initial_revision(database: Path) -> int:
             retention.require_processing(db)
             tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             # A missing retention table means legacy retain, not erased evidence.
-            if _STATE_TABLES - {'retention_state'} - tables:
+            if _STATE_TABLES - {'retention_state', 'record_expiry', 'view_access'} - tables:
                 raise ReplayUnavailable('missing initial-state evidence tables')
             rows = db.execute('SELECT revision FROM semantic_state WHERE singleton=1').fetchall()
             if len(rows) != 1 or type(rows[0][0]) is not int or rows[0][0] < 0:
@@ -496,7 +496,7 @@ def _initial_revision(database: Path) -> int:
 def _configuration(core: Core) -> dict[str, Any]:
     return {'identities': dict(core.config.identities), 'channel': core.config.channel,
             'capabilities': list(core.config.capabilities), 'contract_version': core.contract.version,
-            'retention': asdict(core.config.retention),
+            'retention': asdict(core.config.retention), 'expiry': asdict(core.config.expiry),
             'selection': asdict(core.config.selection), 'media_policy': {
                 key: asdict(value) for key, value in core.config.media_policy.items()},
             'telegram_bot_id': core.config.telegram.bot_id if core.config.telegram else None,
@@ -508,6 +508,7 @@ def _bootstrap(configuration: dict[str, Any], root: Path) -> Bootstrap:
     return Bootstrap(root / 'core.sqlite3', configuration['identities'], channel=channel,
         capabilities=tuple(configuration['capabilities']), contract_version=configuration['contract_version'],
         retention=retention.RetentionPolicy.from_dict(configuration['retention']),
+        expiry=retention.ExpiryPolicy.from_dict(configuration.get('expiry', {})),
         selection=context.SelectionConfig(**configuration['selection']),
         media_policy={key: MediaPolicy(value['artifact_type'], tuple(value['roles']))
                       for key, value in configuration['media_policy'].items()},
@@ -520,6 +521,8 @@ def _bootstrap(configuration: dict[str, Any], root: Path) -> Bootstrap:
 def _outcome(core: Core, result: dict[str, Any]) -> dict[str, Any]:
     inspected = core.inspect(result['communication_id'])
     trace = inspected['trace'] or {}
+    if trace.get('availability'):
+        raise ReplayUnavailable('required processing trace unavailable after expiry')
     return {'result': result, 'proposal': inspected['proposal'], 'outbound': inspected['outbound'],
             'grounding_items': inspected['grounding_items'],
             'selection': [{key: entry.get(key) for key in (
@@ -533,7 +536,10 @@ def _outcome(core: Core, result: dict[str, Any]) -> dict[str, Any]:
 
 
 def _semantic_state(core: Core, steps: list[dict[str, Any]]) -> dict[str, Any]:
-    return {'steps': steps, 'history': core.inspect_history(), 'view': core.current_view(),
+    with connect(core.config.database) as db:
+        withheld = retention.view_withheld(db)
+    return {'steps': steps, 'history': core.inspect_history(),
+            'view': {'availability': 'withheld'} if withheld else core.current_view(),
             'events': core.trusted_events()}
 
 
@@ -565,8 +571,8 @@ class ReplayRecorder:
             new_attempt = db.execute('SELECT count(*) FROM processing_attempts').fetchone()[0] > before_attempts
         inspected = self.core.inspect(result['communication_id'])
         trace = inspected['trace']
-        if trace is None:
-            raise ReplayUnavailable('processing attempt has no durable trace')
+        if trace is None or trace.get('availability'):
+            raise ReplayUnavailable('processing attempt has no available durable trace')
         with connect(self.core.config.database) as db:
             stages = [dict(row) for row in db.execute(
                 'SELECT * FROM artifact_stages WHERE communication_id=? ORDER BY rowid', (result['communication_id'],))]
@@ -606,7 +612,10 @@ def capture(core: Core, scenario: Callable[[ReplayRecorder], None], *, channel: 
                        contract_provider=_ContractProvider(core.contract), identity_source=identities,
                        artifact_store=store)
         recorder = ReplayRecorder(fixture, recording_channel)
-        scenario(recorder)
+        try:
+            scenario(recorder)
+        except retention.RetentionUnavailable as error:
+            raise ReplayUnavailable('required capture evidence unavailable after expiry') from error
         expected = _semantic_state(recorder.core, recorder.outcomes)
         return ReplayCase(initial, hashlib.sha256(initial).hexdigest(), revision, asdict(core.contract),
                           _configuration(core), identities.values, recorder.steps, expected,

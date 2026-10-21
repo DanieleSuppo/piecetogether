@@ -45,6 +45,9 @@ def current_view(db: sqlite3.Connection) -> dict[str, Any]:
     """Derive the view inside the caller's read transaction; no stale cache."""
     retention.require(db, 'current_view')
     retention.require(db, 'semantic_history')
+    retention.require(db, 'communications')
+    if retention.view_withheld(db):
+        raise retention.RetentionUnavailable('current_view reads withheld by local policy')
     revision = db.execute('SELECT revision FROM semantic_state').fetchone()['revision']
     records = [json.loads(row['record']) for row in db.execute(
         'SELECT record FROM trusted_records ORDER BY rowid')]

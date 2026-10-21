@@ -18,7 +18,7 @@ from uuid import uuid4
 
 from . import context, history, projections, references, retention, view
 from .application_api import ApplicationApiConfig
-from .retention import RetentionPolicy
+from .retention import ExpiryPolicy, RetentionPolicy
 from .artifact_store import ArtifactStore, LocalArtifactStore, StagedContent
 from .contracts import DeclarativeContractProvider, DomainContractProvider
 from .email_channel import (
@@ -124,8 +124,11 @@ class Bootstrap:
     openai: OpenAIResponsesConfig | None = None
     media_policy: dict[str, MediaPolicy] = field(default_factory=dict)
     retention: RetentionPolicy = field(default_factory=RetentionPolicy)
+    expiry: ExpiryPolicy = field(default_factory=ExpiryPolicy)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.expiry, retention.ExpiryPolicy):
+            raise ValueError('expiry must be a static ExpiryPolicy')
         if not isinstance(self.retention, retention.RetentionPolicy):
             raise ValueError('retention must be a static RetentionPolicy')
         if self.projection is not None and not isinstance(self.projection, projections.ProjectionConfig):
@@ -240,6 +243,7 @@ class Bootstrap:
             "openai",
             "media_policy",
             "retention",
+            "expiry",
         }
         if not isinstance(data, dict) or set(data) - allowed:
             raise ValueError("invalid bootstrap configuration")
@@ -250,6 +254,8 @@ class Bootstrap:
         ):
             raise ValueError("capabilities must be a string array")
         database = Path(data.pop("database"))
+        if 'expiry' in data:
+            data['expiry'] = retention.ExpiryPolicy.from_dict(data['expiry'])
         if 'retention' in data:
             data['retention'] = retention.RetentionPolicy.from_dict(data['retention'])
         if 'email' in data:
@@ -418,6 +424,9 @@ class DevelopmentChannel:
     @retention.channel_processing
     def deliver(self, outbound: Communication) -> bool:
         with connect(self.database) as db:
+            # Core outbound idempotency is its source turn ID. Old in-memory
+            # replies must not recreate a mailbox copy after payload expiry.
+            retention.require_payload(db, outbound.idempotency_key)
             db.execute(
                 "INSERT OR IGNORE INTO deliveries VALUES (?, ?)",
                 (outbound.id, json.dumps(asdict(outbound))),
@@ -671,12 +680,41 @@ class Core:
         self._dispatch_events_after_commit()
 
     def apply_retention(self) -> dict[str, str]:
-        """Operator-only deployment sweep; rejects active local Core operations."""
+        """Deprecated terminal compatibility sweep; use expire_records for ordinary retention."""
         with retention.operation(self.config.database, exclusive=True):
             with connect(self.config.database) as db:
                 db.execute('PRAGMA secure_delete=ON')
                 db.execute('BEGIN IMMEDIATE')
                 return retention.apply(db, self.config.retention)
+
+    def expire_records(
+        self, *, reference_time: datetime | None = None,
+        policy: retention.ExpiryPolicy | None = None, dry_run: bool = False,
+    ) -> dict[str, int]:
+        """Local ordinary expiry; dry-run rolls back the same dependency-checked plan."""
+        reference = retention.expiry_reference(reference_time)
+        selected = self.config.expiry if policy is None else policy
+        if not isinstance(selected, retention.ExpiryPolicy) or type(dry_run) is not bool:
+            raise ValueError('expiry requires a static policy and boolean dry_run')
+        with retention.operation(self.config.database, exclusive=True):
+            with connect(self.config.database) as db:
+                db.execute('PRAGMA secure_delete=ON')
+                db.execute('BEGIN IMMEDIATE')
+                result = retention.expire(db, selected, reference)
+                if dry_run:
+                    db.rollback()
+                return result
+
+    def set_view_withheld(self, withheld: bool) -> None:
+        """Reversible local read policy, never a reset of an erased-source fence."""
+        if type(withheld) is not bool:
+            raise ValueError('withheld must be boolean')
+        with retention.operation(self.config.database, exclusive=True):
+            with connect(self.config.database) as db:
+                db.execute('BEGIN IMMEDIATE')
+                retention.require_processing(db)
+                db.execute('INSERT INTO view_access VALUES (1, ?) '
+                           'ON CONFLICT(singleton) DO UPDATE SET withheld=excluded.withheld', (int(withheld),))
 
     @retention.processing
     def refresh_references(self) -> dict[str, Any]:
@@ -988,6 +1026,27 @@ class Core:
         return outcomes, rows[-1]['rowid'] if rows else 0
 
     def _accept(self, payload: Any, recovering: bool = False) -> dict[str, Any]:
+        identity = ('channel', 'sender', 'idempotency_key')
+        if not isinstance(payload, dict) or any(
+            not isinstance(payload.get(name), str) or not payload[name].strip() or len(payload[name]) > 256
+            for name in identity
+        ):
+            raise ValueError('Communication identity fields must be bounded nonempty strings')
+        if payload['channel'] != self.config.channel:
+            raise ValueError('channel is disabled')
+        actor = self.config.identities.get(f"{payload['channel']}:{payload['sender']}")
+        if actor is None:
+            raise ValueError('unmapped channel identity')
+        # Unserializable raw attachments must not mask credentials in other fields.
+        if self._contains_secret(payload) or any(self._contains_secret(value) for value in payload.values()):
+            raise ValueError('credential-bearing evidence is not accepted')
+        # Only authorized identities may discover expiry. Check before requiring
+        # removed payload fields or parsing attachments; never reconstruct evidence.
+        with connect(self.config.database) as db:
+            expired = db.execute('SELECT id FROM turns WHERE channel=? AND sender=? AND idempotency_key=?',
+                                 tuple(payload[name] for name in identity)).fetchone()
+            if expired is not None:
+                retention.require_payload(db, expired['id'])
         required = {"channel", "sender", "idempotency_key", "text", "sent_at"}
         optional = {'thread_id', 'reply_to', 'attachments', 'transport_message_id',
                     'transport_reply_to', 'references', 'subject'}
@@ -1058,11 +1117,6 @@ class Core:
             raise ValueError("sent_at must be an ISO-8601 timestamp") from None
         if timestamp.tzinfo is None:
             raise ValueError("sent_at must include a timezone")
-        if normalized_payload["channel"] != self.config.channel:
-            raise ValueError("channel is disabled")
-        actor = self.config.identities.get(f"{normalized_payload['channel']}:{normalized_payload['sender']}")
-        if actor is None:
-            raise ValueError("unmapped channel identity")
         if self._contains_secret(normalized_payload):
             raise ValueError('credential-bearing evidence is not accepted')
         inbound = Communication(
@@ -1536,6 +1590,8 @@ class Core:
             db.execute('BEGIN')
             retention.require(db, 'communications')
             availability = retention.availability(db)
+            retention.require_payload(db, communication_id)
+            trace_expired = retention.record_status(db, communication_id)[0]
             row = db.execute(
                 "SELECT * FROM turns WHERE id=?", (communication_id,)
             ).fetchone()
@@ -1562,6 +1618,7 @@ class Core:
             **{
                 name: ({'availability': availability['evaluation_traces']}
                        if name == 'trace' and availability['evaluation_traces'] != 'retain'
+                       else {'availability': 'expired'} if name == 'trace' and trace_expired
                        else json.loads(row[name]) if row[name] else None)
                 for name in ("inbound", "proposal", "outbound", "trace")
             },
