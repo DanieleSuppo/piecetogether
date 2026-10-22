@@ -49,16 +49,20 @@ alone are insufficient; do not run the paid steps while any gate is unresolved.
 Typing and controlled-local retention/erasure were delivered separately; they do
 not establish Jev adoption. No authenticated Jev request was dispatched by this
 maintenance work. That is an execution-history statement, not an account-billing
-reconciliation: account charges were not inspected and no experiment reservation
-ledger exists. Semantic-quality, measured latency and actual account-charge
+reconciliation: account charges were not inspected. The guarded synthetic smoke
+below now supplies a create-once reservation, but implementation and offline tests
+do not create the owner's reservation or establish any account charges.
+Semantic-quality, measured latency and actual account-charge
 evidence remain absent. The default stays `deterministic`; synthetic replay
 success is not deployment representativeness.
 
 The authorized ceiling is **US$5 total**, not per run, process, case or provider.
 Before any live invocation:
 
-1. Configure an existing secret reference privately, such as the environment name
-   `PT_TYPESAFE_API_KEY`. Never put its value in an issue, report or chat.
+1. Review the actual billing/privacy/trust-boundary diff before credential delivery
+   or a separately approved paid invocation. Configure an existing secret reference
+   privately, such as the environment name `PT_TYPESAFE_API_KEY`. Never put its
+   value in an issue, report or chat.
 2. Obtain credible account/provider evidence for a conservative maximum charge
    per dispatched attempt, including errors, timeouts and unknown usage. Confirm
    applicable rates and top-up/overdraft behavior. No credit purchases, top-ups or
@@ -74,7 +78,8 @@ Before any live invocation:
    attempts until owner billing evidence reconciles it. Never assume a refund
    or release an unresolved reservation. Existing per-request calls/tokens/
    deadline guards do **not** implement this experiment-wide control; it is not
-   currently provided by the adapter or capture/replay helpers. Never reset an
+   provided by the adapter or capture/replay helpers alone. The narrow wrapper
+   below provides one full, permanent reservation, not a reusable budget. Never reset an
    unresolved budget by restarting or choosing another output directory.
 4. Freeze independent required/irrelevant IDs and expected Core outcomes before
    scores; separate tuning and held-out cases. Begin with synthetic fixtures
@@ -88,14 +93,118 @@ Before any live invocation:
 Existing selector validation, independent fixture assertions and request-bound
 capture/replay are the reuse points; no separate benchmark or billing service is
 needed. Close the narrow experiment-control gaps after account facts are known,
-then review the actual billing/privacy boundary before a live command. No live
-runner or billing controller is claimed implemented by this document.
+then review the actual billing/privacy boundary before a live command. The bounded
+synthetic command below is not a general billing controller or benchmark framework.
 
 Enable only a deployment-owned canary after all pre-dispatch gates and task-specific
 quality, privacy, operational benefit and representative held-out evidence pass.
 Roll back through static selector configuration and restart with `deterministic`,
 without deleting trusted history or weakening validation. Issue #32 remains open
 while live gates or representative adoption evidence are missing.
+
+## Owner-confirmed, one-shot synthetic compatibility smoke
+
+The owner **OWNER-CONFIRMED** that the existing prepaid account has at most US$5
+remaining, no auto-refill, and service halts at credit exhaustion. This is not
+independently verified provider/account evidence or a general invoice guarantee.
+For that matching owner-limited account only, this supports one worst-case US$5
+attempt. No purchase, top-up, account change or actual paid invocation belongs to
+this implementation unit. A key for another account does not qualify.
+
+Offline preflight (safe with or without credentials):
+
+```sh
+PYTHONPATH=tests python3 -m jev_guarded_smoke
+```
+
+Import, unittest discovery (collection/import, not execution of the collected
+tests) and default preflight do not resolve secrets, load a real configuration or
+`.env`, create a reservation or call HTTP. Ordinary Core operation still defaults
+to the deterministic selector. Default preflight exits 0 to mean only that offline
+preflight completed, **not that live compatibility passed**. Check its JSON
+`status=offline preflight only` and `live_authorized=false`; a live result requires
+the explicit live flags and its private receipt, not merely exit status 0.
+
+After independent actual-diff review, secure credential delivery and **separate
+approval of the paid invocation**, the command supports `--live --output
+<new-private-directory> --ack-owner-prepaid-usd5`. The acknowledgement explicitly
+confirms that `PT_TYPESAFE_API_KEY` belongs to the matching owner-limited account
+and that the stated prepaid controls apply. Live mode resolves only the process
+environment mapping `typesafe -> PT_TYPESAFE_API_KEY`; it never loads a deployment
+configuration or env file. Do not invoke live mode as part of offline validation.
+
+`piecetogether.jev_smoke.reserve_once() -> None` reserves **all 500 integer cents**
+immediately before `GuardedJevSelector.select(request)` delegates once to the
+existing pinned `JevSelector`. The OS account home from
+`pwd.getpwuid(os.getuid()).pw_dir`, not `HOME`, XDG, cwd, output path or a run ID,
+fixes the ledger identity at
+`.local/state/piecetogether/jev-usd5-smoke/reservation.json`. No public ledger-path
+override exists. Descriptor-relative no-follow traversal validates node ownership,
+type, permissions and binding. Missing account-home ancestry, including `.local`
+and `.local/state`, is created 0700; existing directories are validated, never
+chmodded. Dedicated directories are 0700, the exclusively created record is 0600
+with one hard link, and file plus ancestry are fsynced before delegation. Unsafe
+existing output is refused before reservation. Failed output preparation can
+leave an empty private output directory; that path still refuses reuse, with no
+automatic deletion. Any
+existing reservation, including a partial/corrupt one, refuses another dispatch.
+A partial write or fsync failure never permits dispatch or automatic cleanup.
+
+The reservation records `limit_cents=500`, `reserved_cents=500`,
+`reconciled_cents=0` and `attempted_dispatches=1`. This counts conservative selector
+delegation, including a local pre-HTTP rejection; it is **not an actual HTTP count**.
+Core's `calls_used` can include deterministic fallback and is not an HTTP counter.
+The adapter sends at most one HTTP request, without retries. Success, failure,
+timeout, unknown usage, process death and artifact-write failure **all retain the
+full hold**. Usage or public-price estimates never release it or settle an actual
+charge. No reset, force flag, reconciliation or second-attempt path exists. No
+further paid attempt is allowed until separately reviewed future owner billing
+reconciliation. Owner deletion, filesystem rollback and another host can bypass
+local state; this is not an adversarial-owner or distributed guarantee.
+
+The command seeds only the existing offline cucina/bagno fixtures. It freezes both
+Context IDs and unchanged trusted history/view/events before any scores, uses
+`cucina e bagno` with `minimum_relevance=0.7`, `jev-1.13.0` and
+`context-relevance-v1`, then captures one accept with deterministic zero-operation
+generation and a local channel. It sends no Artifact bytes and uses no other
+third-party model. A completed Core fallback is still a failed smoke. Success
+requires exactly both independently required Contexts, no extra IDs/disclosure,
+no new Grounding Items and unchanged trusted state. Existing capture/replay
+recomputes the outcome without inference, with provider/model/network tripwires;
+the same independent expectations must hold on `ReplayResult.actual`, not merely
+`matched`.
+
+The new private output directory holds 0600 `capture.json` (existing `ReplayCase`
+serialization, including a synthetic initial-state snapshot) and `receipt.json`.
+Raw error payloads/exception messages are unavailable: the guard passes fixed
+sanitized failure classifications to Core before trace capture, rejecting
+credential/header echoes. Check-only normalization casefolds text and performs two
+fixed passes of percent and JSON-unicode escape decoding, with header-whitespace
+checks; safe results retain their exact original values. This is bounded defense
+in depth, not a demonstrated schema-valid echo exploit of pinned `jev-1.13.0` or
+a general secret/DLP service. The strict Jev response schema remains unchanged.
+Never publish captures as ordinary logs. Artifact-write
+failure reports only a fixed error, keeps any reservation, and can leave missing
+or partial artifacts; it does not authorize another attempt.
+
+Receipts separate `cap_evidence=OWNER-CONFIRMED` and
+`provider_account_independently_verified=false`, full reserved cents,
+`actual_cost=UNRECONCILED`, observed validated usage and **nominal** public-rate
+arithmetic (`$0.042/M` input). Unknown usage is null, not zero; no actual-charge
+claim follows from a valid response. A refused reservation reports
+`reserved_cents=null` and `selector_failure=reservation_refused`, never a zero hold
+that might imply a prior/partial reservation was released. The additional closed
+`reservation_refusal_reason` is `already_reserved` for any existing record (even
+empty/corrupt), `unsafe_ancestry` for failed path/permission checks before record
+creation, or `durability_failed` for uncertain creation/write/fsync/final-validation
+failures. Unrecognized diagnostics become the fixed `reservation_refused` fallback.
+`ReservationRefused` still prints only `reservation refused`; no raw error, path or
+exception text enters a receipt. These reasons do not prove that no prior hold
+exists, authorize a retry, or provide a reset/release path. They include fixture/policy/model versions,
+required/selected/missing counts, fallback, Core calls, conservative delegation
+count and timing. Scope is **sample_count=1 synthetic compatibility**, not a
+held-out evaluation, p95/SLA, deployment quality result or production GO. Keep all
+representative adoption and privacy/billing gates above and below unchanged.
 
 ## Comparison on existing domain scenarios
 
