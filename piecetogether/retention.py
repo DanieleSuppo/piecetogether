@@ -17,8 +17,8 @@ from typing import TYPE_CHECKING, Any, Concatenate, ParamSpec, TypeVar
 
 if TYPE_CHECKING:
     from .core import Core, DevelopmentChannel
-    from .email_channel import EmailChannel
-    from .telegram_channel import TelegramChannel
+    from .email_channel import EmailAcquisitionWorker, EmailChannel
+    from .telegram_channel import TelegramAcquisitionWorker, TelegramChannel
 
 
 CATEGORIES = ('communications', 'semantic_history', 'evaluation_traces', 'current_view')
@@ -77,6 +77,8 @@ class ExpiryPolicy:
 
 
 def initialize(db: sqlite3.Connection) -> None:
+    from . import erasure
+    erasure.initialize(db)
     db.execute("""CREATE TABLE IF NOT EXISTS retention_state (
         category TEXT PRIMARY KEY CHECK(category IN
             ('communications', 'semantic_history', 'evaluation_traces', 'current_view')),
@@ -104,6 +106,8 @@ def availability(db: sqlite3.Connection) -> dict[str, str]:
 
 
 def require(db: sqlite3.Connection, category: str) -> None:
+    from .erasure import require_unfrozen
+    require_unfrozen(db)
     if availability(db)[category] != 'retain':
         raise RetentionUnavailable(f'{category} unavailable after retention')
 
@@ -130,6 +134,8 @@ def require_payload(db: sqlite3.Connection, communication_id: str) -> None:
 
 
 def require_processing(db: sqlite3.Connection) -> None:
+    from .erasure import require_unfrozen
+    require_unfrozen(db)
     if any(value != 'retain' for value in availability(db).values()):
         raise RetentionUnavailable('processing unavailable after retention; provision a fresh deployment')
 
@@ -143,7 +149,7 @@ def operation(database: Path, *, exclusive: bool = False) -> Iterator[None]:
     """
     database = database.resolve()
     database.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(str(database) + '.retention.lock', os.O_CREAT | os.O_RDWR, 0o600)
+    descriptor = os.open(str(database) + '.retention.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     try:
         try:
             fcntl.flock(descriptor, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
@@ -176,7 +182,8 @@ def processing(method: Callable[Concatenate['Core', P], R]) -> Callable[Concaten
     return wrapped
 
 
-C = TypeVar('C', 'DevelopmentChannel', 'EmailChannel', 'TelegramChannel')
+C = TypeVar('C', 'DevelopmentChannel', 'EmailChannel', 'TelegramChannel',
+            'EmailAcquisitionWorker', 'TelegramAcquisitionWorker')
 
 
 def channel_processing(method: Callable[Concatenate[C, P], R]) -> Callable[Concatenate[C, P], R]:
@@ -197,6 +204,8 @@ def apply(db: sqlite3.Connection, policy: RetentionPolicy) -> dict[str, str]:
     marker as deletion. No per-record tombstones, reasons or counts survive.
     Source erasure invalidates both source categories and every dependent copy.
     """
+    from .erasure import require_unfrozen
+    require_unfrozen(db)
     previous = availability(db)
     effective = {category: max((previous[category], action), key=_ACTIONS.index)
                  for category, action in asdict(policy).items()}

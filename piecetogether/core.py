@@ -16,7 +16,7 @@ from time import monotonic, time
 from typing import Any, ContextManager, Protocol, cast
 from uuid import uuid4
 
-from . import context, history, projections, references, retention, view
+from . import context, erasure, history, projections, references, retention, view
 from .application_api import ApplicationApiConfig
 from .retention import ExpiryPolicy, RetentionPolicy
 from .artifact_store import ArtifactStore, LocalArtifactStore, StagedContent
@@ -606,8 +606,15 @@ class Core:
         declared_capabilities = set(getattr(self.channel, 'capabilities', config.capabilities))
         if not set(config.capabilities) <= declared_capabilities:
             raise ValueError('ChannelPlugin capabilities do not match deployment configuration')
-        self.artifact_store = artifact_store or (LocalArtifactStore(config.artifact_store)
-                                                 if config.artifact_store is not None else None)
+        with retention.operation(config.database):
+            prepared = False
+            if config.database.exists():
+                with connect(config.database) as db:
+                    prepared = erasure.frozen(db)
+            self.artifact_store = artifact_store or (LocalArtifactStore(config.artifact_store, create=not prepared)
+                                                     if config.artifact_store is not None else None)
+            if type(self.artifact_store) is LocalArtifactStore:
+                self.artifact_store.database = config.database
         if selector is not None:
             self.selector = selector
         elif config.selection.adapter == 'jev':
@@ -626,6 +633,10 @@ class Core:
     def _initialize_state(self) -> None:
         with connect(self.config.database) as db:
             retention.initialize(db)
+            if erasure.frozen(db):
+                # Prepared erasure is terminal for normal operation. No recovery,
+                # reference refresh, semantic-state rewrite or publication on startup.
+                return
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS turns (
                     id TEXT PRIMARY KEY,
@@ -670,6 +681,8 @@ class Core:
                     db, row["id"], row["proposal"], row["outbound"],
                     json.loads(row["trace"]), row["status"],
                 )
+        if type(self.artifact_store) is LocalArtifactStore:
+            erasure.bind_empty_store(self.artifact_store, self.config.database)
         if self.artifact_store is not None:
             with self._artifact_maintenance_lock():
                 self._release_abandoned_artifact_cleanup()
@@ -678,6 +691,34 @@ class Core:
         if self.reference_provider is not None:
             self.refresh_references()
         self._dispatch_events_after_commit()
+
+    def erasure_status(self) -> dict[str, Any]:
+        """Sanitized local status; local logical completion never means global erasure."""
+        with retention.operation(self.config.database):
+            with connect(self.config.database) as db:
+                return erasure.status(db)
+
+    def erasure_preflight(self) -> dict[str, Any]:
+        """Non-destructive inventory only; does not freeze or authorize removal."""
+        with retention.operation(self.config.database, exclusive=True):
+            return erasure.preflight(self.config.database, self.artifact_store)
+
+    def prepare_erasure(self) -> dict[str, Any]:
+        """Explicit local operator boundary overriding ordinary keep, not a Proposal/HTTP API.
+
+        Freeze and inventory only; this report never claims local completion.
+        """
+        with retention.operation(self.config.database, exclusive=True):
+            return erasure.prepare(self.config.database, self.artifact_store)
+
+    def erase_all(self) -> dict[str, Any]:
+        """Explicit local operator override, never a sender/Proposal/HTTP authority.
+
+        Prefer erasure.erase_local to begin without normal startup recovery.
+        All phases remain frozen; only a verified local logical receipt completes.
+        """
+        with retention.operation(self.config.database, exclusive=True):
+            return erasure.erase(self.config.database, self.artifact_store)
 
     def apply_retention(self) -> dict[str, str]:
         """Deprecated terminal compatibility sweep; use expire_records for ordinary retention."""

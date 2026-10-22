@@ -3,6 +3,7 @@
 import base64
 import http.client
 import json
+import logging
 import os
 import math
 import re
@@ -15,7 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from .email_channel import DeliveryResult, valid_media
-from .retention import channel_processing
+from .retention import RetentionBusy, RetentionUnavailable, channel_processing
 
 if TYPE_CHECKING:
     from .core import Communication, Core
@@ -207,6 +208,7 @@ class TelegramChannel:
                 communication_id TEXT, outcome TEXT NOT NULL, PRIMARY KEY(bot_id, update_id)
             )''')
 
+    @channel_processing
     def offset(self) -> int:
         from .core import connect
         with connect(self.database) as db:
@@ -221,6 +223,7 @@ class TelegramChannel:
                        (self.config.bot_id, update_id, 'acquired' if communication_id else 'unsupported',
                         communication_id, outcome))
 
+    @channel_processing
     def acquisition_outcomes(self) -> list[dict[str, Any]]:
         from .core import connect
         with connect(self.database) as db:
@@ -377,9 +380,11 @@ class TelegramAcquisitionWorker:
     def __init__(self, core: 'Core', channel: TelegramChannel, transport: TelegramTransport,
                  config: TelegramConfig, sleep: Callable[[float], None] | None = None):
         self.core, self.channel, self.transport, self.config = core, channel, transport, config
+        self.database = core.config.database
         self.sleep = sleep or time.sleep
         self.recovery_cursor = 0
 
+    @channel_processing
     def poll_once(self) -> int:
         offset = self.channel.offset()
         updates = self.transport.fetch(offset)
@@ -419,7 +424,10 @@ class TelegramAcquisitionWorker:
             try:
                 _, self.recovery_cursor = self.core.recover_channel_pending(self.recovery_cursor)
                 self.poll_once()
-            except (OSError, sqlite3.Error) as error:
+            except RetentionUnavailable:
+                logging.getLogger(__name__).warning('Acquisition stopped: retention unavailable.')
+                return
+            except (OSError, sqlite3.Error, RetentionBusy) as error:
                 self.sleep(max(backoff, error.retry_after if isinstance(error, TelegramUnavailable) else 0))
                 backoff = min(backoff * 2, maximum_backoff)
             else:

@@ -50,13 +50,33 @@
 
 Execute R2 as two serial, independently reviewable subunits to bound worker context/runtime. **R2a** owns validated dedicated-store inventory, durable freeze/worklist schema and compatibility/recovery gates; it performs no byte removal and makes no complete-erasure claim. **R2b** consumes that exact handoff, owns idempotent removal/finalization/receipt and end-to-end proof. Do not release an incomplete R2a erasure feature to production; commit/push the coherent R2 implementation only after R2b and final review pass.
 
-- [ ] Pin temporary-store tests for publication/staging/keys/partial/orphan files, existing pending publication/deletion, restart/retry, missing files, injected storage failure and unsafe/shared/symlink boundaries.
-- [ ] Persist erasure freeze and removal inventory before I/O. Reject/fence all updated first-party writes/reads/recovery that could leak or recreate erased data; no publication on erase startup.
-- [ ] Remove only validated dedicated Core-controlled byte/key resources idempotently under existing store coordination, outside semantic DB transactions. Preserve pending work on failure with sanitized classification. Do not discard obligations or claim success prematurely.
-- [ ] After every required controlled removal succeeds, purge all runtime identifiers/content/provenance/jobs, leaving only non-identifying completion/availability state. No semantic commit/event/Grounding acceptance. Old terminal residue is not auto-cleared.
-- [ ] Receipt distinguishes local completion from external/provider/backup/export/log/caller copies. Provide finite inventory and owner/action/verification status; unknown required resources remain pending/unverified. Never unlink arbitrary export paths or silently delete third-party messages.
-- [ ] Document explicit operator override versus ordinary Contract keep policy, dedicated-store requirements, no real execution, irreversible rollback limits and physical-storage exclusions.
-- [ ] Targeted tests, full unittest timeout600, strict mypy green and diff-check; checkpoint `/tmp/opencode/retention-r2-result.md`. Parent performs independent destructive/privacy/concurrency review of actual diff/new files and fixes/reproof before relevant dedicated commits/non-force verified pushes.
+- [x] Pin temporary-store tests for publication/staging/keys/partial/orphan files, existing pending publication/deletion, restart/retry, missing files, injected storage failure and unsafe/shared/symlink boundaries.
+- [x] Persist erasure freeze and removal inventory before I/O. Reject/fence all updated first-party writes/reads/recovery that could leak or recreate erased data; no publication on erase startup.
+- [x] Remove only validated dedicated Core-controlled byte/key resources idempotently under existing store coordination, outside semantic DB transactions. Preserve pending work on failure with sanitized classification. Do not discard obligations or claim success prematurely.
+- [x] After every required controlled removal succeeds, purge all runtime identifiers/content/provenance/jobs, leaving only non-identifying completion/availability state. No semantic commit/event/Grounding acceptance. Old terminal residue is not auto-cleared.
+- [x] Receipt distinguishes local completion from external/provider/backup/export/log/caller copies. Provide finite inventory and owner/action/verification status; unknown required resources remain pending/unverified. Never unlink arbitrary export paths or silently delete third-party messages.
+- [x] Document explicit operator override versus ordinary Contract keep policy, dedicated-store requirements, no real execution, irreversible rollback limits and physical-storage exclusions.
+- [x] Targeted tests, full unittest timeout600, strict mypy green and diff-check; checkpoint `/tmp/opencode/retention-r2-result.md`. Independent destructive/privacy/concurrency review of the actual coherent diff and new files passed. Dedicated commit/non-force push delivery is tracked in #32; this checkbox does not authorize production erasure.
+
+R2 checkpoint: R2a fix2 scoped independent review and the coherent full-R2
+privacy/destructive-boundary/concurrency review passed. Final proof: 35 new
+erasure/migration tests, 73 erasure/preparation tests, 455 full tests in 150.707s,
+strict mypy GREEN19, and clean whitespace. The earlier nearest gate passed 269
+tests before the final old-schema status correction. Final full unittest output
+is complete and says OK; the worker timeout lost the wrapper exit/wall receipt,
+so no captured exit code is claimed. Recovery finalized artifacts without source
+changes or repeated tests. Exact offline APIs are
+`erasure.erase_local(database, *, store_root)` and `erasure.status_local(database)`;
+`Core.erase_all()` extends the existing operator helpers. R2a CHECK expansion was
+implemented and tested first. Sentinel → verified non-owner absence → owner-last
+→ separately gated runtime purge is implemented. The author report is
+`/tmp/opencode/retention-r2b-result.186c8af6.md`, full log is
+`/tmp/opencode/retention-r2b-full-tests.log`, and independent review is
+`/tmp/opencode/retention-r2-release-review.md`. Minor review notes were addressed
+through operator documentation: retain the load-bearing sentinel, distinguish
+prior freed-page residue, schedule large-store maintenance, and initialize old
+metadata through offline preflight before read-only status. No production erasure
+has occurred or is authorized here. External/physical copies remain unverified.
 
 ## Migration and release boundary
 

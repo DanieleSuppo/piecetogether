@@ -3,6 +3,7 @@
 import base64
 import hashlib
 import imaplib
+import logging
 import os
 import re
 import smtplib
@@ -18,7 +19,7 @@ from email.utils import format_datetime, parsedate_to_datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal, Protocol
 
-from .retention import channel_processing
+from .retention import RetentionBusy, RetentionUnavailable, channel_processing
 
 if TYPE_CHECKING:
     from .core import Communication, Core
@@ -280,6 +281,7 @@ class EmailChannel:
                 'transport_reply_to': replies[0] if replies else None,
                 'references': refs, 'subject': subject, 'attachments': attachments}
 
+    @channel_processing
     def acquired(self, mailbox: str, uidvalidity: str, uid: str) -> bool:
         from .core import connect
         with connect(self.database) as db:
@@ -296,6 +298,7 @@ class EmailChannel:
             db.execute('INSERT OR IGNORE INTO email_acquisition VALUES (?, ?, ?, ?, ?, ?)',
                        (mailbox, uidvalidity, uid, status, communication_id, outcome))
 
+    @channel_processing
     def acquisition_outcomes(self) -> list[dict[str, str | None]]:
         from .core import connect
         with connect(self.database) as db:
@@ -437,9 +440,11 @@ class EmailAcquisitionWorker:
     def __init__(self, core: 'Core', channel: EmailChannel, transport: InboundEmailTransport,
                  config: ImapConfig, sleep: Callable[[float], None] | None = None):
         self.core, self.channel, self.transport, self.config = core, channel, transport, config
+        self.database = core.config.database
         self.sleep = sleep or time.sleep
         self.recovery_cursor = 0
 
+    @channel_processing
     def poll_once(self) -> int:
         uidvalidity, messages = self.transport.fetch()
         if not uidvalidity.isdigit():
@@ -473,7 +478,10 @@ class EmailAcquisitionWorker:
             try:
                 self._recover_pending()
                 self.poll_once()
-            except (OSError, sqlite3.Error):
+            except RetentionUnavailable:
+                logging.getLogger(__name__).warning('Acquisition stopped: retention unavailable.')
+                return
+            except (OSError, sqlite3.Error, RetentionBusy):
                 self.sleep(backoff)
                 backoff = min(backoff * 2, maximum_backoff)
             else:

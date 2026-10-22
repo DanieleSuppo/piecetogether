@@ -18,7 +18,7 @@ from .openai_responses import GenerationResult
 from .proposals import SemanticProposal
 from .telegram_channel import TelegramConfig
 
-from . import context, retention
+from . import context, erasure, retention
 
 ReplayUnavailable = context.ReplayUnavailable
 
@@ -409,6 +409,7 @@ class _CapturedStore:
 # Only deterministic Core state belongs in a fixture. Transport queues, delivery logs
 # and optional prompt diagnostics do not.
 _STATE_TABLES = {
+    'erasure_state', 'erasure_jobs',
     'retention_state', 'record_expiry', 'view_access', 'turns', 'processing_attempts', 'semantic_state', 'semantic_commits', 'trusted_records',
     'reference_assertions', 'reference_commits', 'trusted_relationships', 'trusted_groundings',
     'trusted_grounding_items', 'exposed_groundings', 'pending_items', 'candidate_target_bindings',
@@ -447,13 +448,17 @@ def _required_trace(raw: str) -> dict[str, Any]:
 
 
 def _snapshot(database: Path) -> bytes:
-    with tempfile.TemporaryDirectory(prefix='piecetogether-snapshot-') as directory:
+    with retention.operation(database), tempfile.TemporaryDirectory(prefix='piecetogether-snapshot-') as directory:
         snapshot = Path(directory) / 'snapshot.sqlite3'
         return _snapshot_to_file(database, snapshot)
 
 
 def _snapshot_to_file(database: Path, snapshot: Path) -> bytes:
     with closing(sqlite3.connect(database)) as source, closing(sqlite3.connect(snapshot)) as fixture:
+        try:
+            erasure.require_unfrozen(source)
+        except retention.RetentionUnavailable as error:
+            raise ReplayUnavailable('source evidence unavailable') from error
         source.backup(fixture)
         fixture.execute('PRAGMA secure_delete=ON')
         tables = [row[0] for row in fixture.execute("SELECT name FROM sqlite_master WHERE type='table'")]
@@ -483,7 +488,7 @@ def _initial_revision(database: Path) -> int:
             retention.require_processing(db)
             tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             # A missing retention table means legacy retain, not erased evidence.
-            if _STATE_TABLES - {'retention_state', 'record_expiry', 'view_access'} - tables:
+            if _STATE_TABLES - {'retention_state', 'record_expiry', 'view_access', 'erasure_state', 'erasure_jobs'} - tables:
                 raise ReplayUnavailable('missing initial-state evidence tables')
             rows = db.execute('SELECT revision FROM semantic_state WHERE singleton=1').fetchall()
             if len(rows) != 1 or type(rows[0][0]) is not int or rows[0][0] < 0:
