@@ -17,11 +17,11 @@ def request():
         'context-relevance-v1', 3, 65536, 2000, .7)
 
 
-def reserve_worker(root, start, results):
+def reserve_worker(root, start, results, *, trust_primary_group=False):
     with patch.object(jev_smoke, '_ledger_root', return_value=Path(root)):
         start.wait()
         try:
-            jev_smoke.reserve_once()
+            jev_smoke.reserve_once(trust_primary_group=trust_primary_group)
             results.put('reserved')
         except jev_smoke.ReservationRefused:
             results.put('refused')
@@ -304,6 +304,151 @@ class ReservationTests(unittest.TestCase):
                         self.assertNotIn('Authorization', str(caught.exception.raw))
 
 
+class PrimaryGroupTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.home = Path(self.temp.name) / 'home'
+        self.home.mkdir(mode=0o700)
+        self.root = self.home / 'piecetogether/jev-usd5-smoke'
+        self.root_patch = patch.object(jev_smoke, '_ledger_root', return_value=self.root)
+        self.root_patch.start()
+        self.addCleanup(self.root_patch.stop)
+
+    def test_matching_primary_group_requires_explicit_opt_in_and_never_chmods(self):
+        from types import SimpleNamespace
+        os.chmod(self.home, 0o775)
+        primary_gid = self.home.stat().st_gid
+        with patch.object(jev_smoke.pwd, 'getpwuid', return_value=SimpleNamespace(pw_gid=primary_gid)), \
+                patch('os.getgid', return_value=primary_gid + 1), \
+                patch('os.chmod', side_effect=AssertionError('must not chmod existing nodes')) as chmod, \
+                patch('os.fchmod', side_effect=AssertionError('must not fchmod')) as fchmod:
+            with self.assertRaises(jev_smoke.ReservationRefused) as strict:
+                jev_smoke.reserve_once()
+            self.assertEqual(strict.exception.reason, 'unsafe_ancestry')
+            self.assertFalse((self.root / 'reservation.json').exists())
+            jev_smoke.reserve_once(trust_primary_group=True)
+            self.assertEqual(chmod.call_count, 0)
+            self.assertEqual(fchmod.call_count, 0)
+        self.assertEqual(self.home.stat().st_mode & 0o777, 0o775)
+        self.assertEqual(self.root.stat().st_mode & 0o777, 0o700)
+        record = json.loads((self.root / 'reservation.json').read_text())
+        self.assertEqual(record['experiment'], 'jev-usd5-smoke-v1')
+        self.assertEqual(record['reserved_cents'], 500)
+        self.assertEqual((self.root / 'reservation.json').stat().st_mode & 0o777, 0o600)
+
+    def test_opt_in_rejects_foreign_uid_gid_and_world_write(self):
+        from types import SimpleNamespace
+        os.chmod(self.home, 0o775)
+        node = self.home.stat()
+        original_fstat = os.fstat
+        for field in ('gid', 'uid', 'world_write'):
+            os.chmod(self.home, 0o777 if field == 'world_write' else 0o775)
+            def metadata(fd):
+                result = original_fstat(fd)
+                if (result.st_dev, result.st_ino) == (node.st_dev, node.st_ino):
+                    values = list(result)
+                    if field == 'gid':
+                        values[5] = node.st_gid + 1
+                    elif field == 'uid':
+                        values[4] = os.getuid() + 1
+                    return os.stat_result(values)
+                return result
+            with self.subTest(field=field), \
+                    patch.object(jev_smoke.pwd, 'getpwuid', return_value=SimpleNamespace(pw_gid=node.st_gid)), \
+                    patch.object(jev_smoke.os, 'fstat', side_effect=metadata), \
+                    patch('http.client.HTTPSConnection') as http:
+                with self.assertRaises(jev_smoke.ReservationRefused) as caught:
+                    jev_smoke.reserve_once(trust_primary_group=True)
+                self.assertEqual(caught.exception.reason, 'unsafe_ancestry')
+                self.assertEqual(http.call_count, 0)
+                self.assertFalse((self.root / 'reservation.json').exists())
+
+    def test_truthy_nonbooleans_cannot_enable_group_trust(self):
+        from piecetogether.context import SelectionConfig
+        config = SelectionConfig(adapter='jev', model_id='jev-1.13.0', secret_reference='typesafe', minimum_relevance=.7)
+        os.chmod(self.home, 0o775)
+        class MustNotCoerce:
+            def __bool__(self):
+                raise AssertionError('must require literal True')
+        for value in (1, 'true', {'trust': True}, MustNotCoerce()):
+            with self.subTest(kind=type(value).__name__):
+                with self.assertRaises(jev_smoke.ReservationRefused):
+                    jev_smoke.reserve_once(trust_primary_group=value)
+                with self.assertRaises(ValueError):
+                    jev_smoke._new_output(self.home / 'output', trust_primary_group=value)
+                guarded = jev_smoke.GuardedJevSelector(config, 'fixture-secret', trust_primary_group=value)
+                with patch('http.client.HTTPSConnection') as http:
+                    with self.assertRaises(jev_smoke.ReservationRefused):
+                        guarded.select(request())
+                    self.assertEqual(http.call_count, 0)
+        self.assertFalse((self.root / 'reservation.json').exists())
+
+    def test_opt_in_preserves_private_directories_and_no_follow(self):
+        for kind in ('private_parent', 'private_leaf', 'symlink'):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory(dir=self.temp.name) as directory:
+                root = Path(directory) / 'piecetogether/jev-usd5-smoke'
+                root.parent.mkdir(mode=0o700)
+                if kind == 'private_parent':
+                    os.chmod(root.parent, 0o775)
+                elif kind == 'private_leaf':
+                    root.mkdir(mode=0o700)
+                    os.chmod(root, 0o775)
+                else:
+                    root.symlink_to(self.home, target_is_directory=True)
+                with patch.object(jev_smoke, '_ledger_root', return_value=root):
+                    with self.assertRaises(jev_smoke.ReservationRefused):
+                        jev_smoke.reserve_once(trust_primary_group=True)
+                self.assertFalse((root / 'reservation.json').exists())
+
+    def test_output_ancestry_uses_same_opt_in_but_output_remains_private(self):
+        os.chmod(self.home, 0o775)
+        with self.assertRaises(ValueError):
+            jev_smoke._new_output(self.home / 'strict')
+        fd = jev_smoke._new_output(self.home / 'trusted', trust_primary_group=True)
+        try:
+            self.assertEqual(os.fstat(fd).st_mode & 0o777, 0o700)
+            jev_smoke._write_private(fd, 'receipt.json', {'synthetic': True})
+            self.assertEqual((self.home / 'trusted/receipt.json').stat().st_mode & 0o777, 0o600)
+        finally:
+            os.close(fd)
+        original_mkdir = os.mkdir
+        def unsafe_output(name, mode=0o777, *, dir_fd=None):
+            original_mkdir(name, mode, dir_fd=dir_fd)
+            os.chmod(name, 0o775, dir_fd=dir_fd)  # Simulate changed output permissions.
+        with patch.object(jev_smoke.os, 'mkdir', side_effect=unsafe_output):
+            with self.assertRaises(ValueError):
+                jev_smoke._new_output(self.home / 'unsafe-output', trust_primary_group=True)
+
+    def test_mixed_mode_processes_share_one_reservation_and_no_reset(self):
+        ctx = multiprocessing.get_context('fork')
+        for group_writable in (False, True):
+            with self.subTest(group_writable=group_writable), tempfile.TemporaryDirectory(dir=self.temp.name) as directory:
+                home = Path(directory) / 'home'
+                home.mkdir(mode=0o700)
+                if group_writable:
+                    os.chmod(home, 0o775)
+                root = home / 'piecetogether/jev-usd5-smoke'
+                start, results = ctx.Event(), ctx.Queue()
+                workers = [ctx.Process(target=reserve_worker, args=(str(root), start, results),
+                                       kwargs={'trust_primary_group': mode})
+                           for mode in (False, True, False, True)]
+                for worker in workers:
+                    worker.start()
+                start.set()
+                outcomes = [results.get(timeout=10) for _ in workers]
+                for worker in workers:
+                    worker.join(10)
+                    self.assertEqual(worker.exitcode, 0)
+                self.assertEqual(outcomes.count('reserved'), 1)
+                before = (root / 'reservation.json').read_bytes()
+                for mode in (False, True):
+                    with patch.object(jev_smoke, '_ledger_root', return_value=root):
+                        with self.assertRaises(jev_smoke.ReservationRefused):
+                            jev_smoke.reserve_once(trust_primary_group=mode)
+                self.assertEqual((root / 'reservation.json').read_bytes(), before)
+
+
 class SmokeCommandTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -378,6 +523,7 @@ class SmokeCommandTests(unittest.TestCase):
                 patch('os.environ.get', side_effect=environment_get), \
                 patch.object(jev_smoke, 'reserve_once', side_effect=AssertionError('reservation')), \
                 patch('http.client.HTTPSConnection', side_effect=AssertionError('network')) as http, \
+                patch.object(jev_smoke.pwd, 'getpwuid', side_effect=AssertionError('account lookup')) as account, \
                 patch('piecetogether.core._load_local_env', side_effect=AssertionError('env file')), \
                 patch('piecetogether.core.Bootstrap.from_file', side_effect=AssertionError('real configuration')), \
                 patch('piecetogether.core.Core', side_effect=AssertionError('fixture construction')):
@@ -391,7 +537,60 @@ class SmokeCommandTests(unittest.TestCase):
                 self.assertGreater(suite.countTestCases(), 0)
                 self.assertEqual(jev_guarded_smoke.main([]), 0)
                 self.assertEqual(http.call_count, 0)
+                self.assertEqual(account.call_count, 0)
         self.assertFalse(self.root.exists())
+
+    def test_primary_group_flag_requires_live_and_does_not_replace_account_consent(self):
+        import contextlib
+        import io
+        import jev_guarded_smoke
+        with patch('http.client.HTTPSConnection') as http, \
+                patch.object(jev_smoke, 'reserve_once') as reserve, \
+                contextlib.redirect_stderr(io.StringIO()):
+            for arguments in (['--ack-trusted-primary-group'],
+                              ['--live', '--ack-trusted-primary-group', '--output', self.temp.name]):
+                with self.assertRaises(SystemExit) as caught:
+                    jev_guarded_smoke.main(arguments)
+                self.assertEqual(caught.exception.code, 2)
+            self.assertEqual(http.call_count, 0)
+            self.assertEqual(reserve.call_count, 0)
+        self.assertFalse(self.root.exists())
+
+    def test_primary_group_flag_reaches_output_guard_receipt_and_same_hold(self):
+        import contextlib
+        import io
+        import jev_guarded_smoke
+        group_home = Path(self.temp.name) / 'group-home'
+        group_home.mkdir(mode=0o700)
+        os.chmod(group_home, 0o775)
+        root = group_home / 'piecetogether/jev-usd5-smoke'
+        requests = []
+        with patch.object(jev_smoke, '_ledger_root', return_value=root), \
+                patch.dict(os.environ, {'PT_TYPESAFE_API_KEY': 'fixture-secret'}), \
+                patch('http.client.HTTPSConnection', self.connection('success', requests)), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(jev_guarded_smoke.main(['--live', '--ack-owner-prepaid-usd5',
+                '--output', str(group_home / 'strict-output')]), 1)
+            self.assertEqual(len(requests), 0)
+            self.assertFalse((root / 'reservation.json').exists())
+            output = group_home / 'trusted-output'
+            self.assertEqual(jev_guarded_smoke.main(['--live', '--ack-owner-prepaid-usd5',
+                '--ack-trusted-primary-group', '--output', str(output)]), 0)
+            self.assertEqual(len(requests), 1)
+            receipt = json.loads((output / 'receipt.json').read_text())
+            self.assertIs(receipt['trust_primary_group'], True)
+            self.assertEqual(receipt['reserved_cents'], 500)
+            self.assertEqual(receipt['actual_cost'], 'UNRECONCILED')
+            self.assertTrue(receipt['replay_independent_expectations_passed'])
+            for mode in (False, True):
+                arguments = ['--live', '--ack-owner-prepaid-usd5', '--output',
+                             str(Path(self.temp.name) / ('second-' + str(mode)))]
+                if mode:
+                    arguments.append('--ack-trusted-primary-group')
+                self.assertEqual(jev_guarded_smoke.main(arguments), 1)
+                self.assertEqual(len(requests), 1)
+        self.assertEqual(json.loads((root / 'reservation.json').read_text())['reserved_cents'], 500)
+        self.assertEqual(group_home.stat().st_mode & 0o777, 0o775)
 
     def test_live_requires_explicit_matching_account_ack_and_new_output(self):
         import contextlib
@@ -428,6 +627,7 @@ class SmokeCommandTests(unittest.TestCase):
         self.assertEqual(len(requests), 1)
         report = json.loads((output / 'receipt.json').read_text())
         self.assertEqual(report['status'], 'passed')
+        self.assertIs(report['trust_primary_group'], False)
         self.assertEqual(report['sample_count'], 1)
         self.assertEqual(report['required_available'], 2)
         self.assertEqual(report['required_selected'], 2)
@@ -516,16 +716,16 @@ class SmokeCommandTests(unittest.TestCase):
                     for parent in (root.parent, root.parent.parent, root.parent.parent.parent):
                         os.chmod(parent, 0o700)
                     (root / 'reservation.json').write_text('{')
-                def reserve():
+                def reserve(*, trust_primary_group=False):
                     if mode == 'fsync':
                         with patch.object(jev_smoke.os, 'fsync', side_effect=OSError('Bearer fixture-secret /private')):
-                            original_reserve()
+                            original_reserve(trust_primary_group=trust_primary_group)
                     elif mode == 'malformed':
                         error = jev_smoke.ReservationRefused()
                         error.reason = {'Authorization': 'Bearer fixture-secret'}
                         raise error
                     else:
-                        original_reserve()
+                        original_reserve(trust_primary_group=trust_primary_group)
                 output = Path(directory) / 'output'
                 stdout, stderr = io.StringIO(), io.StringIO()
                 with patch.object(jev_smoke, '_ledger_root', return_value=root), \

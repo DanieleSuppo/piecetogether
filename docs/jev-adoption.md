@@ -133,6 +133,33 @@ and that the stated prepaid controls apply. Live mode resolves only the process
 environment mapping `typesafe -> PT_TYPESAFE_API_KEY`; it never loads a deployment
 configuration or env file. Do not invoke live mode as part of offline validation.
 
+An additional, optional live-only `--ack-trusted-primary-group` explicitly trusts
+this OS account's primary group like the owner for nonprivate ancestry. Strict
+mode remains the default: group-writable ancestry, including 0775, still refuses
+without this option. The opt-in permits group-write only when the node belongs to
+the OS uid and its gid matches `pwd.getpwuid(os.getuid()).pw_gid`, not an effective
+or supplementary group or an environment value. Other-write and foreign ownership
+or group-write by another gid remain refused. The existing root-owned sticky
+shared-ancestry exception is unchanged. Dedicated ledger/output directories still
+require owned 0700, and reservation/artifact files still require owned, regular,
+single-link 0600 nodes. Existing directories are never chmodded or chowned.
+
+Opted-in primary-group members are **trusted like the owner**: they can rename or
+delete writable ancestry and thereby invalidate local reservation state. No
+resistance to malicious or accidental changes by those trusted members is claimed.
+The option is a local trust acknowledgement, not payment approval, an account
+verification or permission to reset the reservation. It does not replace
+`--ack-owner-prepaid-usd5`, and cannot be supplied to default offline preflight.
+Receipts record the chosen boolean `trust_primary_group` even on a refused live
+attempt that produces a receipt. Both modes use exactly the same ledger and
+experiment identity; changing the flag cannot mint a second attempt.
+
+The Python APIs expose keyword-only `trust_primary_group: bool = False` on
+`reserve_once`, `GuardedJevSelector` construction and private ancestry/output
+helpers. Only literal `True` opts in; malformed truthy values retain strict
+behavior and cannot grant trust. No Bootstrap, SelectionConfig or Proposal
+permission is added.
+
 `piecetogether.jev_smoke.reserve_once() -> None` reserves **all 500 integer cents**
 immediately before `GuardedJevSelector.select(request)` delegates once to the
 existing pinned `JevSelector`. The OS account home from

@@ -42,14 +42,19 @@ _RECORD = {'experiment': 'jev-usd5-smoke-v1', 'currency': 'USD', 'limit_cents': 
            'reserved_cents': 500, 'reconciled_cents': 0, 'attempted_dispatches': 1}
 
 
-def _check_directory(fd: int, private: bool = False) -> None:
+def _check_directory(fd: int, private: bool = False, *, trust_primary_group: bool = False) -> None:
     node = os.fstat(fd)
     mode = stat.S_IMODE(node.st_mode)
     # Shared sticky root-owned ancestry (e.g. /tmp in tests) is safe to traverse;
     # experiment directories themselves must be owned and private.
     sticky_root = node.st_uid == 0 and bool(node.st_mode & stat.S_ISVTX)
+    # Opt-in trusts only this account's primary group on its nonprivate ancestry.
+    trusted_group = (trust_primary_group is True and not private
+                     and node.st_uid == os.getuid()
+                     and node.st_gid == pwd.getpwuid(os.getuid()).pw_gid)
+    unsafe_write = bool(mode & 0o002 or mode & 0o020 and not trusted_group)
     if (not stat.S_ISDIR(node.st_mode) or node.st_uid not in (0, os.getuid())
-            or mode & 0o022 and not sticky_root
+            or unsafe_write and not sticky_root
             or private and (node.st_uid != os.getuid() or mode != 0o700)):
         raise ReservationRefused()
 
@@ -68,13 +73,13 @@ def _check_binding(parent: int, name: str, fd: int) -> None:
         raise ReservationRefused()
 
 
-def _open_chain(path: Path, *, create: bool) -> list[tuple[int, str]]:
+def _open_chain(path: Path, *, create: bool, trust_primary_group: bool = False) -> list[tuple[int, str]]:
     """Open and validate each component without following any symlink."""
     if not path.is_absolute() or '..' in path.parts:
         raise ReservationRefused()
     chain = [(os.open('/', _DIRECTORY), '')]
     try:
-        _check_directory(chain[0][0])
+        _check_directory(chain[0][0], trust_primary_group=trust_primary_group)
         for name in path.parts[1:]:
             parent = chain[-1][0]
             if create:
@@ -84,7 +89,8 @@ def _open_chain(path: Path, *, create: bool) -> list[tuple[int, str]]:
                     pass
             fd = os.open(name, _DIRECTORY, dir_fd=parent)
             chain.append((fd, name))
-            _check_directory(fd, private=name in ('piecetogether', 'jev-usd5-smoke'))
+            _check_directory(fd, private=name in ('piecetogether', 'jev-usd5-smoke'),
+                             trust_primary_group=trust_primary_group)
             _check_binding(parent, name, fd)
         return chain
     except BaseException:
@@ -93,9 +99,10 @@ def _open_chain(path: Path, *, create: bool) -> list[tuple[int, str]]:
         raise
 
 
-def _validate_chain(chain: list[tuple[int, str]]) -> None:
+def _validate_chain(chain: list[tuple[int, str]], *, trust_primary_group: bool = False) -> None:
     for index, (fd, name) in enumerate(chain):
-        _check_directory(fd, private=name in ('piecetogether', 'jev-usd5-smoke'))
+        _check_directory(fd, private=name in ('piecetogether', 'jev-usd5-smoke'),
+                         trust_primary_group=trust_primary_group)
         if index:
             _check_binding(chain[index - 1][0], name, fd)
 
@@ -108,17 +115,18 @@ def _write_all(fd: int, body: bytes) -> None:
         body = body[count:]
 
 
-def reserve_once() -> None:
+def reserve_once(*, trust_primary_group: bool = False) -> None:
     """Durably hold all 500 cents before dispatch. Any existing file refuses.
 
     Interrupted writes and fsync errors intentionally leave their partial record.
+    Only literal True opts into primary-group trust on owned nonprivate ancestry.
     There is no release, reconciliation, reset, force option or second attempt.
     """
     chain: list[tuple[int, str]] = []
     fd: int | None = None
     reason = 'unsafe_ancestry'
     try:
-        chain = _open_chain(_ledger_root(), create=True)
+        chain = _open_chain(_ledger_root(), create=True, trust_primary_group=trust_primary_group)
         _check_directory(chain[-1][0], private=True)
         # Creation, writes, fsync and final validation can leave uncertain evidence.
         reason = 'durability_failed'
@@ -134,7 +142,7 @@ def reserve_once() -> None:
         # Persist the leaf entry and every possibly newly created ancestor.
         for directory, _ in reversed(chain):
             os.fsync(directory)
-        _validate_chain(chain)
+        _validate_chain(chain, trust_primary_group=trust_primary_group)
         _check_binding(chain[-1][0], 'reservation.json', fd)
         _check_file(fd)
     except Exception:
@@ -172,11 +180,12 @@ class GuardedJevSelector:
     provider_id = 'typesafe'
     model_id = 'jev-1.13.0'
 
-    def __init__(self, config: SelectionConfig, api_key: str):
+    def __init__(self, config: SelectionConfig, api_key: str, *, trust_primary_group: bool = False):
         if not api_key:
             raise ValueError('smoke secret unavailable')
         self._delegate = JevSelector(config, api_key)
         self._key = api_key
+        self._trust_primary_group = trust_primary_group is True
         self.attempted_dispatches = 0
         self.reserved_cents: int | None = 0
         self.failure: str | None = None
@@ -184,7 +193,7 @@ class GuardedJevSelector:
 
     def select(self, request: SelectionRequest) -> SelectionResult:
         try:
-            reserve_once()
+            reserve_once(trust_primary_group=self._trust_primary_group)
         except ReservationRefused as error:
             # Existing/partial/unsafe evidence cannot establish a zero hold.
             self.reserved_cents = None
@@ -212,18 +221,18 @@ class GuardedJevSelector:
             raise SelectionFailure({'classification': 'selector_unavailable'}) from None
 
 
-def _new_output(path: Path) -> int:
+def _new_output(path: Path, *, trust_primary_group: bool = False) -> int:
     """Create a new private output leaf before reservation; return its directory FD."""
     chain: list[tuple[int, str]] = []
     fd: int | None = None
     try:
         absolute = path.absolute()
-        chain = _open_chain(absolute.parent, create=False)
+        chain = _open_chain(absolute.parent, create=False, trust_primary_group=trust_primary_group)
         os.mkdir(absolute.name, mode=0o700, dir_fd=chain[-1][0])
         fd = os.open(absolute.name, _DIRECTORY, dir_fd=chain[-1][0])
         _check_directory(fd, private=True)
         _check_binding(chain[-1][0], absolute.name, fd)
-        _validate_chain(chain)
+        _validate_chain(chain, trust_primary_group=trust_primary_group)
         os.fsync(chain[-1][0])
         return fd
     except Exception:

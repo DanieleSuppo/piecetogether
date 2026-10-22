@@ -58,13 +58,15 @@ def _offline_replay(case):
         return replay(case)
 
 
-def _run(output):
-    directory = _new_output(output)  # Reject existing/unsafe paths BEFORE a hold.
+def _run(output, *, trust_primary_group: bool = False):
+    trust_primary_group = trust_primary_group is True
+    directory = _new_output(output, trust_primary_group=trust_primary_group)
     selector = None
     case = None
     started = monotonic()
     report = {
         'status': 'failed', 'error': None, 'scope': 'synthetic compatibility only; not deployment adoption',
+        'trust_primary_group': trust_primary_group,
         'fixture_version': FIXTURE_VERSION, 'model': 'jev-1.13.0', 'rubric': 'context-relevance-v1',
         'policy_versions': POLICY_VERSIONS, 'trace_schema_version': TRACE_SCHEMA_VERSION,
         'minimum_relevance': .7, 'configured_sample_count': 1, 'sample_count': 0,
@@ -107,7 +109,7 @@ def _run(output):
             if not key:
                 report['error'] = 'secret_unavailable'
                 return report
-            selector = GuardedJevSelector(config, key)
+            selector = GuardedJevSelector(config, key, trust_primary_group=trust_primary_group)
             fixture.config = replace(fixture.config, selection=config, secret_references=references)
             core = fixture.core(test_context.OperationsModel(()), selector=selector)
             payload = fixture.message(text='cucina e bagno')
@@ -166,10 +168,13 @@ def main(argv=None):
     parser.add_argument('--ack-owner-prepaid-usd5', action='store_true', help=(
         'confirm PT_TYPESAFE_API_KEY belongs to the owner-confirmed prepaid account: remaining <= USD 5, '
         'no auto-refill, service stops at exhaustion; not independently verified; full USD 5 held permanently'))
+    parser.add_argument('--ack-trusted-primary-group', action='store_true', help=(
+        'trust the OS account primary group like the owner on owned nonprivate ancestry; '
+        'group members can rename/delete ancestry; private directories remain 0700'))
     args = parser.parse_args(argv)
     if not args.live:
-        if args.output is not None or args.ack_owner_prepaid_usd5:
-            parser.error('--output and account acknowledgement require --live')
+        if args.output is not None or args.ack_owner_prepaid_usd5 or args.ack_trusted_primary_group:
+            parser.error('--output and account/group acknowledgements require --live')
         print(json.dumps({'status': 'offline preflight only', 'live_authorized': False,
                           'cap_evidence': 'OWNER-CONFIRMED', 'provider_account_independently_verified': False,
                           'reservation_created': False, 'secret_resolved': False,
@@ -178,7 +183,7 @@ def main(argv=None):
     if args.output is None or not args.ack_owner_prepaid_usd5:
         parser.error('--live requires --output and --ack-owner-prepaid-usd5 for the matching owner-limited account')
     try:
-        report = _run(args.output)
+        report = _run(args.output, trust_primary_group=args.ack_trusted_primary_group)
         print('synthetic smoke ' + report['status'] + '; actual cost UNRECONCILED; no adoption decision')
         return 0 if report['status'] == 'passed' else 1
     except Exception:
