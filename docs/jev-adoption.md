@@ -47,17 +47,22 @@ These gates precede every live invocation in the comparison below. Credentials
 alone are insufficient; do not run the paid steps while any gate is unresolved.
 
 Typing and controlled-local retention/erasure were delivered separately; they do
-not establish Jev adoption. No authenticated Jev request was dispatched by this
-maintenance work. That is an execution-history statement, not an account-billing
-reconciliation: account charges were not inspected. The guarded synthetic smoke
-below now supplies a create-once reservation, but implementation and offline tests
-do not create the owner's reservation or establish any account charges.
-Semantic-quality, measured latency and actual account-charge
-evidence remain absent. The default stays `deterministic`; synthetic replay
+not establish Jev adoption. The owner-run synthetic smoke received a valid
+`jev-1.13.0` response, then failed its independent selection expectations:
+Jev abstained at 0.7 and Core used deterministic fallback. The two required
+Contexts scored 0.39 and 0.44; unrelated records scored up to 0.45. An offline
+sweep found no threshold selecting both Contexts without at least three extra
+records. Matching replay reproduces that failure; it does not certify quality.
+Observed usage was 4529 input / 759 output tokens. Public-rate arithmetic gives
+nominal US$0.000190218, not a reconciled charge. Actual account charges remain
+unverified, and the full local 500-cent reservation stays intact. The default stays `deterministic`; synthetic replay
 success is not deployment representativeness.
 
 The authorized ceiling is **US$5 total**, not per run, process, case or provider.
-Before any live invocation:
+Before any live invocation, apply the gates below. The explicitly authorized
+[prepaid catalogue diagnostic exception](#prepaid-catalogue-diagnostic-exception)
+substitutes an aggregate wallet ceiling for gates 2–3 only within that fixed
+experiment. It does not relax production-adoption requirements.
 
 1. Review the actual billing/privacy/trust-boundary diff before credential delivery
    or a separately approved paid invocation. Configure an existing secret reference
@@ -185,8 +190,10 @@ The adapter sends at most one HTTP request, without retries. Success, failure,
 timeout, unknown usage, process death and artifact-write failure **all retain the
 full hold**. Usage or public-price estimates never release it or settle an actual
 charge. No reset, force flag, reconciliation or second-attempt path exists. No
-further paid attempt is allowed until separately reviewed future owner billing
-reconciliation. Owner deletion, filesystem rollback and another host can bypass
+further paid attempt through this one-shot command is allowed until separately
+reviewed future owner billing reconciliation. The separately authorized prepaid
+catalogue diagnostic exception below consumes the same unreleased envelope;
+it neither resets this record nor authorizes another one-shot invocation. Owner deletion, filesystem rollback and another host can bypass
 local state; this is not an adversarial-owner or distributed guarantee.
 
 The command seeds only the existing offline cucina/bagno fixtures. It freezes both
@@ -232,6 +239,144 @@ required/selected/missing counts, fallback, Core calls, conservative delegation
 count and timing. Scope is **sample_count=1 synthetic compatibility**, not a
 held-out evaluation, p95/SLA, deployment quality result or production GO. Keep all
 representative adoption and privacy/billing gates above and below unchanged.
+
+## Prepaid catalogue diagnostic exception
+
+The operator explicitly authorized further tests using the local `.env` and
+confirmed no off-credit, postpaid or card charges: service stops when the same
+prepaid wallet is exhausted. Together with no auto-refill and remaining credit
+at most US$5, this is an **OWNER-CONFIRMED aggregate cash bound** across the first
+smoke and this one follow-up. It is not independent account/provider verification.
+The local ledger limits attempts; it is not itself a provider cash ceiling.
+The whole remaining authorization may be consumed. No purchase, refill, second
+wallet, third batch or assumption of remaining funds is authorized.
+
+This exception permits **at most five new synthetic POSTs**, after implementation
+and independent actual-diff billing/privacy review. It does not implement or
+clear the general credible-per-attempt-cost or billing-reconciliation gates.
+All charges stay `UNRECONCILED`; public-rate arithmetic stays nominal. The
+original `reservation.json` must remain intact and byte-equal to its fixed
+500-cent record. Never recreate, delete, release or reset it.
+
+One fixed supplemental, private, exclusive and fsynced batch claim must bind the
+predeclared plan hash, prior recorded attempt 1 and maximum five new attempts.
+It allocates **no additional funds**. Each new attempt needs its own immutable,
+exclusive, fsynced marker before delegation. Existing, partial or corrupt claims
+refuse a new run; crash may burn slots but never authorizes restart or retry.
+Neither output paths, environment paths, trust modes nor run identifiers create
+another envelope. Reports include the first attempt, distinguish invocation-local
+counts from unknown prior counts, and never infer zero charges from missing data.
+
+The existing original-ID/original-order capture is the control, not another paid
+request. The five fixed variants are: original IDs with reversed catalogue;
+readable IDs with original/reversed catalogue; fresh opaque IDs with
+original/reversed catalogue. Relabel mappings preserve question-key wire order
+by original record, and every provider request must differ from the original.
+Model `jev-1.13.0`, `context-relevance-v1`, question text, summaries, expected
+Context identities and minimum relevance 0.7 stay unchanged. These are
+**post-hoc-informed catalogue/ID ablations, not held-out validation**. New IDs are
+mapped back to the original synthetic identities for comparison. Do not feed
+those counterfactual IDs into Core or claim new Grounding or replay success.
+
+Freeze the full plan and analysis rule before the first dispatch. Report
+score-to-content and score-to-position alignment separately; ordinary score
+variation alone does not prove an ID-mapping defect. Clear positional tracking
+ends the batch without adoption or more spending. Any authentication, quota,
+rate-limit, model, transport or missing/invalid-usage error also ends it
+immediately. No HTTP retry or provider/model switch is permitted. Semantic
+abstention is diagnostic data, not permission for adaptive extra requests.
+
+The new paid path may load only the explicitly authorized repository `.env`
+credential into a short-lived process. Never print or persist its value or
+headers. Import/default/offline tests must not load it, read a real reservation,
+or call a provider. Use the existing secret-echo sanitation, strict Jev schema,
+request byte/token/deadline bounds and private output helpers unchanged. Group
+trust remains an explicit owner-approved primary-group option, not a permission
+change. Keep deterministic production defaults and the original smoke assertions.
+
+### Fixed diagnostic command and records
+
+The existing owner authorization covers this fixed protocol after independent
+actual-diff review; it does not authorize production adoption or another batch.
+The original one-shot smoke command and its independent expectations are unchanged.
+
+Offline preflight and plan compilation never resolve a credential, look up the
+OS account, inspect the real ledger or dispatch a provider request:
+
+```sh
+PYTHONPATH=tests python3 -m jev_catalogue_probe
+PYTHONPATH=tests python3 -m jev_catalogue_probe --capture PRIVATE_SYNTHETIC_CAPTURE
+```
+
+The second form emits the canonical plan, including `plan_hash`. Only the closed
+15-record cucina/bagno profile qualifies: development/a1/s1, exact synthetic
+summaries and Communication, no attachments/references/permitted-context records.
+No snapshot is deserialized or copied. Candidate payloads must already be empty.
+The plan binds the source-capture digest, canonical provider-body/request digests,
+identity maps, two independent required Contexts, pinned versions and stop rule.
+It freezes every mapping and request before reading control scores.
+
+The paid form requires **all** of `--live --capture PRIVATE_SYNTHETIC_CAPTURE
+--output NEW_PRIVATE_DIRECTORY --expected-plan-hash HASH
+--ack-owner-prepaid-usd5 --ack-no-off-credit-charges`. An optional
+`--ack-trusted-primary-group` keeps the existing trust semantics. A hash mismatch
+refuses before child creation, credential access or claim. Live execution alone
+starts a short-lived POSIX child; the existing Core dotenv loader reads the fixed
+repository `.env` into a key-filtered mapping. Only `PT_TYPESAFE_API_KEY` is
+selected; no deployment configuration or other dotenv variable is loaded into
+that mapping. There is no credential, model, provider, environment-path or ledger
+path CLI override. The key never crosses argv, pipes, receipts or console output.
+
+`piecetogether.jev._payload(request, model_id)` owns the unchanged canonical
+provider body. `FollowupJevSelector(config, api_key,
+planned_requests, *, plan_hash, trust_primary_group=False,
+ack_no_off_credit_charges=False)` requires exactly five distinct pinned requests
+and literal-True financial acknowledgement. It shares the original pre-Core
+schema/echo/usage boundary; it never invokes `reserve_once`. Construction is inert.
+A lock serializes selection. Each call must match the next full request digest;
+unplanned input, exhausted slots or any error makes that instance terminal.
+
+The fixed ledger names are `catalogue-followup.json` and
+`catalogue-attempt-1.json` through `catalogue-attempt-5.json`. The exclusive claim
+binds the plan hash, original-record digest, prior recorded attempt 1, maximum five
+new calls and all five request digests. It contains no new `reserved_cents`.
+Each immutable marker binds its slot, plan and request. File and directory fsync
+precede delegation, with no-follow, ownership, permissions, single-link and inode
+binding checks. Every call revalidates the original record, claim and earlier
+markers. Write/fsync uncertainty burns evidence and refuses restart; nothing is
+automatically removed or repaired. The old one-shot still refuses its existing
+reservation in either trust mode.
+
+New private output exists before credential access or claim. `plan.json`,
+`case-1.json` through `case-5.json` as reached, and `receipt.json` are exclusive
+0600 artifacts. Batch deadline is 15 seconds; each frozen request uses at most
+its captured timeout or 1000ms, whichever is smaller. Existing byte/token guards
+remain. Any provider, transport, response, usage, budget or artifact error stops
+further dispatch, without retry. A crash can leave missing/partial artifacts and
+burnt markers, never permission to resume.
+
+Receipts keep `reserved_cents=500` only after validating the original evidence;
+otherwise it is null. They distinguish invocation-local durable markers and
+selector delegations from actual HTTP count (unknown), original attempt 1 when
+validated, and global counts. Existing/uncertain prior batch evidence gives
+`global_recorded_attempts=null`, with conservative authorized upper bound 6,
+never a misleading global `1 + 0`. Validated-response usage and nominal estimates
+are explicitly partial evidence, never reconciled billing. `UNRECONCILED`,
+`OWNER-CONFIRMED`, independent verification false and the full hold remain even
+when every case passes. Abstention leaves accepted-selection metrics null.
+A completed selection with no selected records has known zero counts and zero
+required recall; false-accept rate remains unmeasured/null.
+
+For original/reversed same-ID pairs, content-aligned and position-aligned score
+vectors are reported separately. The fixed rule stops only when **all** position
+differences are <=0.01 and **any** content difference is >=0.10, using exact decimal
+comparisons. The headline `position_tracking_suspected` is true only on an
+observed trigger and otherwise null/inconclusive. `stop_rule` distinguishes
+`not_tested`, `not_triggered` and `triggered`; an unmet rule does not demonstrate
+content grounding or exclude a positional effect. The historical control and
+provider variability limit sensitivity. No conclusion is certified.
+Other drift is descriptive. Counterfactual IDs never enter Core, and these
+post-hoc-informed cases establish neither held-out quality nor p95/production GO.
 
 ## Comparison on existing domain scenarios
 
