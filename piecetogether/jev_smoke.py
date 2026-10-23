@@ -269,7 +269,19 @@ def _exclusive_record(directory: int, name: str, expected: bytes) -> None:
         os.close(fd)
 
 
-class FollowupJevSelector:
+def _catalogue_claim(plan_hash: str, digests: tuple[str, ...]) -> bytes:
+    return _record_bytes({'experiment': 'jev-catalogue-followup-v1', 'plan_hash': plan_hash,
+        'max_new_calls': 5, 'prior_recorded_attempts': 1,
+        'original_record_sha256': hashlib.sha256(_record_bytes(_RECORD)).hexdigest(),
+        'request_digests': digests})
+
+
+def _attempt_markers(plan_hash: str, digests: tuple[str, ...]) -> tuple[bytes, ...]:
+    return tuple(_record_bytes({'plan_hash': plan_hash, 'slot': i + 1, 'request_digest': digest})
+                 for i, digest in enumerate(digests))
+
+
+class _FrozenJevSelector:
     """One nonresumable five-slot attempt log under the original unreleased hold.
 
     The owner-confirmed provider wallet, NOT this log, bounds aggregate cash.
@@ -278,16 +290,27 @@ class FollowupJevSelector:
     provider_id = 'typesafe'
     model_id = 'jev-1.13.0'
 
+    _v2 = False
+
     def __init__(self, config: SelectionConfig, api_key: str,
                  planned_requests: tuple[SelectionRequest, ...], *, plan_hash: str,
-                 trust_primary_group: bool = False, ack_no_off_credit_charges: bool = False):
+                 trust_primary_group: bool = False, ack_no_off_credit_charges: bool = False,
+                 prior_plan_hash: str | None = None, prior_request_digests: tuple[str, ...] = ()):
         from .jev import _payload
+        rubric = 'context-relevance-v2' if self._v2 else 'context-relevance-v1'
+        timeout = 2000 if self._v2 else 1000
+        if self._v2 and (not isinstance(prior_plan_hash, str)
+                or re.fullmatch(r'[0-9a-f]{64}', prior_plan_hash) is None
+                or type(prior_request_digests) is not tuple or len(prior_request_digests) != 5
+                or any(not isinstance(d, str) or re.fullmatch(r'[0-9a-f]{64}', d) is None
+                       for d in prior_request_digests) or len(set(prior_request_digests)) != 5):
+            raise ValueError('invalid prior diagnostic binding')
         if (ack_no_off_credit_charges is not True or not api_key
                 or not isinstance(plan_hash, str) or re.fullmatch(r'[0-9a-f]{64}', plan_hash) is None
                 or type(planned_requests) is not tuple or len(planned_requests) != 5
-                or config.minimum_relevance != .7 or config.rubric_version != 'context-relevance-v1'
+                or config.minimum_relevance != .7 or config.rubric_version != rubric
                 or any(r.minimum_relevance != .7 or r.rubric_version != config.rubric_version
-                       or not r.candidates or not 1 <= r.timeout_ms <= 1000
+                       or not r.candidates or type(r.timeout_ms) is not int or not 1 <= r.timeout_ms <= timeout
                        or r.remaining_calls < 1 or not 1 <= r.remaining_tokens <= 65536
                        for r in planned_requests)):
             raise ValueError('invalid frozen diagnostic plan or financial acknowledgement')
@@ -298,12 +321,22 @@ class FollowupJevSelector:
         self._delegate = JevSelector(config, api_key)
         self._key = api_key
         self._trust = trust_primary_group is True
-        self._claim = _record_bytes({'experiment': 'jev-catalogue-followup-v1', 'plan_hash': plan_hash,
-            'max_new_calls': 5, 'prior_recorded_attempts': 1,
-            'original_record_sha256': hashlib.sha256(_record_bytes(_RECORD)).hexdigest(),
-            'request_digests': self._digests})
-        self._markers = tuple(_record_bytes({'plan_hash': plan_hash, 'slot': i + 1, 'request_digest': digest})
-                              for i, digest in enumerate(self._digests))
+        self._claim_name = 'jev-v2-followup.json' if self._v2 else 'catalogue-followup.json'
+        self._marker_prefix = 'jev-v2-attempt' if self._v2 else 'catalogue-attempt'
+        self._prior_records: tuple[tuple[str, bytes], ...] = ()
+        self._claim = _catalogue_claim(plan_hash, self._digests)
+        if self._v2:
+            assert prior_plan_hash is not None
+            prior_claim = _catalogue_claim(prior_plan_hash, prior_request_digests)
+            self._prior_records = (('catalogue-followup.json', prior_claim),) + tuple(
+                (f'catalogue-attempt-{i + 1}.json', marker)
+                for i, marker in enumerate(_attempt_markers(prior_plan_hash, prior_request_digests)))
+            self._claim = _record_bytes({'experiment': 'jev-relevance-v2-followup',
+                'plan_hash': plan_hash, 'max_new_calls': 5, 'prior_recorded_attempts': 6,
+                'prior_claim_sha256': hashlib.sha256(prior_claim).hexdigest(),
+                'original_record_sha256': hashlib.sha256(_record_bytes(_RECORD)).hexdigest(),
+                'request_digests': self._digests})
+        self._markers = _attempt_markers(plan_hash, self._digests)
         self._lock = Lock()
         self._terminal = False
         self._claimed = False
@@ -313,36 +346,53 @@ class FollowupJevSelector:
         self.reserved_cents: int | None = None
         self.failure: str | None = None
         self.prior_batch_attempts_known = False
+        self.verified_prior_recorded_attempts: int | None = None
+
+    def _validate_prior(self, directory: int) -> None:
+        self.reserved_cents = None
+        self.verified_prior_recorded_attempts = None
+        _read_record(directory, 'reservation.json', _record_bytes(_RECORD))
+        self.reserved_cents = 500
+        for name, body in self._prior_records:
+            _read_record(directory, name, body)
+        self.verified_prior_recorded_attempts = 6 if self._v2 else 1
 
     def _mark(self) -> None:
         chain: list[tuple[int, str]] = []
+        # No previous exact count survives interrupted marker durability checks.
+        self.prior_batch_attempts_known = False
+        self.verified_prior_recorded_attempts = None
         try:
+            # A v2 receipt cannot reuse reservation evidence from an earlier call.
+            if self._v2:
+                self.reserved_cents = None
             # Never create missing ancestry or resurrect the old reservation.
             chain = _open_chain(_ledger_root(), create=False, trust_primary_group=self._trust)
             directory = chain[-1][0]
             _check_directory(directory, private=True)
-            self.reserved_cents = None
-            _read_record(directory, 'reservation.json', _record_bytes(_RECORD))
-            self.reserved_cents = 500
+            self._validate_prior(directory)
             if not self._claimed:
-                _exclusive_record(directory, 'catalogue-followup.json', self._claim)
+                _exclusive_record(directory, self._claim_name, self._claim)
                 self._claimed = True
-                self.prior_batch_attempts_known = True
-            _read_record(directory, 'catalogue-followup.json', self._claim)
+            _read_record(directory, self._claim_name, self._claim)
             for index in range(self.recorded_slots):
-                _read_record(directory, f'catalogue-attempt-{index + 1}.json', self._markers[index])
+                _read_record(directory, f'{self._marker_prefix}-{index + 1}.json', self._markers[index])
             index = self.recorded_slots
-            _exclusive_record(directory, f'catalogue-attempt-{index + 1}.json', self._markers[index])
+            _exclusive_record(directory, f'{self._marker_prefix}-{index + 1}.json', self._markers[index])
             # A durable marker burns its slot, even if subsequent validation fails.
             self.recorded_slots += 1
             _validate_chain(chain, trust_primary_group=self._trust)
-            _read_record(directory, 'reservation.json', _record_bytes(_RECORD))
-            _read_record(directory, 'catalogue-followup.json', self._claim)
-            _read_record(directory, f'catalogue-attempt-{index + 1}.json', self._markers[index])
+            self._validate_prior(directory)
+            _read_record(directory, self._claim_name, self._claim)
+            for index in range(self.recorded_slots):
+                _read_record(directory, f'{self._marker_prefix}-{index + 1}.json', self._markers[index])
+            _validate_chain(chain, trust_primary_group=self._trust)
+            self.prior_batch_attempts_known = True
         except Exception:
             # A partial/fsync-uncertain marker is burned but cannot support an
             # exact global count. Do not turn local zero into historical zero.
             self.prior_batch_attempts_known = False
+            self.verified_prior_recorded_attempts = None
             raise ReservationRefused() from None
         finally:
             for directory, _ in reversed(chain):
@@ -387,6 +437,28 @@ class FollowupJevSelector:
             except BaseException:
                 self._terminal = True
                 raise
+
+
+class FollowupJevSelector(_FrozenJevSelector):
+    """Legacy fixed catalogue protocol; names, claim bytes and limits unchanged."""
+    def __init__(self, config: SelectionConfig, api_key: str,
+                 planned_requests: tuple[SelectionRequest, ...], *, plan_hash: str,
+                 trust_primary_group: bool = False, ack_no_off_credit_charges: bool = False):
+        super().__init__(config, api_key, planned_requests, plan_hash=plan_hash,
+            trust_primary_group=trust_primary_group, ack_no_off_credit_charges=ack_no_off_credit_charges)
+
+
+class JevV2BoundedSelector(_FrozenJevSelector):
+    """One fixed v2 extension; no additional allocation or resumable claim."""
+    _v2 = True
+
+    def __init__(self, config: SelectionConfig, api_key: str,
+                 planned_requests: tuple[SelectionRequest, ...], *, plan_hash: str,
+                 prior_plan_hash: str, prior_request_digests: tuple[str, ...],
+                 trust_primary_group: bool = False, ack_no_off_credit_charges: bool = False):
+        super().__init__(config, api_key, planned_requests, plan_hash=plan_hash,
+            prior_plan_hash=prior_plan_hash, prior_request_digests=prior_request_digests,
+            trust_primary_group=trust_primary_group, ack_no_off_credit_charges=ack_no_off_credit_charges)
 
 
 def _new_output(path: Path, *, trust_primary_group: bool = False) -> int:

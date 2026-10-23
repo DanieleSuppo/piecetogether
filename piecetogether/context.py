@@ -73,7 +73,7 @@ class SelectionConfig:
             value = getattr(self, name)
             if type(value) is not int or not 1 <= value <= ceiling:
                 raise ValueError(f'{name} must be a positive bounded integer')
-        if self.rubric_version != 'context-relevance-v1':
+        if self.rubric_version not in ('context-relevance-v1', 'context-relevance-v2'):
             raise ValueError('unsupported relevance rubric version')
         if self.adapter == 'jev' and (
             not isinstance(self.model_id, str)
@@ -81,6 +81,7 @@ class SelectionConfig:
             or not isinstance(self.secret_reference, str) or not self.secret_reference.strip()
             or not finite_number(self.minimum_relevance)
             or self.minimum_relevance is None or not 0 < self.minimum_relevance < 1
+            or self.rubric_version == 'context-relevance-v2' and self.minimum_relevance != .7
         ):
             raise ValueError('Jev requires pinned model, secret reference and evaluated operating point')
 
@@ -545,7 +546,7 @@ def select(pack: ContextPack, inbound: dict[str, Any], selector: SemanticSelecto
     entry: dict[str, Any] = {'request': asdict(request),
                             'request_id': digest(encoded(asdict(request))),
                             'selection_policy_version': SELECTION_POLICY_VERSION,
-                            'task_version': 'context-relevance-v1',
+                            'task_version': config.rubric_version,
                             'operating_point': config.minimum_relevance,
                             'raw_response': raw_response, 'failure': failure,
                             'provider_metadata': raw_response if failure == 'budget_exhausted' else None,

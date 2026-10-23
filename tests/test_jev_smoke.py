@@ -4,6 +4,7 @@ import multiprocessing
 import os
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -36,10 +37,20 @@ def crash_worker(root):
         jev_smoke.reserve_once()
 
 
+def temporary_account(test, directory):
+    """Never resolve the operator's actual NSS home during offline proofs."""
+    for p in (patch.object(jev_smoke.pwd, 'getpwuid', return_value=SimpleNamespace(
+            pw_dir=directory, pw_gid=Path(directory).stat().st_gid)),
+            patch.dict(os.environ, {}, clear=True)):
+        p.start()
+        test.addCleanup(p.stop)
+
+
 class ReservationTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
+        temporary_account(self, self.temp.name)
         self.root = Path(self.temp.name) / 'private' / 'jev-usd5-smoke'
         self.patch = patch.object(jev_smoke, '_ledger_root', return_value=self.root)
         self.patch.start()
@@ -308,6 +319,7 @@ class PrimaryGroupTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
+        temporary_account(self, self.temp.name)
         self.home = Path(self.temp.name) / 'home'
         self.home.mkdir(mode=0o700)
         self.root = self.home / 'piecetogether/jev-usd5-smoke'
@@ -453,6 +465,7 @@ class SmokeCommandTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
+        temporary_account(self, self.temp.name)
         self.root = Path(self.temp.name) / 'ledger' / 'jev-usd5-smoke'
         self.ledger_patch = patch.object(jev_smoke, '_ledger_root', return_value=self.root)
         self.ledger_patch.start()

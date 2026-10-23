@@ -80,6 +80,8 @@ class ProbeTests(unittest.TestCase):
         self.probe = probe
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
+        from test_jev_smoke import temporary_account
+        temporary_account(self, self.temp.name)
         self.root = Path(self.temp.name) / 'piecetogether/jev-usd5-smoke'
         self.env = Path(self.temp.name) / 'fixture.env'
         self.env.write_text('PT_TYPESAFE_API_KEY=fixture-secret\nOTHER_SECRET=must-not-load\n')

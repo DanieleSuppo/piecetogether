@@ -17,7 +17,9 @@ Public documentation is not authenticated verification of this deployment's acco
 
 - `POST https://api.typesafe.ai/v1/systemone`, Bearer API key, pinned `jev-1.13.0`.
   The provider also advertises `jev-1.14.0`; this is not permission to upgrade or
-  use a moving alias. Preserve the existing pin and `context-relevance-v1` rubric.
+  use a moving alias. Preserve the existing pin and default `context-relevance-v1`
+  rubric. The explicit `context-relevance-v2` diagnostic opt-in below does not
+  change deployment defaults or the shared Core selection policy.
 - Text/JSON only; no raw Artifact or DB access. Provider sessions are not Core
   memory. This does not mean the provider retains no requests or telemetry;
   no-training statements do not establish zero logging or a deletion deadline.
@@ -49,7 +51,8 @@ alone are insufficient; do not run the paid steps while any gate is unresolved.
 Typing and controlled-local retention/erasure were delivered separately; they do
 not establish Jev adoption. The owner-run synthetic smoke received a valid
 `jev-1.13.0` response, then failed its independent selection expectations:
-Jev abstained at 0.7 and Core used deterministic fallback. The two required
+The adapter returned application `abstained` at 0.7 and Core used deterministic fallback.
+This was not a native Jev abstention: the provider returned Noul P(yes) values. The two required
 Contexts scored 0.39 and 0.44; unrelated records scored up to 0.45. An offline
 sweep found no threshold selecting both Contexts without at least three extra
 records. Matching replay reproduces that failure; it does not certify quality.
@@ -249,7 +252,9 @@ at most US$5, this is an **OWNER-CONFIRMED aggregate cash bound** across the fir
 smoke and this one follow-up. It is not independent account/provider verification.
 The local ledger limits attempts; it is not itself a provider cash ceiling.
 The whole remaining authorization may be consumed. No purchase, refill, second
-wallet, third batch or assumption of remaining funds is authorized.
+wallet or assumption of remaining funds is authorized. This completed v1 protocol
+never authorizes a third batch; the separately authorized fixed v2 extension below
+is a new protocol under the same original wallet, not a restart of this one.
 
 This exception permits **at most five new synthetic POSTs**, after implementation
 and independent actual-diff billing/privacy review. It does not implement or
@@ -283,7 +288,7 @@ score-to-content and score-to-position alignment separately; ordinary score
 variation alone does not prove an ID-mapping defect. Clear positional tracking
 ends the batch without adoption or more spending. Any authentication, quota,
 rate-limit, model, transport or missing/invalid-usage error also ends it
-immediately. No HTTP retry or provider/model switch is permitted. Semantic
+immediately. No HTTP retry or provider/model switch is permitted. Application
 abstention is diagnostic data, not permission for adaptive extra requests.
 
 The new paid path may load only the explicitly authorized repository `.env`
@@ -383,7 +388,9 @@ post-hoc-informed cases establish neither held-out quality nor p95/production GO
 The reviewed five-request follow-up completed on the frozen plan
 `68f38641db29c2741f904ba84b40303a922ab133d0ca04fc55db64c6f8614f2d`.
 All five provider replies passed the pinned schema and usage checks. All five
-returned `abstained`: no record reached the unchanged relevance threshold 0.7.
+produced adapter outcome `abstained`: no record reached the unchanged relevance
+threshold 0.7. These are application routing decisions over native Noul P(yes),
+not a native Jev abstention field.
 There were no additional retries, alternate models or third batch.
 
 | Input variant | Bagno Context score | Cucina Context score | Fewest extra records at full Context recall |
@@ -425,6 +432,140 @@ justified, explicitly versioned task/rubric and independently labelled held-out
 scenarios, not a threshold tweak to fit this capture. No further paid request is
 authorized by this completed protocol; preserve all attempt records. Billing
 reconciliation and production-adoption evidence remain open in #32.
+
+## Authorized relevance-v2 diagnostic extension (not yet executed)
+
+The operator requested a remodeled task and one bounded retry. This permits at
+most five additional synthetic POSTs under the **same original aggregate
+500-cent wallet**, including the six earlier recorded attempts. It authorizes
+no new US$5, wallet, refill, reservation, release, reset or protocol restart.
+Account controls remain OWNER-CONFIRMED, independently verified false; charges
+remain UNRECONCILED. Independent actual-diff billing/privacy/concurrency/trust
+review and parent release gates still precede any paid execution. Implementation
+and offline fake-HTTP tests do not establish that future execution succeeded.
+
+`JevSelector` shares one transport/schema/budget boundary across exactly v1/v2.
+V1 question, actual serialized provider bytes and routing remain unchanged for
+matching request/config pairs. A new fail-closed rubric/config equality precondition
+also applies to v1; this is not a claim that all invalid-caller behavior is unchanged.
+V2 inlines only each existing compact candidate (`id`, `kind`, `summary`, `revision`)
+and adds explicit kind-specific inclusion rules and the application boundary.
+No raw payload, binary Artifact, additional memory, access or disclosure authority
+is supplied. Unknown optional kinds refuse before HTTP. Core still supplies
+mandatory pending items outside optional filtering and owns fallback, membership,
+revision and disclosure checks. Task evidence equals the request/config rubric;
+replay accepts only known, exactly matching task/request/result versions. The
+Core selection policy version remains `context-selection-v1`.
+
+V2 native Noul P(yes) >=0.7 is positive; <=0.3 is negative. Any value strictly
+between causes application `abstained` and bounded reference fallback, even with
+another positive. All strong negatives produce completed/empty, not fallback.
+These exact initial thresholds are vendor starting heuristics, not local
+calibration guarantees. Native probabilities and adapter routing are reported
+separately; no model-generated explanation or confidence field is requested.
+
+Offline default and closed plan compilation:
+
+```sh
+PYTHONPATH=tests python3 -m jev_relevance_probe
+PYTHONPATH=tests python3 -m jev_relevance_probe --capture PRIVATE_SYNTHETIC_CAPTURE
+```
+
+Only the old validated 15-record capture profile qualifies. Snapshots are never
+deserialized. Five literal messages and independent expected optional sets freeze
+before new responses: `cucina e bagno` (both Contexts),
+`Riprendiamo il contesto cucina, non quello bagno.` (cucina Context),
+`Buongiorno, grazie.` (empty),
+`Mi riferisco all'entità chiamata bagno, non al contesto della conversazione.`
+(bagno Entity), and `Sì, confermo.` (empty with one fixed synthetic Core-shaped
+mandatory pending item and reply reference). New message IDs are deterministic;
+the original normalized Communication remains unchanged. No arbitrary input,
+expected-label, ledger-root, environment-path or namespace flags exist. Exact
+requests, provider bodies, expectations, thresholds and digests bind the canonical
+plan hash. Changed plans/hashes refuse before key or claim access. Diagnostics
+are post-hoc-informed, not representative held-out or Core end-to-end evaluation.
+
+Live flags, reserved for the parent after review/release, match the old command:
+`--live --capture PRIVATE_SYNTHETIC_CAPTURE --output NEW_PRIVATE_DIRECTORY
+--expected-plan-hash HASH --ack-owner-prepaid-usd5 --ack-no-off-credit-charges`,
+plus the approved `--ack-trusted-primary-group` on hosts needing that trust.
+Only the short-lived child calls the existing selected-key dotenv loader; no key
+reaches parent argv, pipes, artifacts or logs. Import/default/offline are inert.
+The new protocol shares the frozen guard engine with v1; it is not a generic
+experiment registry or another HTTP client.
+
+`JevV2BoundedSelector(config, api_key, planned_requests, *, plan_hash,
+prior_plan_hash, prior_request_digests, trust_primary_group=False,
+ack_no_off_credit_charges=False)` constructs inertly. Exactly five distinct v2
+requests and five distinct prior hex digests are required. The expected old claim
+is derived offline from the old catalogue plan compiled from the same capture.
+Before **every** dispatch, validate the exact original reservation, old claim,
+five old markers, new claim and all reached new markers, including owner-only
+permissions, no-follow/single-link and FD/path binding. New fixed filenames are
+`jev-v2-followup.json` and `jev-v2-attempt-1.json` through
+`jev-v2-attempt-5.json`. The new exclusive claim binds the prior claim SHA-256,
+current plan and five current request digests. File/directory fsync precedes
+HTTP. Old bytes never change. There is no new allocation, namespace, resume or
+slot release. Competing processes have one claim winner; partial writes, crashes
+and errors burn evidence and refuse all further work. Old smoke/v1 commands
+remain closed by their existing records.
+
+Each request timeout is <=2000 ms, the batch deadline is 15 seconds and the
+child lifetime is 20 seconds. Auth/quota/rate/model/transport/schema/usage/echo,
+budget/deadline and artifact failures are terminal. A semantic expected-set
+failure may continue only to the next already-frozen case, never adaptive retry.
+Receipts distinguish required prior count six from actually verified prior
+count, invocation-local markers/delegations, conditional known global records
+(6 + new markers), upper bound eleven, and unknown actual HTTP count. The
+500-cent reservation is reported only after validation; otherwise null. Observed
+validated usage and public-rate nominal estimates never reconcile charges.
+Expected positive/negative matches, ambiguous IDs and application fallback stay
+separate. False-accept rate/p95 remain unmeasured, held-out/Core-end-to-end and
+production GO false. Even five matches cannot enable production or close #32.
+
+### Offline implementation proof (2026-10-23)
+
+Before any v2 response, authoritative specification review clarified the unreleased
+question to:
+
+> Does `candidate` satisfy `selection_rule` for inclusion among the optional records used to interpret `state.communication.text`?
+
+The false criterion now symmetrically says the kind's rule does not apply. This removes a conflicting
+extra necessity test; a named Context qualifies under its operational rule.
+Kind rules, boundary, true criterion, thresholds, expectations, request identities,
+guard, versions and model are unchanged. This is pre-live modeling clarification,
+not adaptive tuning or semantic-quality proof. The API-boundary test freezes the
+exact normative question and both criteria; it failed against the previous phrase.
+
+The earlier 135/542/mypy proof (outer wall 206.625 seconds) remains historical;
+it does not validate the clarified provider wire. After the final source changes,
+the clarified source passed 135 focused tests (new v2, existing smoke/catalogue,
+Context and evaluation suites), strict cached offline mypy on 20 source files,
+and all 542 tests with `timeout 600 python3 -m unittest discover -s tests -v`
+(exit 0; outer-wrapper wall 281.665 seconds). Twenty-six new tests cover actual
+v1 serialized-body compatibility against the base implementation, v2 bands and
+capture/replay, mandatory context, fixed scenarios, prior/current evidence,
+finite slots, process/thread races, durability/interruptions, unsafe nodes,
+terminal fake-HTTP errors, private output and offline/selected-key boundaries.
+Financial tests use temporary ledgers/env files, mocked NSS and fake HTTP.
+
+These are local contract/regression proofs, not semantic quality, real billing,
+account verification or future live-execution evidence. No live request was made
+by the implementer. Independent actual-whole-diff review and parent-only release
+and execution remain pending. Production remains deterministic. The superseded
+offline owner plan `41c514d6fe42e6f84459870f534542e3a709f4d8c865a34e0df76ef398b8b879`
+must not be dispatched or overwritten. Parent must compile a new private final
+plan; the completed v1 prior-plan hash `68f38641db29c2741f904ba84b40303a922ab133d0ca04fc55db64c6f8614f2d`
+remains unchanged.
+
+Review reading limits require no source changes: unavailable receipts require
+read-only marker audit, not an assumed HTTP count or unique failure cause.
+`reserved_cents=500` verifies the original hold, not the entire prior evidence set.
+Generic provider errors intentionally hide specific causes; use exit code and
+receipt, not stdout, for status. A deterministic selector's v2 task label alone
+is not proof it ran the Jev algorithm; defaults and deployment remain unchanged.
+The prior independent review remains historical; scoped clarification re-review
+still gates release and any paid batch.
 
 ## Comparison on existing domain scenarios
 

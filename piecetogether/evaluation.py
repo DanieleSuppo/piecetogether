@@ -38,7 +38,8 @@ class CapturedSelector:
                     'raw_response', 'response', 'failure', 'latency_ms', 'fallback_reason'}
         if (not required <= entry.keys() or entry.get('capture') or entry.get('response_capture')
                 or entry['selection_policy_version'] != context.SELECTION_POLICY_VERSION
-                or entry['task_version'] != 'context-relevance-v1'
+                or request.rubric_version not in ('context-relevance-v1', 'context-relevance-v2')
+                or entry['task_version'] != request.rubric_version
                 or context.encoded(entry['request']) != context.encoded(asdict(request))
                 or entry['request_id'] != context.digest(context.encoded(asdict(request)))):
             raise ReplayUnavailable('incompatible or unavailable selector evidence')
@@ -64,6 +65,8 @@ class CapturedSelector:
             raise context.BudgetExhausted(entry['raw_response'])
         response = entry['response']
         if response is not None:
+            if not isinstance(response, dict) or response.get('rubric_version') != request.rubric_version:
+                raise ReplayUnavailable('incompatible selector result version')
             try:
                 types = entry['response_types']
                 ids = tuple(response['ranked_ids']) if types['ranked_ids_tuple'] else response['ranked_ids']
