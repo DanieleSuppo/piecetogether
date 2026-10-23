@@ -74,7 +74,7 @@ Interfaces:
 - [x] Run exact `timeout 600 python3 -m unittest discover -s tests -v`, capture full log, wrapper exit and wall receipt under `/tmp/opencode/jev-v2-*` (542 passed; exit 0; wall 206.625s).
 - [x] Check tracked/new-file whitespace, index empty, protected research hash; create exact whole-feature diff including all new files and source hash manifest against HEAD `a7b032dc80e51c0d619990432ff6dafc6b098cc5` (12 feature files; protected research excluded).
 - [x] Writer returns files, meaningful RED/GREEN, proof paths, risks and whole diff at `/tmp/opencode/jev-v2-implementation-result.md`; no commit/push/live. No source edits after gates. Parent independent actual-diff privacy/billing/concurrency/trust review required.
-- [ ] Parent handles material findings with targeted fixes/re-review; rerun only gates invalidated by actual source changes. Explicitly stage reviewed task files, non-force commit/push on main, remote-SHA verification; do not integrate divergence.
+- [x] Parent handles material findings with targeted fixes/re-review; rerun only gates invalidated by actual source changes. Explicitly stage reviewed task files, non-force commit/push on main, remote-SHA verification; do not integrate divergence.
 
 ### Pre-live question clarification — final bounded fix wave
 
@@ -88,7 +88,7 @@ exact question and both criteria (135 focused tests still total).
 - [x] Observe API-boundary RED on the previous phrase; apply only the two normative v2 text changes.
 - [x] Re-gate clarified source: 135 focused tests; cached offline strict mypy clean on 20 files; exact full 600-second command passed 542 tests, exit 0, outer wall 281.665s.
 - [x] Freeze clarified source hashes and preserve prior gate/review artifacts as immutable history; new artifacts use `/tmp/opencode/jev-v2-clarified-*`.
-- [ ] Parent performs scoped re-review and compiles a NEW private final owner plan. Superseded offline plan `41c514d6fe42e6f84459870f534542e3a709f4d8c865a34e0df76ef398b8b879` must not be dispatched/overwritten. Completed v1 prior hash `68f38641db29c2741f904ba84b40303a922ab133d0ca04fc55db64c6f8614f2d` stays unchanged.
+- [x] Parent performs scoped re-review and compiles a NEW private final owner plan. Superseded offline plan `41c514d6fe42e6f84459870f534542e3a709f4d8c865a34e0df76ef398b8b879` must not be dispatched/overwritten. Completed v1 prior hash `68f38641db29c2741f904ba84b40303a922ab133d0ca04fc55db64c6f8614f2d` stays unchanged.
 
 Review F1–F6 are reading limits only, not source/API additions: unavailable
 receipt requires read-only immutable-marker audit, not an assumed HTTP count or
@@ -99,7 +99,46 @@ Jev algorithm execution or production adoption. Defaults remain unchanged.
 
 ### Task 4 — parent-only execution and honest evidence
 
-- [ ] Compile owner capture offline under key/NSS/network tripwires; save private canonical manifest and expected hash. Check exact prior plan binding and five unique v2 bodies. No real ledger mutation in preflight.
-- [ ] After review/source release GO, run one new frozen five-case protocol with all flags in a short-lived child reading Root `.env`; new private output. No new user routine confirmation required by existing delegation/current retry request.
-- [ ] Inspect sanitized receipts; read-only verify old reservation/claim/markers unchanged and new claim/markers correct. Never reset/release/retry after error or completion.
-- [ ] Record observations vs application decisions, usage-based nominal estimates vs UNRECONCILED charges, quality limits and disabled production default. Commit/push docs only, update #32/#12 honestly, keep missing adoption gates open. Stop; no automatic next experiment or model change.
+- [x] Compile owner capture offline under key/NSS/network tripwires; save private canonical manifest and expected hash. Check exact prior plan binding and five unique v2 bodies. No real ledger mutation in preflight.
+- [x] After review/source release GO, run one new frozen five-case protocol with all flags in a short-lived child reading Root `.env`; new private output. No new user routine confirmation required by existing delegation/current retry request.
+- [x] Inspect sanitized receipts; read-only verify old reservation/claim/markers unchanged and new claim/markers correct. Never reset/release/retry after error or completion.
+- [x] Record observations vs application decisions, usage-based nominal estimates vs UNRECONCILED charges, quality limits and disabled production default. Commit/push docs only, update #32/#12 honestly, keep missing adoption gates open. Stop; no automatic next experiment or model change.
+
+## Parent delivery and observed outcome
+
+- Independent whole review and scoped Q1/Q2 re-review passed before source release.
+  Source commit `bec0eb1f80c63c35a5b50c96c5f147a781d12bdf` was non-force pushed
+  and remote SHA verified. Final source proof remains 135 focused / 542 full /
+  strict mypy 20, unchanged by subsequent result documentation.
+- Final owner plan was privately compiled after GO under key/NSS/ledger/network
+  tripwires, hash
+  `ae88902982833c5b3224778f6dd341e32b17a03e19f334105b4e9249acb08f3f`.
+  Prior v1 hash and request digests remained unchanged. All five byte-budget checks
+  passed. Superseded offline hash `41c514d6...` was preserved, never dispatched.
+- One explicit live child, all hash/account/no-off-credit/primary-group flags,
+  same original wallet. Exit 0, parent wall 1.4346854639006779s, no stderr or raw
+  child output printed. Receipt:
+  `/tmp/pt-jev-relevance-v2.8xfzwi5b/result/receipt.json`.
+- Four exact completed sets, one unresolved application fallback. Original case
+  now selects only cucina Context P(yes)=0.86 and bagno Context=0.82. Single-scope,
+  greeting/empty, and Entity-vs-Context cases match. Confirmation case has no
+  positives but three ambiguous probabilities 0.33/0.34/0.36; do not count it as
+  an exact pass or claim native Jev abstention. Mandatory pending input was supplied;
+  no actual Core fallback, Grounding resolution or generative workload was run.
+- No expected label, rule, threshold or question changed after any v2 response.
+  No follow-up paid retry. Four expected positives, 68 definite negatives and three
+  ambiguous values across 75 Nouls; no extra positive in this limited sample.
+- Read-only audit verified old reservation/claim/five markers unchanged and new
+  claim/five markers valid: thirteen physical nodes, eleven recorded attempts,
+  unique original hold 500 cents, new allocation zero. No ledger write by audit.
+- New usage 38,144 input / 3,795 output; overall eleven replies 63,610 / 7,495.
+  Nominal US$0.001602048 new / US$0.002671620 total is not reconciled billing or
+  verified remaining credit. Account controls remain OWNER-CONFIRMED.
+- Parent result artifacts: `/tmp/opencode/jev-v2-live-start.json`,
+  `jev-v2-live-return.json`, `jev-v2-observed-summary.json`. Private summary
+  independently checks raw bands/expected sets, arithmetic and immutable records.
+- #32 result comment: https://github.com/DanieleSuppo/piecetogether/issues/32#issuecomment-6376974256
+  Parent #12 update: https://github.com/DanieleSuppo/piecetogether/issues/12#issuecomment-6376978110
+- Decision: retain the improved v2 experimental integration; no production
+  activation. Default deterministic, held-out/calibration/false-accept/real
+  Grounding/Core end-to-end/billing acceptance still open. This protocol is done.

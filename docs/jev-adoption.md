@@ -551,11 +551,14 @@ Financial tests use temporary ledgers/env files, mocked NSS and fake HTTP.
 
 These are local contract/regression proofs, not semantic quality, real billing,
 account verification or future live-execution evidence. No live request was made
-by the implementer. Independent actual-whole-diff review and parent-only release
-and execution remain pending. Production remains deterministic. The superseded
+by the implementer. Independent actual-whole-diff review and scoped clarification
+re-review passed; the parent published the reviewed source as
+`bec0eb1f80c63c35a5b50c96c5f147a781d12bdf` on main with a verified non-force push.
+The completed parent-only execution is recorded below. Production remains
+deterministic. The superseded
 offline owner plan `41c514d6fe42e6f84459870f534542e3a709f4d8c865a34e0df76ef398b8b879`
-must not be dispatched or overwritten. Parent must compile a new private final
-plan; the completed v1 prior-plan hash `68f38641db29c2741f904ba84b40303a922ab133d0ca04fc55db64c6f8614f2d`
+must not be dispatched or overwritten. The parent compiled the new private final
+plan recorded below; the completed v1 prior-plan hash `68f38641db29c2741f904ba84b40303a922ab133d0ca04fc55db64c6f8614f2d`
 remains unchanged.
 
 Review reading limits require no source changes: unavailable receipts require
@@ -564,8 +567,64 @@ read-only marker audit, not an assumed HTTP count or unique failure cause.
 Generic provider errors intentionally hide specific causes; use exit code and
 receipt, not stdout, for status. A deterministic selector's v2 task label alone
 is not proof it ran the Jev algorithm; defaults and deployment remain unchanged.
-The prior independent review remains historical; scoped clarification re-review
-still gates release and any paid batch.
+The whole-feature review and scoped clarification re-review together gated release
+and the new paid batch. Both gates passed before execution.
+
+### Observed relevance-v2 outcome
+
+The parent compiled a new private final plan after re-review:
+`ae88902982833c5b3224778f6dd341e32b17a03e19f334105b4e9249acb08f3f`.
+The prior v1 binding remained
+`68f38641db29c2741f904ba84b40303a922ab133d0ca04fc55db64c6f8614f2d`.
+All five request identities, expected positive/negative sets and thresholds were
+unchanged from the pre-live specification. The superseded offline plan was never
+dispatched. The selected dotenv key was loaded only in the short-lived live child.
+
+One authorized five-case batch completed with five validated native replies, no
+transport/schema/usage error and no additional retry. The exact operating policy
+remained yes >=0.7 / no <=0.3 / strict middle -> application fallback.
+
+| Frozen case | Expected optional selection | Observed result |
+| --- | --- | --- |
+| `cucina e bagno` | Both Contexts, nothing extra | Exact: cucina P(yes)=0.86, bagno=0.82; all 13 others <=0.19 |
+| Resume cucina, explicitly exclude bagno | Cucina Context only | Exact: cucina=0.91; bagno Context=0.13 |
+| Unrelated greeting | Empty | Exact: all 15 probabilities <=0.19; completed/empty, no fallback |
+| Explicit bagno Entity, not the conversation Context | Bagno Entity only | Exact: Entity=0.82; same-named Context=0.10 |
+| Confirmation with one mandatory pending item already supplied | No optional records | No positive, but three ambiguous probabilities (0.33, 0.34, 0.36); adapter requests fallback; exact-set result unmeasured/null |
+
+Thus **four cases have exact completed selections; one remains deferred**, not
+five passing cases. Across 75 Nouls, four expected positives were found, 68 records
+were definite negatives and three were ambiguous. No extra positive appeared in
+this sample. In case 5 the ambiguous records were the bagno Context and two prior
+`Yes` communications. The mandatory pending item was present in the input, outside
+optional filtering. This standalone probe did not execute Core fallback, resolve
+Grounding, confirm a claim, or exercise a real generative workload.
+
+The same model `jev-1.13.0` and positive threshold 0.7 now select exactly the two
+Contexts in the original case. This corrects any inference that the v1 result
+established Jev's general unsuitability. Input modelling and application routing
+changed together; these data do not isolate which individual change caused the
+improvement. No thresholds, rules or expectations were tuned after these replies.
+
+Validated v2 usage was 38,144 input / 3,795 output tokens. Including the original
+smoke and v1 diagnostics, eleven validated replies used 63,610 input / 7,495 output.
+At the advertised input-only rate, nominal cost is US$0.001602048 for v2 and
+US$0.002671620 overall. **Actual charges remain UNRECONCILED**, not a verified
+account balance. Owner-confirmed wallet controls are not independent provider
+verification. No funding, account setting, permission or provider/model change.
+
+Read-only post-run audit verified all prior bytes and the new claim plus five
+markers: thirteen physical ledger nodes, eleven recorded attempts, original
+500-cent local hold preserved, zero new allocation. No reset, release or replay
+of a completed protocol occurred. Adapter latency was 231.4–276.6 ms, median
+251.3 ms, n=5; this is not p95/SLA or Core end-to-end latency.
+
+**Decision:** retain v2 as the better-specified experimental integration, not an
+approved production selector. Default remains deterministic. These are five
+post-hoc-informed synthetic cases, not representative held-out validation;
+false-accept, calibration, real Grounding and production end-to-end evidence remain
+unmeasured. #32 stays open. This authorized batch is complete; do not spend more
+or alter the fifth-case policy to make its result pass. All durable evidence stays.
 
 ## Comparison on existing domain scenarios
 
