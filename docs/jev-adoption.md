@@ -378,6 +378,54 @@ provider variability limit sensitivity. No conclusion is certified.
 Other drift is descriptive. Counterfactual IDs never enter Core, and these
 post-hoc-informed cases establish neither held-out quality nor p95/production GO.
 
+## Observed catalogue diagnostic outcome (2026-10-23)
+
+The reviewed five-request follow-up completed on the frozen plan
+`68f38641db29c2741f904ba84b40303a922ab133d0ca04fc55db64c6f8614f2d`.
+All five provider replies passed the pinned schema and usage checks. All five
+returned `abstained`: no record reached the unchanged relevance threshold 0.7.
+There were no additional retries, alternate models or third batch.
+
+| Input variant | Bagno Context score | Cucina Context score | Fewest extra records at full Context recall |
+| --- | ---: | ---: | ---: |
+| Original IDs, original order (earlier control) | 0.39 | 0.44 | 3 |
+| Original IDs, reversed order | 0.36 | 0.34 | 6 |
+| Readable IDs, original order | 0.45 | 0.52 | 2 |
+| Readable IDs, reversed order | 0.40 | 0.38 | 2 |
+| Fresh opaque IDs, original order | 0.41 | 0.45 | 3 |
+| Fresh opaque IDs, reversed order | 0.39 | 0.37 | 2 |
+
+The last column is an offline sweep of the observed scores, not a new operating
+point or new inference. No single threshold selects exactly the two required
+Contexts and zero extra records in any row. Changing order or making IDs readable
+therefore did not resolve this fixture's fixed selection criterion. These data
+do not isolate a parser defect, a unique prompt defect, or general model quality.
+
+The positional stop rule was evaluated three times and never triggered. The
+headline remains null/inconclusive: this does not exclude order/ID sensitivity or
+demonstrate content grounding. The cases were informed by the initial failure;
+they are not held-out or representative deployment validation.
+
+New validated usage was 20,937 input / 2,941 output tokens. Including the earlier
+control: 25,466 input / 3,700 output. At the advertised input-only rate, nominal
+cost is US$0.000879354 for the follow-up and US$0.001069572 including the control.
+**Actual charges remain UNRECONCILED**; these figures are not invoices or verified
+remaining credit. All 500 cents stay reserved locally. Read-only post-run checks
+confirmed the original record unchanged and the one claim plus five immutable
+markers intact, with no additional allocation.
+
+Adapter latency across the five replies was 224.9–271.6 ms, median 236.9 ms
+(sample count 5). This excludes a real generative workload, channel delivery and
+Core end-to-end processing; it is not a p95, SLA or production latency claim.
+False-accept rate is unmeasured because the counterfactual trials never enter Core.
+
+**Decision: NO-GO for adopting the current pinned selector/rubric on this fixed
+criterion.** Keep deterministic production selection. A future attempt needs a
+justified, explicitly versioned task/rubric and independently labelled held-out
+scenarios, not a threshold tweak to fit this capture. No further paid request is
+authorized by this completed protocol; preserve all attempt records. Billing
+reconciliation and production-adoption evidence remain open in #32.
+
 ## Comparison on existing domain scenarios
 
 1. Use the consumer's existing domain fixtures and approved expected state
@@ -434,9 +482,10 @@ the deployment's adoption decision pending evidence.
 
 The [Core scenario coverage audit](core-scenario-coverage.md) adds deterministic
 captured-decision proofs, not measured deployment results. There is still no
-measured required-record recall, wrong-selection/false-accept rate, fallback
-rate, end-to-end latency or total-cost evidence. Jev remains unenabled; the
-deterministic selector remains the default. #17 uses captured optional decision
+representative held-out or production evidence for required-record recall,
+wrong-selection/false-accept rate, fallback rate, end-to-end latency or actual
+total cost. The post-hoc synthetic diagnostics above do not close those gates.
+Jev remains unenabled; the deterministic selector remains the default. #17 uses captured optional decision
 metadata through ordinary proposals, not a separate live per-item Jev adapter;
 #27 does not adopt Jev for Artifact perception/classification. Enabling any path
 still requires the independent task-specific evidence above.

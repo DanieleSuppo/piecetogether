@@ -65,7 +65,7 @@ Analysis is post-hoc-informed, not held-out: per case report scores mapped to or
 - [x] Implement the fixed command. New private output before claim; total batch deadline15s, each request timeout no larger than captured timeout or1000ms, existing byte/token bounds. Use fixed synthetic input only. Receipts distinguish original1, invocation-local new recorded slots, unknown historical counts on refusal, cap evidence OWNER-CONFIRMED, actual cost UNRECONCILED, nominal estimates and production_go=false. Never call counterfactual IDs a Core replay success.
 - [x] Run focused new tests and old smoke tests, exact `uvx mypy --strict piecetogether`, exact `timeout 600 python3 -m unittest discover -s tests -v` with exit/wall receipt, then whitespace/index checks. No source changes after final gates; no unchanged reruns.
 - [x] Report exact files/APIs/limits/secret and ledger boundaries/proof/diff hash and stop. Parent independent actual-diff financial/privacy/concurrency review precedes commit/non-force push and all real execution.
-- [ ] Parent-only after GO: compute live plan hash offline, save private manifest, then execute this one five-request protocol with explicit hash/acks under the user's current authorization. Stop on any guard/provider/usage/position-tracking failure. Preserve all records and report evidence, not adoption; no third batch.
+- [x] Parent-only after GO: compute live plan hash offline, save private manifest, then execute this one five-request protocol with explicit hash/acks under the user's current authorization. Stop on any guard/provider/usage/position-tracking failure. Preserve all records and report evidence, not adoption; no third batch.
 
 ## Offline implementation verification
 
@@ -90,10 +90,38 @@ Analysis is post-hoc-informed, not held-out: per case report scores mapped to or
   remain parent-only after independent actual-diff review.
 - Exact whole-feature diff and reports are under `/tmp/opencode/`; the unrelated
   research file remains unchanged and unstaged. No source edits follow final
-  gates. Scoped re-review of the final evidence-label fixes remains required.
+  gates. Scoped re-review of the final evidence-label fixes completed GO with
+  no remaining findings (`jev-catalogue-probe-review.6f0c91b4.md`).
 - Owner-capture offline compilation succeeded without key, ledger or network
   access: five cases, plan hash
   `68f38641db29c2741f904ba84b40303a922ab133d0ca04fc55db64c6f8614f2d`.
-  Paid execution remains unchecked above until the parent completes the gates.
+  Canonical JSON and the digest were checked again before dispatch; Python
+  tuple/list representation differences did not change any value or wire body.
+
+## Parent execution and decision
+
+- Source delivery: `00f973f92f34917f0b7a492a32a57ac40a04c3af`, main, non-force
+  push verified before the paid invocation. No source changes followed the gates.
+- One batch completed using the selected repository dotenv key in the isolated
+  child, the frozen hash, a new private output and all account/no-off-credit/group
+  acknowledgements. No permission change, funding or account-setting change.
+- Receipt: `/tmp/pt-jev-catalogue.7qpiav3r/result/receipt.json`; parent exit 0,
+  wall 1.3893761349609122 seconds, no stderr and no raw child output printed.
+- Five validated replies, five abstentions, no records at threshold 0.7. Maximum
+  observed score 0.52. Positional rule tested three times without a trigger;
+  headline null remains inconclusive. No counterfactual ID entered Core.
+- Read-only post-run validation confirmed the exact original reservation, the
+  frozen claim and all five markers. Six recorded attempts including the control;
+  all 500 cents remain held. Audit made no ledger writes or additional requests.
+- Follow-up usage 20,937 input / 2,941 output; including control 25,466 / 3,700.
+  Nominal US$0.000879354 new / US$0.001069572 total is not reconciled billing.
+- An offline threshold sweep found no exact two-Context/zero-extra selection in
+  any of the six variants. Minimum extras at full recall for the new cases were
+  6, 2, 2, 3, 2 respectively. This is not a retuned threshold or held-out proof.
+- Decision: keep deterministic production selection. Current rubric/selector
+  does not pass this fixture's fixed criterion. Actual charges, representative
+  held-out quality and production end-to-end evidence remain open in #32.
+  No third batch, reset, release, repeated smoke or model fallback is permitted
+  by this protocol. Private observed summary: `/tmp/opencode/jev-catalogue-observed-summary.json`.
 
 Rollback: do not run live; keep deterministic defaults. Do not roll back/delete/reset attempt evidence. No code installation or offline test may create a real ledger claim or read the actual credential file.
