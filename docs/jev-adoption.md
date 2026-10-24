@@ -43,6 +43,25 @@ Public documentation is not authenticated verification of this deployment's acco
   remain unverified. Public rate arithmetic is nominal, not a guaranteed invoice
   ceiling. Metadata does not guarantee calibrated correctness or latency.
 
+## Issue #32 closeout: delivered Core work, optional rollout deferred
+
+The operator requested completing #32 after separating optional deployment adoption
+from Core MVP delivery. Typing, non-terminal retention, controlled-local erasure,
+versioned Jev integration, bounded diagnostics, reviews and verified delivery are
+complete. The still-current source proof is 542 tests passing and strict mypy
+clean on 20 files; no unchanged gate is rerun for this documentation-only closeout.
+
+Production Jev adoption is **not completed or enabled**. Its outstanding
+consumer/deployment-specific acceptance and actual-billing reconciliation are
+tracked in **#33**, an optional `needs-info` follow-up, not a blocker for #12.
+The missing measurements below remain missing; splitting the issue does not turn
+four synthetic exact selections and one deferred case into production acceptance.
+
+Default remains deterministic. No new paid request, deployment change, credit,
+ledger reset/release/deletion or retry is authorized by this closeout. Preserve the
+original local 500-cent hold and all eleven recorded attempts. Historical
+experiment results and their limitations below remain unchanged.
+
 ## #32 live-validation boundary
 
 These gates precede every live invocation in the comparison below. Credentials
@@ -107,8 +126,9 @@ synthetic command below is not a general billing controller or benchmark framewo
 Enable only a deployment-owned canary after all pre-dispatch gates and task-specific
 quality, privacy, operational benefit and representative held-out evidence pass.
 Roll back through static selector configuration and restart with `deterministic`,
-without deleting trusted history or weakening validation. Issue #32 remains open
-while live gates or representative adoption evidence are missing.
+without deleting trusted history or weakening validation. Optional deployment
+adoption remains open in #33 while these gates or adoption evidence are missing;
+Core maintenance delivery under #32 is a separate closeout decision.
 
 ## Owner-confirmed, one-shot synthetic compatibility smoke
 
@@ -431,9 +451,9 @@ criterion.** Keep deterministic production selection. A future attempt needs a
 justified, explicitly versioned task/rubric and independently labelled held-out
 scenarios, not a threshold tweak to fit this capture. No further paid request is
 authorized by this completed protocol; preserve all attempt records. Billing
-reconciliation and production-adoption evidence remain open in #32.
+reconciliation and production-adoption evidence are deferred to #33, not marked complete.
 
-## Authorized relevance-v2 diagnostic extension (not yet executed)
+## Authorized relevance-v2 diagnostic extension
 
 The operator requested a remodeled task and one bounded retry. This permits at
 most five additional synthetic POSTs under the **same original aggregate
@@ -521,7 +541,8 @@ count, invocation-local markers/delegations, conditional known global records
 validated usage and public-rate nominal estimates never reconcile charges.
 Expected positive/negative matches, ambiguous IDs and application fallback stay
 separate. False-accept rate/p95 remain unmeasured, held-out/Core-end-to-end and
-production GO false. Even five matches cannot enable production or close #32.
+production GO false. Even five matches cannot establish production adoption.
+The #32 closeout explicitly transfers the unfulfilled deployment acceptance to #33.
 
 ### Offline implementation proof (2026-10-23)
 
@@ -623,7 +644,8 @@ of a completed protocol occurred. Adapter latency was 231.4–276.6 ms, median
 approved production selector. Default remains deterministic. These are five
 post-hoc-informed synthetic cases, not representative held-out validation;
 false-accept, calibration, real Grounding and production end-to-end evidence remain
-unmeasured. #32 stays open. This authorized batch is complete; do not spend more
+unmeasured and tracked in optional follow-up #33, not claimed completed by closing
+#32. This authorized batch is complete; do not spend more
 or alter the fifth-case policy to make its result pass. All durable evidence stays.
 
 ## Comparison on existing domain scenarios
