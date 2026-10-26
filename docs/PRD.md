@@ -1,6 +1,6 @@
 # PieceTogether — Product Requirements Document
 
-**Status:** Draft v0.1  
+**Status:** Draft v0.1 (product scope retained; Core MVP technical SPEC #12 implemented and closed 2026-10-26; live commissioning not claimed)  
 **Product:** PieceTogether  
 **Repository:** `piecetogether`  
 **Audience:** Product, AI engineering, backend/platform engineering  
@@ -1157,17 +1157,12 @@ PieceTogether is built around a small set of product principles:
 
 ---
 
-## 30. Next step
+## 30. Implementation handoff and next step
 
-This PRD defines the product and MVP boundary.
+This PRD remains the product and Core MVP boundary. The subsequent technical design was consolidated in [SPEC #12](https://github.com/DanieleSuppo/piecetogether/issues/12), and its 19 implementation sub-issues (#13-#31) were closed by 2026-10-26. This handoff records implementation completion against the SPEC, not a new PRD scope, a production deployment approval or proof of live-model correctness.
 
-The next phase should produce a technical specification that resolves implementation-level questions without reopening the product invariants defined here, beginning with:
+The next product phase is a **separate Interior Design / Renovation reference application**, not more domain logic inside the Core. It should provide its own Domain Contract, identities, deployment configuration, limited user interface and scenario expectations. It must consume the Core's trusted State API and Grounded Change Events, demonstrate natural multi-session conversation, supported documents/images, Grounding, corrections/supersession and inspectable provenance, then verify the selected real provider/channel path in a controlled deployment.
 
-- Semantic Proposal model;
-- Grounding state machine;
-- Domain Contract format;
-- persistent conceptual data model;
-- Context Assembly interfaces;
-- extension/plugin contracts;
-- State API and grounded event contracts;
-- canonical evaluation fixtures.
+The current tests and canonical scenario coverage establish deterministic Core behavior. Real Email/Telegram transport and model quality remain to be validated for a concrete deployment; see [cross-channel grounding](cross-channel-grounding.md) and [Core scenario coverage](core-scenario-coverage.md). Preserve the acquisition trust boundary and explicit operator control of credentials and external traffic.
+
+Optional Jev v2 deployment adoption is tracked in [#33](https://github.com/DanieleSuppo/piecetogether/issues/33), with the deterministic selector still the default; this is not a blocker or a prerequisite for the reference application. A reproducible release and updated operational instructions follow evidence from the integrated demonstration.
