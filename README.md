@@ -1113,7 +1113,7 @@ TypeSafe/Jev evaluation starts with the replaceable semantic selector in Context
 
 Later tickets can reuse the approach for known Entity/Context references, concept reconciliation, per-item Grounding proposals and Artifact text classifications. Generative ModelProviders still handle open interpretations and conversational responses; all model decisions remain proposals subject to deterministic validation and Grounding. Confidence never authorizes trusted state.
 
-Read the [development design and ticket responsibilities](docs/superpowers/specs/2026-10-05-semantic-decision-routing-design.md) before implementing #16, #17, #27, #29 or #31. The [research note](docs/research/2026-10-05-typesafe.md) records primary sources and provider limitations. This direction requires no change to the implemented #13–#15 foundation.
+The [development design and historical ticket responsibilities](docs/superpowers/specs/2026-10-05-semantic-decision-routing-design.md) document the architecture behind completed #16, #17, #27, #29 and #31. The [research note](docs/research/2026-10-05-typesafe.md) records the original provider investigation and limitations. The current optional deployment-adoption procedure is [docs/jev-adoption.md](docs/jev-adoption.md) and [#33](https://github.com/DanieleSuppo/piecetogether/issues/33); neither changes the deterministic default.
 
 ## Verify
 
