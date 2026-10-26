@@ -1123,3 +1123,12 @@ uvx mypy --strict piecetogether
 ```
 
 The tests use the Core service boundary and deterministic adapters with temporary persistent databases, not live models or storage-internal assertions. `uvx` is needed only for the optional development typechecker.
+
+## Development workflow and next handoff (2026-10-26)
+
+Use the installed Matt Pocock skills and this repository's existing GitHub Issues tracker ([AGENTS.md](AGENTS.md), [issue-tracker configuration](docs/agents/issue-tracker.md), [domain guidance](docs/agents/domain.md)). Read [docs/PRD.md](docs/PRD.md), the completed [Core SPEC #12](https://github.com/DanieleSuppo/piecetogether/issues/12) and relevant delivery documents. This section gives a handoff, not new skill instructions.
+
+- **Completed:** discovery and PRD -> `/wayfinder` map #1 and decisions #2-#11 -> technical SPEC #12 -> `to-tickets` (#13-#31) -> standard ticket implementation and verification. Core SPEC #12 and maintenance #32 are closed.
+- **Now:** start a **new, separate Interior Design / Renovation reference-consumer repository**. Use its own README/PRD or focused discovery, followed by the installed Wayfinder / SPEC / ticket workflow as needed. Consume the Core through authenticated State API and trusted events. Do not rerun the closed Core Wayfinder or add domain entities inside the Core.
+- **Integration and release:** once a controlled deployment is authorized and configured, test actual provider and Email/Telegram behavior, Core Grounding, correction, Artifact supersession, provenance and API events; document gaps before claiming live quality or release readiness. These operational tests are not retroactive acceptance gates for the already closed SPEC.
+- **Optional:** [Jev adoption #33](https://github.com/DanieleSuppo/piecetogether/issues/33) requires a concrete deployment and separate owner-approved evidence and spend authorization; keep deterministic selection enabled until it passes. Do not spend or run new experiments as part of this documentation handoff.
