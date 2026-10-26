@@ -730,7 +730,26 @@ Extension points exist to support real applications. Connector frameworks and pl
 
 ## Status
 
-The development Core implements durable text ingress and observable interpretation ([#13](https://github.com/DanieleSuppo/piecetogether/issues/13)), deterministic Domain Contract and typed Semantic Proposal validation ([#14](https://github.com/DanieleSuppo/piecetogether/issues/14)), atomic trusted semantic history ([#15](https://github.com/DanieleSuppo/piecetogether/issues/15)), bounded Context Packs with disclosure controls ([#16](https://github.com/DanieleSuppo/piecetogether/issues/16)), the conversational Grounding lifecycle ([#17](https://github.com/DanieleSuppo/piecetogether/issues/17)), and Current Trusted View with grounded Context lifecycle ([#18](https://github.com/DanieleSuppo/piecetogether/issues/18)). Production channels and authenticated application APIs remain subsequent tickets. Product boundaries are captured in [docs/PRD.md](docs/PRD.md); technical authority is [SPEC #12](https://github.com/DanieleSuppo/piecetogether/issues/12).
+**Core MVP implementation delivered (2026-10-26).** The technical [SPEC #12](https://github.com/DanieleSuppo/piecetogether/issues/12) is closed, with all 19 implementation sub-issues [#13-#31](https://github.com/DanieleSuppo/piecetogether/issues/13) completed. The follow-up [#32](https://github.com/DanieleSuppo/piecetogether/issues/32) delivered Core typing, non-terminal retention, controlled local erasure and bounded Jev v2 diagnostics. Closing these issues establishes delivery against the planned technical SPEC, **not** commissioning of a live production deployment or acceptance of live-model semantic quality.
+
+The development Core now includes:
+
+- Standalone Python Core, idempotent Communication ingress, declarative Domain Contracts, typed Semantic Proposals and deterministic validation.
+- Bounded Context Assembly and sender disclosure, conversational Grounding, immutable trusted semantic history, Current Trusted View and authoritative-reference conflict handling.
+- Persistent Artifacts and lifecycle management; first-party Email and Telegram channels with supported image/document acquisition and sender-initiated pending Grounding continuity across explicitly linked Actors.
+- An authenticated, loopback-only application State API, post-commit Grounded Change Events, concurrency safeguards, retention/erasure operations, Evaluation Traces, offline semantic replay and canonical Core scenario coverage.
+
+The delivery record in [#32](https://github.com/DanieleSuppo/piecetogether/issues/32) reports **542 passing full-suite tests** and **strict mypy clean on 20 files**. These are recorded source-verification results, not a claim that live providers were exercised or that every runtime deployment was tested. Reproduction commands are under [Verify](#verify); canonical scenarios and limits are in [docs/core-scenario-coverage.md](docs/core-scenario-coverage.md).
+
+**Still to demonstrate:** A separately deployed, usable reference consumer and a controlled end-to-end run with real model and channel providers. The [cross-channel real-transport procedure](docs/cross-channel-grounding.md) is explicitly marked *NOT RUN*; captured-provider tests do not establish live language understanding, provider behavior or operational readiness. In particular, the trusted local Email ingress assumes the configured technical sender identity: it does not independently prove sender authenticity with SPF/DKIM/DMARC. An operator must establish a trustworthy acquisition boundary before accepting untrusted external traffic.
+
+**Optional and not blocking the Core MVP:** [#33](https://github.com/DanieleSuppo/piecetogether/issues/33) tracks potential Jev v2 adoption for a specific deployment. The current selector default remains deterministic. Five synthetic v2 diagnostics yielded four exact selections and one uncertain adapter fallback; they are not deployment acceptance, and actual provider charges remain unreconciled. No additional paid inference is authorized by this issue.
+
+### Next product milestone
+
+Build the **separate Interior Design / Renovation reference application** described above, with its own Domain Contract, configuration, minimal trusted-state UI and a small set of realistic multi-session scenarios. Then run an explicitly authorized, controlled integration demonstration across an actual configured provider/channel boundary; inspect Grounding, corrections, Artifact supersession, provenance, API state and emitted events. Use observed defects to prioritize fixes, without turning the Core into a domain-specific application or introducing a generic benchmark framework. After this demonstration, prepare a reproducible first release and bring this README's setup and operational limitations up to date.
+
+Product boundaries remain in [docs/PRD.md](docs/PRD.md); the completed technical authority is [SPEC #12](https://github.com/DanieleSuppo/piecetogether/issues/12).
 
 ## Run the development Core
 
